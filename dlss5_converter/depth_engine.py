@@ -40,6 +40,11 @@ def configure_model_cache() -> Path:
     os.environ.setdefault("HF_HOME", str(model_cache_dir()))
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    # The app draws its own progress bar, so the hub's is redundant — and in a
+    # windowed build it is worse than redundant: tqdm writes to a stderr that
+    # does not exist there. main.py guards the streams as well; this removes the
+    # writer instead of just giving it somewhere harmless to go.
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     return Path(os.environ["HF_HOME"])
 
 
