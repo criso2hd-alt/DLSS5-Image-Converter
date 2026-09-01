@@ -69,15 +69,63 @@ def test_hf_home_overrides_the_models_folder(frozen, monkeypatch):
 
 
 def test_dlss_files_is_searched_first(frozen):
-    """The folder the app told the user to fill outranks any stray copy."""
+    """The folder the app told the user to fill outranks any stray copy.
+
+    Nested layouts are handled by searching recursively rather than by listing
+    the subfolder names we expect - guessing them meant a Streamline unpacked
+    as "streamline/" instead of "NVStreamline/" was reported as missing.
+    """
     (frozen / "dlss_files").mkdir()
-    (frozen / "dlss_files" / "NVStreamline" / "Production").mkdir(parents=True)
     roots = paths.runtime_search_roots()
     assert roots[0] == frozen / "dlss_files"
-    # Streamline drops are searched unflattened, because that is how they unzip.
-    assert frozen / "dlss_files" / "NVStreamline" / "Production" in roots
 
 
 def test_output_and_models_do_not_collide(frozen):
     assert paths.output_dir() != paths.model_cache_dir()
     assert paths.output_dir().is_dir()
+
+
+def test_release_searches_only_dlss_files(frozen):
+    """A release must not find files anywhere the user cannot see.
+
+    The Downloads fallbacks made this project's author's machine work with an
+    incomplete dlss_files while an outside tester with the same folder failed.
+    A convenience that hides a broken setup from the person able to fix it is
+    not one.
+    """
+    (frozen / "dlss_files").mkdir()
+    assert paths.runtime_search_roots() == [frozen / "dlss_files"]
+
+
+def test_source_checkout_keeps_the_developer_fallbacks(source, monkeypatch, tmp_path):
+    """Convenient in a checkout, where nobody is shipping the result."""
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    (tmp_path / "dlss_files").mkdir()
+    (tmp_path / "runtime").mkdir()
+    assert (tmp_path / "runtime") in paths.runtime_search_roots()
+
+
+def test_streamline_is_found_however_it_was_unpacked(frozen):
+    """streamline/, NVStreamline/, or an extra wrapper - all must work."""
+    files = frozen / "dlss_files"
+    for layout in (
+        files / "streamline" / "Production",
+        files / "NVStreamline" / "Production",
+        files / "sl" / "extracted" / "bin" / "x64",
+    ):
+        layout.mkdir(parents=True)
+        target = layout / "nvngx_dlss.dll"
+        target.write_bytes(b"x")
+        assert paths.find_runtime_file("nvngx_dlss.dll") == target
+        target.unlink()
+
+
+def test_a_loose_file_beats_one_buried_in_an_archive_folder(frozen):
+    """The copy the user placed deliberately wins over an unpacked one."""
+    files = frozen / "dlss_files"
+    nested = files / "streamline" / "Production"
+    nested.mkdir(parents=True)
+    (nested / "nvngx_dlss.dll").write_bytes(b"nested")
+    loose = files / "nvngx_dlss.dll"
+    loose.write_bytes(b"loose")
+    assert paths.find_runtime_file("nvngx_dlss.dll") == loose

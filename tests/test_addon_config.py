@@ -110,3 +110,60 @@ def test_key_case_is_preserved(tmp_path):
     raw = runtime.write_addon_config(tmp_path, NeuralSettings()).read_text(encoding="utf-8")
     assert "NRIntensity=" in raw
     assert "nrintensity=" not in raw
+
+
+def test_runtime_files_are_recovered_from_a_zip(tmp_path, monkeypatch):
+    """Streamline ships as a zip and people drop the whole archive in.
+
+    The first outside tester did exactly that and was told
+    "nvngx_dlss.dll was not found" while looking at a streamline.zip
+    containing it.
+    """
+    import zipfile
+
+    from dlss5_converter import paths
+
+    folder = tmp_path / "dlss_files"
+    folder.mkdir()
+    monkeypatch.setattr(paths, "runtime_search_roots", lambda: [folder])
+
+    with zipfile.ZipFile(folder / "streamline.zip", "w") as bundle:
+        # Nested, as the real archive is - not at the root of the zip.
+        bundle.writestr("Production/nvngx_dlss.dll", b"x" * 2048)
+        bundle.writestr("Production/sl.interposer.dll", b"y" * 512)
+
+    recovered = runtime.unpack_archives()
+
+    assert (folder / "nvngx_dlss.dll").is_file()
+    assert any("nvngx_dlss.dll" in entry for entry in recovered)
+    # Only what we asked for: the rest of Streamline is not ours to scatter.
+    assert not (folder / "sl.interposer.dll").exists()
+
+
+def test_unpacking_never_overwrites_a_file_already_there(tmp_path, monkeypatch):
+    """A deliberately placed build must win over an old copy inside a zip."""
+    import zipfile
+
+    from dlss5_converter import paths
+
+    folder = tmp_path / "dlss_files"
+    folder.mkdir()
+    monkeypatch.setattr(paths, "runtime_search_roots", lambda: [folder])
+
+    (folder / "nvngx_dlss.dll").write_bytes(b"the one the user chose")
+    with zipfile.ZipFile(folder / "streamline.zip", "w") as bundle:
+        bundle.writestr("Production/nvngx_dlss.dll", b"an older build")
+
+    runtime.unpack_archives()
+    assert (folder / "nvngx_dlss.dll").read_bytes() == b"the one the user chose"
+
+
+def test_a_corrupt_archive_is_not_fatal(tmp_path, monkeypatch):
+    from dlss5_converter import paths
+
+    folder = tmp_path / "dlss_files"
+    folder.mkdir()
+    monkeypatch.setattr(paths, "runtime_search_roots", lambda: [folder])
+    (folder / "broken.zip").write_bytes(b"not really a zip")
+
+    assert runtime.unpack_archives() == []

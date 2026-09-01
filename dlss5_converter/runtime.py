@@ -50,21 +50,82 @@ class RuntimeStatus:
 _MIN_NEURAL_DLL_BYTES = 100 * 1024 * 1024
 
 
+#: Filenames worth pulling out of an archive, lowercased for comparison.
+_WANTED_IN_ARCHIVES = {
+    "nvngx_dlssnr.dll",
+    "nvngx_dlss.dll",
+    paths.ADDON_FILE.lower(),
+    "reshade64.dll",
+    "dxgi.dll",
+}
+
+
+def unpack_archives(extra: Path | None = None) -> list[str]:
+    """Pull the runtime files out of any zip sitting in the runtime folders.
+
+    Streamline ships as a zip and people quite reasonably drop the whole archive
+    in rather than hunting through it for one DLL — the first outside tester did
+    exactly that and got "nvngx_dlss.dll was not found" while looking straight at
+    a streamline.zip containing it.
+
+    Extracted beside the archive, which is already a folder we search. Existing
+    files are never overwritten: if someone has deliberately placed a particular
+    build, an old copy inside a zip must not silently replace it.
+    """
+    import zipfile
+
+    recovered: list[str] = []
+    roots = paths.runtime_search_roots()
+    if extra is not None and extra.is_dir():
+        roots.insert(0, extra)
+
+    for root in roots:
+        for archive in sorted(root.glob("*.zip")):
+            try:
+                with zipfile.ZipFile(archive) as bundle:
+                    for member in bundle.infolist():
+                        if member.is_dir():
+                            continue
+                        name = Path(member.filename).name
+                        if name.lower() not in _WANTED_IN_ARCHIVES:
+                            continue
+                        target = root / name
+                        if target.exists():
+                            continue
+                        with bundle.open(member) as source, open(target, "wb") as sink:
+                            shutil.copyfileobj(source, sink)
+                        recovered.append(f"{name} (from {archive.name})")
+            except (OSError, zipfile.BadZipFile, RuntimeError):
+                # A corrupt or encrypted archive is not fatal; the missing-file
+                # message downstream is still the right thing to show.
+                continue
+    return recovered
+
+
 def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     """Find every piece the harness needs, without loading any of them."""
     extra = Path(runtime_dir) if runtime_dir else None
     status = RuntimeStatus()
 
-    status.neural_dll = paths.find_runtime_file("nvngx_dlssnr.dll", extra)
-    status.dlss_dll = paths.find_runtime_file("nvngx_dlss.dll", extra)
-    status.addon = paths.find_runtime_file(paths.ADDON_FILE, extra)
-    # ReShade under either name it plausibly has. An existing install has
-    # already renamed it to the DLL it proxies, so a user following our own
-    # advice drops a "dxgi.dll" here and would otherwise be told ReShade is
-    # missing while looking straight at it.
-    status.reshade = paths.find_runtime_file("ReShade64.dll", extra) or paths.find_reshade_proxy(
-        extra
-    )
+    def locate() -> None:
+        status.neural_dll = paths.find_runtime_file("nvngx_dlssnr.dll", extra)
+        status.dlss_dll = paths.find_runtime_file("nvngx_dlss.dll", extra)
+        status.addon = paths.find_runtime_file(paths.ADDON_FILE, extra)
+        # ReShade under either name it plausibly has. An existing install has
+        # already renamed it to the DLL it proxies, so a user following our own
+        # advice drops a "dxgi.dll" here and would otherwise be told ReShade is
+        # missing while looking straight at it.
+        status.reshade = paths.find_runtime_file(
+            "ReShade64.dll", extra
+        ) or paths.find_reshade_proxy(extra)
+
+    locate()
+    # Only if something is missing: opening every zip in the folder on each
+    # detect() would be wasted work on the common path, and detect() runs on
+    # startup, on Diagnose, and before every conversion.
+    if not all((status.neural_dll, status.dlss_dll, status.addon, status.reshade)):
+        if unpack_archives(extra):
+            locate()
 
     harness = paths.native_exe()
     status.harness = harness if harness.is_file() else None
@@ -95,7 +156,10 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     if status.dlss_dll is None:
         status.problems.append(
             "nvngx_dlss.dll was not found. The neural pass runs inside a DLSS "
-            f"Super Resolution evaluation, so both DLLs are required. {where}"
+            f"Super Resolution evaluation, so both DLLs are required. {where} "
+            "It ships inside Streamline, under Production - a zipped Streamline "
+            "in that folder is opened automatically, so if you are seeing this "
+            "the archive does not contain it."
         )
     if status.addon is None:
         status.problems.append(

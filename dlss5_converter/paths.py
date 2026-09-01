@@ -153,41 +153,105 @@ ADDON_FILE = "renodx-dlss5.addon64"
 
 
 def runtime_search_roots() -> list[Path]:
-    """Plausible locations for a user's DLSS 5 mod files, best guess first.
+    """Places to look for the user's DLSS 5 files, best guess first.
 
-    ``dlss_files`` comes first because in a release build it is the folder the
-    app told the user to fill. ``NVStreamline/Production`` is listed as well as
-    the folder itself: nvngx_dlss.dll ships inside a Streamline drop, and users
-    reliably unpack the archive rather than flattening it.
+    A **release build looks only in ``dlss_files``** (plus whatever folder the
+    user set explicitly). The tempting Downloads guesses below are deliberately
+    limited to source checkouts, because they make the developer's machine
+    behave differently from everybody else's: this project's own author had a
+    working app with an incomplete ``dlss_files``, purely because a stray
+    ``~/Downloads/dlss5`` was satisfying the lookup, while the first outside
+    tester with the identical folder got "nvngx_dlss.dll was not found".
+
+    A convenience that hides a broken configuration from the one person able to
+    fix it is not a convenience.
     """
-    roots = [
-        dlss_files_dir(),
-        dlss_files_dir() / "NVStreamline" / "Production",
-        data_dir() / "runtime",
-        app_dir() / "runtime",
-    ]
-    home = Path.home()
-    roots += [
-        home / "Downloads" / "dlss5",
-        home / "Downloads" / "dlss5" / "NVStreamline" / "Production",
-        home / "Downloads" / "DLSS5",
-        home / "Downloads" / "DLSS5" / "NVStreamline" / "Production",
-    ]
+    roots = [dlss_files_dir()]
+    if not is_frozen():
+        home = Path.home()
+        roots += [
+            data_dir() / "runtime",
+            app_dir() / "runtime",
+            home / "Downloads" / "dlss5",
+            home / "Downloads" / "DLSS5",
+        ]
     return [root for root in roots if root.is_dir()]
 
 
+#: How deep to look inside a runtime folder. A Streamline drop unpacks as
+#: streamline/Production/nvngx_dlss.dll, or NVStreamline/Production/..., or with
+#: an extra wrapper folder depending on how it was zipped. Four levels covers
+#: every shape seen so far without turning a mis-set folder into a disk crawl.
+_MAX_RUNTIME_DEPTH = 4
+
+
+def deep_search_roots() -> list[Path]:
+    """Folders worth searching recursively, as opposed to just checking.
+
+    Same set as ``runtime_search_roots`` — and the same reason for keeping a
+    release confined to ``dlss_files``.
+    """
+    return runtime_search_roots()
+
+
+def _find_deep(root: Path, wanted: str, depth: int = _MAX_RUNTIME_DEPTH) -> Path | None:
+    """Breadth-first hunt for a filename under `root`.
+
+    Breadth-first on purpose: a file sitting directly in the runtime folder
+    should win over a copy buried inside an unpacked archive, because the loose
+    one is the copy the user placed deliberately.
+    """
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return None
+
+    subdirectories: list[Path] = []
+    for entry in entries:
+        try:
+            if entry.is_file():
+                if entry.name.lower() == wanted:
+                    return entry
+            elif entry.is_dir():
+                subdirectories.append(entry)
+        except OSError:
+            continue
+
+    if depth <= 0:
+        return None
+    for subdirectory in subdirectories:
+        found = _find_deep(subdirectory, wanted, depth - 1)
+        if found is not None:
+            return found
+    return None
+
+
 def find_runtime_file(name: str, extra: Path | None = None) -> Path | None:
-    """First readable copy of `name`, preferring an explicit user setting."""
+    """First readable copy of `name`, preferring an explicit user setting.
+
+    Falls back to searching the runtime folders recursively. People unpack
+    Streamline in whatever shape the archive came in, and demanding one exact
+    layout means telling a user their perfectly reasonable folder is wrong —
+    which is precisely what happened to the first outside tester, twice.
+    """
+    wanted = name.lower()
     candidates: list[Path] = []
     if extra is not None:
         candidates += [extra / name, extra]
     candidates += [root / name for root in runtime_search_roots()]
     for candidate in candidates:
         try:
-            if candidate.is_file() and candidate.name.lower() == name.lower():
+            if candidate.is_file() and candidate.name.lower() == wanted:
                 return candidate
         except OSError:
             continue
+
+    # Nothing at the expected spots, so look inside them.
+    roots = ([extra] if extra is not None and extra.is_dir() else []) + deep_search_roots()
+    for root in roots:
+        found = _find_deep(root, wanted)
+        if found is not None:
+            return found
     return None
 
 

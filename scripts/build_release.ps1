@@ -210,8 +210,13 @@ None of these ship with the app and it will not help you obtain them.
                           here. Otherwise extract ReShade64.dll from the
                           ReShade installer and rename it to dxgi.dll.
 
-You can drop a Streamline folder in here unflattened; the app looks inside
-NVStreamline\Production too.
+You do not need to tidy any of this up:
+
+  - a Streamline folder can stay unflattened; the app looks inside
+    NVStreamline\Production too
+  - a .zip can stay zipped. If nvngx_dlss.dll is missing the app opens any
+    zip in this folder, pulls out what it needs, and leaves the rest alone.
+    It never overwrites a file you put here yourself.
 
 The app copies these next to engine\dlss5_eval.exe on first run, because that
 is where NGX and ReShade look. Use Diagnose in the app to check what it found.
