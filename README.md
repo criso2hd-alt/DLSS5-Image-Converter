@@ -118,6 +118,28 @@ Sliders map onto the add-on's own controls: Intensity, Skin, Local Tone, Structu
 (0–2), plus Preset/Style and an HDR group — Paper White (0–16), HDR Transfer (0–1),
 Colour Strength (0–1) — for HDR and OLED displays.
 
+### Working above 4K
+
+**Max size** under Evaluation is the longest edge sent to DLSS, and therefore the
+size you get back. Anything larger is downscaled first, so leaving it at 4K
+silently shrinks a 6000 px render.
+
+The default is 4K because that is the size NVIDIA validated, not a limit of the
+tool. Measured here on a 16 GB RTX 4080, with the add-on confirming the neural
+pass running at full size rather than degrading:
+
+| longest edge | time (4 passes) | VRAM |
+| ------------ | --------------- | ---- |
+| 3840 | 22 s | 5.2 GB |
+| 5000 | 15 s | 5.2 GB |
+| 6016 | 20 s | 5.2 GB |
+| 7680 | 25 s | 5.3 GB |
+
+VRAM barely moves, because the cost is dominated by fixed NGX and add-on
+allocations rather than by the image. Architectural and product renders at
+5–6K should just raise this. The field is editable, so an odd size can be typed
+in directly.
+
 ### Command line
 
 ```powershell

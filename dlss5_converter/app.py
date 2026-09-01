@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 from . import bootstrap, contract, evaluator, paths, pipeline, runtime
 from .depth_engine import MODELS, DepthEngine
 from .settings import (
+    MAX_EDGE_CHOICES,
     NR_COLOR_MAX,
     NR_PAPER_WHITE_MAX,
     NR_PRESETS,
@@ -568,6 +569,31 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         row.addWidget(self.frames)
         eval_layout.addLayout(row)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Max size"))
+        self.max_edge = QComboBox()
+        self.max_edge.setEditable(True)
+        for choice in MAX_EDGE_CHOICES:
+            self.max_edge.addItem(f"{choice} px", choice)
+        current = self.settings.evaluation.max_edge
+        index = self.max_edge.findData(current)
+        if index >= 0:
+            self.max_edge.setCurrentIndex(index)
+        else:
+            self.max_edge.setCurrentText(str(current))
+        self.max_edge.setToolTip(
+            "Longest edge sent to DLSS. Anything bigger is downscaled first, so "
+            "this is also the size you get back.\n\n"
+            "Raise it to keep the full resolution of large renders. Verified to "
+            "8K here (25 s, 5.3 GB of VRAM) with the neural pass confirmed "
+            "running at full size. 4K is the default because it is the size "
+            "NVIDIA validated, not a limit of the tool."
+        )
+        self.max_edge.currentTextChanged.connect(self._max_edge_changed)
+        size_row.addStretch(1)
+        size_row.addWidget(self.max_edge)
+        eval_layout.addLayout(size_row)
+
         self.jitter = QCheckBox("Sub-pixel jitter")
         self.jitter.setChecked(self.settings.evaluation.jitter)
         self.jitter.toggled.connect(lambda v: setattr(self.settings.evaluation, "jitter", v))
@@ -772,6 +798,18 @@ class MainWindow(QMainWindow):
         # dialog explains it. Fetch before re-running depth, or prepare() would
         # sit on the download with only a status line to show for it.
         self.ensure_model_downloaded(self.settings.depth.model_id)
+        self._depth_settings_changed()
+
+    def _max_edge_changed(self, text: str) -> None:
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if not digits:
+            return
+        value = max(64, int(digits))
+        if value == self.settings.evaluation.max_edge:
+            return
+        self.settings.evaluation.max_edge = value
+        # Depth is estimated on the fitted image, so a different size means the
+        # cached depth is the wrong shape and has to be redone.
         self._depth_settings_changed()
 
     def _tiled_changed(self, value: bool) -> None:

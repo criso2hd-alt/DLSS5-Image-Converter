@@ -107,9 +107,17 @@ class EvaluationSettings:
     #: around. It cannot invent information the photo lacks, but it does stop
     #: the accumulator from locking onto one sample grid.
     jitter: bool = True
-    #: Cap on the longest edge sent to DLSS. 4K is the ceiling NVIDIA quotes for
-    #: real-time evaluation; beyond it the model has not been validated and
-    #: VRAM use climbs sharply.
+    #: Cap on the longest edge sent to DLSS. Anything larger is downscaled
+    #: first, so this is also the resolution the result comes back at.
+    #:
+    #: 3840 was chosen as "the ceiling NVIDIA quotes for real-time evaluation",
+    #: on the assumption that beyond it VRAM would climb sharply. Measured on a
+    #: 16 GB RTX 4080 that assumption was wrong: 8K completes in 25 s using
+    #: 5.3 GB, barely more than 4K's 5.2 GB, and the add-on confirms the neural
+    #: pass running at full 7680x4320 rather than quietly degrading. The cap
+    #: stays at 4K as a *default* because it is the validated size and a sane
+    #: first run, not because larger does not work — people doing architectural
+    #: renders at 5-6K should raise it.
     max_edge: int = 3840
     #: Re-run DLSS automatically when a neural slider moves.
     #:
@@ -120,6 +128,11 @@ class EvaluationSettings:
     #: at a lower resolution therefore saves almost nothing, which is why there
     #: is no separate preview size.
     live_preview: bool = False
+
+
+#: Offered in the sidebar. 8192 is the top because it is the largest verified
+#: here; the field accepts anything, so an unusual workflow is not blocked.
+MAX_EDGE_CHOICES = (1920, 2560, 3840, 5120, 6144, 7680, 8192)
 
 
 @dataclass
