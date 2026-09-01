@@ -1,0 +1,26 @@
+.venv/
+.venv-cuda/
+.venv-xpu/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+release/
+model_cache/
+runtime/
+
+# Native harness build output and the NVIDIA SDK it links against.
+native/build/
+native/_sdk/
+native/bin/
+
+# Never commit NVIDIA runtime binaries. The app locates the user's own copy.
+*.dll
+*.addon64
+
+# Test images. Game promo art and screenshots are not ours to redistribute,
+# and the app needs no sample data to run.
+sample_image/
+*.log

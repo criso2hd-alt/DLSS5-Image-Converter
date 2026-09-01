@@ -1,48 +1,72 @@
-DLSS 5 Image Converter — run the neural renderer on a still image
+# DLSS 5 Image Converter
 
-A small desktop app that feeds a **photo** to DLSS 5's neural renderer instead of a game frame.
-Drag and drop, paste (Ctrl+V), or browse. Free, open source, bring your own DLSS files.
+Run NVIDIA's DLSS 5 neural renderer over a **still image** instead of a game frame.
+Drag and drop, paste (Ctrl+V), or browse.
 
-# DLSS 5 Image Converter — run the neural renderer on a still image
+This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of the look.
 
-A small desktop app that feeds a **photo** to DLSS 5's neural renderer instead of a game frame.
-Drag and drop, paste (Ctrl+V), or browse. Free, open source, bring your own DLSS files.
-
-**Source:** <your GitHub link>
+> **Bring your own DLSS files.** None of NVIDIA's binaries are included here, and
+> this project will not help you obtain them. You point it at the copies you
+> already have.
 
 ---
 
 ## How it works
 
-`nvngx_dlssnr.dll` isn't a standalone image model — it's an NGX snippet that the RenoDX
-add-on injects into a DLSS Super Resolution evaluation. So the app doesn't "call DLSS 5".
-It **fabricates a convincing DLAA frame** out of one still image and lets the add-on do its thing:
+`nvngx_dlssnr.dll` is not a standalone image model. It is an NGX snippet that the
+RenoDX ReShade add-on injects into a DLSS Super Resolution evaluation. So this app
+does not "call DLSS 5" — it **fabricates a convincing DLAA frame** out of one still
+image and lets the add-on do its thing.
 
 | DLSS input | Game source | Here |
-|---|---|---|
+| ---------- | ----------- | ---- |
 | Colour | backbuffer | your image, linearised to RGBA16F |
-| Depth | depth buffer | Depth Anything V2, reversed-Z |
+| Depth | hardware depth buffer | Depth Anything V2, reversed-Z |
 | Motion vectors | velocity buffer | zeros — nothing moved |
-| Jitter | sub-pixel projection | Halton sub-pixel resample |
+| Jitter | sub-pixel projection | optional Halton sub-pixel resample |
 
-The depth mapping is the load-bearing trick, and it's a lucky one. Games use reversed-Z
-(near = 1.0, far = 0.0). Depth Anything V2 outputs normalised inverse depth — near = 1.0,
-far = 0.0. Same curve. No reprojection needed.
+The depth mapping is the load-bearing trick, and it is a lucky one. Games almost
+universally use reversed-Z with an infinite far plane: near objects at 1.0, far at
+0.0. Depth Anything V2 emits normalised inverse relative depth — near at 1.0, far at
+0.0. Same curve. No reprojection, no metric depth, no camera.
 
-It runs a hidden 64×64 swapchain and presents per evaluation, which turns out to be
-enough for ReShade to attach and load the add-on in a **headless** process.
+The harness runs a hidden 64×64 swapchain and presents once per evaluation, which
+turns out to be enough for ReShade to attach and load the add-on in a **headless**
+process. That was the open question the whole project rested on.
 
-## What you need
+## Requirements
 
-Nothing NVIDIA ships with this and it will not help you get it.
+- Windows 11, an **RTX** GPU (DLSS is required, so this is not optional)
+- Your own copies of:
 
-- `nvngx_dlssnr.dll` — your own copy (RTX 40-series needs the patched build)
-- `nvngx_dlss.dll` — from a Streamline `Production` folder
-- `renodx-dlss5.addon64`
-- `dxgi.dll` — ReShade. **Already have ReShade in a game? Just copy that game's
-  `bin\x64\dxgi.dll`.** No need to touch the installer.
+| File | Where it comes from |
+| ---- | ------------------- |
+| `nvngx_dlssnr.dll` | your own copy — RTX 40-series needs the patched build |
+| `nvngx_dlss.dll` | a Streamline `Production` folder |
+| `renodx-dlss5.addon64` | the RenoDX DLSS 5 add-on |
+| `dxgi.dll` | ReShade. Already have it in a game? Copy that game's `bin\x64\dxgi.dll` — no need to touch the installer. |
 
-Drop all four in the `dlss_files` folder next to the exe. Hit **Check runtime** and you should get:
+## Install (portable)
+
+1. Download the zip from [Releases](../../releases) and unpack it anywhere.
+2. Put your four files in `dlss_files\`.
+3. Run `DLSS5Converter.exe`.
+
+First launch downloads **PyTorch** (~1.8 GB, from `download.pytorch.org`) and a
+**Depth Anything V2** model (~400 MB, from `huggingface.co`), each with a progress
+bar showing megabytes, rate and time remaining. Both land in folders beside the exe
+and are kept.
+
+```
+DLSS5Converter.exe
+dlss_files\   your own DLSS 5 binaries    <- you fill this
+models\       depth weights               <- downloaded on first launch
+pytorch\      PyTorch                     <- downloaded on first launch
+output\       converted images
+engine\       the DLSS harness
+```
+
+Click **Check runtime**. You want all of this:
 
 ```
 adapter: NVIDIA GeForce RTX 4080
@@ -53,73 +77,112 @@ reshade_proxy_loaded: 1
 dlssnr_module_loaded: 1
 ```
 
-If the first three are 1 and the last is 0, DLSS works and the neural pass doesn't —
-you still get a picture, just a plain DLAA resolve. That's the most confusing failure
-this thing has, so check it first.
-
-## Findings that might be useful to you
-
-I measured these rather than guessed, and some contradict what's floating around:
-
-- **`NRIntensity` and friends really do go to 2.0**, not 1.0. Output keeps changing all
-  the way up and is identical at 3.0. (I initially measured a ceiling of 1.0 on a synthetic
-  test card — don't measure saturation on synthetic input, photos behave differently.)
-- **`NRStyle` is a big effect.** Cinematic lands ~50% further from the source than Natural
-  at matched strengths.
-- **`NRPreset` appears inert with upscaling off.** All four presets came back *bit-identical*
-  on my portrait tests. The add-on echoes `preset=3` back in its log, so it receives the
-  value — it just doesn't change the native/DLAA path. My guess is it selects an SR preset.
-  Happy to be proven wrong if someone sees otherwise.
-- **`NeuralUplift=0` is a clean off switch** — bit-identical to a plain DLAA resolve.
-  Good A/B control.
-- **`--frames 1` silently does nothing.** The add-on installs its NGX hooks on the first
-  evaluate, so that first one can't be intercepted. Use 2 or more. Default is 8, and the
-  result stops changing by about 8.
-- Settings are read **once, at add-on load** — flipping the ini mid-run does nothing, so
-  every settings change means a new process (~3.5 s, and it barely depends on resolution).
+If the first three are 1 and `neural_addon_loaded` is 0, DLSS is working and the
+neural pass is not. **You still get a picture** — a plain DLAA resolve that looks
+like a mild sharpen — which is the single most confusing failure this tool has.
+Check this before anything else.
 
 ## Using it
 
-Depth runs as soon as you open an image, so you can look at the **depth mask** and tune
-its contrast live before spending a DLSS pass on it.
+Depth is estimated as soon as you open an image, so the **Depth mask** view is
+available before you spend a DLSS pass. Its contrast slider redraws live, because
+contrast is applied to the finished depth array rather than fed back into the model.
 
-**Live preview** re-runs DLSS when a slider settles — budget ~4 s per change. That's not
-render cost, it's add-on init: settings are startup-only, so each change is a fresh
-process. Depth is cached across runs so you don't pay for it twice.
+**Live preview** re-runs DLSS when a slider settles. Budget about four seconds per
+change — that is not render cost. The add-on reads its settings once at startup, so
+every change is a fresh process, and ~3.5 s of the four is NGX and add-on
+initialisation regardless of image size. Depth is cached across runs, and a slider
+drag is debounced into a single evaluation.
 
-Sliders map straight onto the add-on's own: Intensity, Skin Structure, Local Tone,
-Local Structure, plus Preset/Style and an HDR group (Paper White 0–16, HDR Transfer 0–1,
-Colour Strength 0–1) for the HDR/OLED crowd.
+Sliders map onto the add-on's own controls: Intensity, Skin, Local Tone, Structure
+(0–2), plus Preset/Style and an HDR group — Paper White (0–16), HDR Transfer (0–1),
+Colour Strength (0–1) — for HDR and OLED displays.
 
-## What it's good at
+### Command line
 
-Game screenshots, 3D renders, CG stills. DLSS 5 was trained to push *rendered* images
-toward photoreal, so it has the most to say about images that started out rendered.
+```powershell
+.\.venv-cuda\Scripts\python.exe -m dlss5_converter.pipeline in.jpg out.png `
+    --frames 8 --intensity 0.7 --skin 0.5 --tiled-depth
+```
 
-On real photographs it does less, and what it does is more likely to read as uncanny —
-the model adds cues it expects a render to be missing, and a photo already has them.
-Drop **Skin** first when faces go waxy. That's the model, not the harness.
+## What it is good at
 
-## On trust
+Game screenshots, 3D renders, and CG stills. DLSS 5 was trained to push *rendered*
+images towards photoreal, so it has the most to say about images that started out
+rendered.
 
-Fair question for a random exe, so:
+On real photographs it does less, and what it does is more likely to read as
+uncanny — the model adds the cues it expects a render to be missing, and a
+photograph already has them. Lower **Skin** first when faces go waxy. That is a
+property of the model, not a bug in the harness.
 
-- **Source is public.** Build it yourself: one PowerShell script for the Python side,
-  one for the C++ harness.
-- **No NVIDIA binaries are bundled**, and there's no downloader for them. The build
-  literally refuses to finish if any `nvngx_*.dll`, `*.addon64` or `dxgi.dll` ends up
-  inside the app.
-- The download is ~400 MB. On first launch it fetches **PyTorch** (from
-  `download.pytorch.org`) and **Depth Anything V2** (from `huggingface.co`), with a
-  progress bar. Those two hosts are the only things it talks to. Nothing else phones home.
-- Python side is ~2500 lines; the only NVIDIA-facing code is one ~600-line C++ file.
+## Measured behaviour
 
-MIT, except nothing here grants any rights to NVIDIA's binaries.
+Findings from bring-up, measured rather than assumed. Full detail and method in
+[ROADMAP.md](ROADMAP.md).
 
-## Known issues
+- **The strength knobs go to 2.0**, not 1.0. Output keeps changing all the way up and
+  is identical at 3.0. An earlier measurement of 1.0 came from a synthetic test card,
+  which stops responding above 1 where a photograph does not.
+- **`NRStyle` is a large effect** — Cinematic lands ~50% further from the source than
+  Natural at matched strengths.
+- **`NRPreset` appears inert** with upscaling off: all four presets measured
+  bit-identical, though the add-on echoes the value back in its log. It most likely
+  selects a Super Resolution preset that a DLAA-only path never reaches.
+- **`NeuralUplift=0` is a clean off switch**, bit-identical to a plain DLAA resolve.
+- **`--frames 1` silently skips the neural pass entirely.** The add-on installs its
+  NGX hooks on the first evaluate, so that one cannot be intercepted. Use 2 or more;
+  the default is 8, and the result stops changing by about 8.
+- Settings are read **once, at add-on load**. Flipping the ini mid-run does nothing.
 
-- `--frames 1` skips the neural pass entirely (see above). Leave it at 8.
-- `NRPreset` does nothing that I can measure.
-- First launch needs ~2.2 GB of downloads before it's usable.
-- Tested on one machine: RTX 4080, driver 616.56, ReShade 6.8.0.2155,
-  RenoDX DLSS5 Generic v4.1.5. Reports from other setups very welcome.
+## Build from source
+
+```powershell
+.\scripts\setup.ps1 -Cuda      # Python 3.12 venv; -Cuda gets GPU depth estimation
+.\scripts\build_native.ps1     # clones the NGX SDK, builds dlss5_eval.exe
+.\scripts\run.ps1
+```
+
+Needs Python 3.12, git, and Visual Studio with the C++ workload. CMake is found
+inside Visual Studio if it is not on PATH. The SDK clone is blobless and sparse
+(~85 MB rather than ~1 GB).
+
+`.\scripts\build_release.ps1` produces the portable folder. It **refuses to finish**
+if any `nvngx_*.dll`, `*.addon64` or `dxgi.dll` has ended up inside the application,
+so "bring your own files" is a property of the build rather than something to
+remember. `dlss_files`, `models`, `pytorch` and `output` survive a rebuild.
+
+Tests: `.\.venv-cuda\Scripts\python.exe -m pytest`
+
+## Layout
+
+```
+dlss5_converter/     Python: GUI, depth, contract construction
+  contract.py        the interesting part — photo to DLAA frame
+  runtime.py         locating the user's binaries, and the add-on's ini
+  evaluator.py       line protocol to the harness
+  pipeline.py        the whole conversion, runnable headless
+  bootstrap.py       first-launch runtime download
+native/dlss5_eval/   C++: D3D12 + NGX. The only NVIDIA-facing code.
+scripts/             setup / build / run
+```
+
+Python never links against NGX. The harness is a plain CLI that reads raw binary
+planes and writes one back, so it can be run and debugged by hand, and a crash
+inside DLSS cannot take the app down with it.
+
+## Trust
+
+Reasonable question for a random executable:
+
+- The source is here. Build it yourself with the two scripts above.
+- **No NVIDIA binaries are bundled and there is no downloader for them.**
+- The app talks to exactly two hosts, both on first launch: `download.pytorch.org`
+  and `huggingface.co`. Nothing else phones home, and there is no telemetry.
+- Roughly 2,500 lines of Python and one ~600-line C++ file.
+
+## Licence
+
+[MIT](LICENSE), except that nothing here grants any rights to NVIDIA's binaries.
+`nvngx_dlssnr.dll` is a leaked pre-release NVIDIA file; this repository does not
+ship it, reference it by hash, or help anyone acquire it.
