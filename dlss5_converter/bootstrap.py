@@ -95,12 +95,45 @@ def is_ready() -> bool:
         return False
 
 
+def _remote_size(url: str) -> int:
+    request = Request(url, headers={"User-Agent": "dlss5-converter"}, method="HEAD")
+    with urlopen(request, timeout=30) as response:
+        return int(response.headers.get("Content-Length") or 0)
+
+
 def _download(url: str, destination: Path, on_bytes: BytesProgress | None) -> None:
-    request = Request(url, headers={"User-Agent": "dlss5-converter"})
+    """Fetch `url` to `destination`, resuming a partial file if one is there.
+
+    Resume matters more than it looks: this is nearly two gigabytes, the people
+    running it are on domestic connections, and without a Range request every
+    transient failure restarts from zero.
+    """
+    expected = _remote_size(url)
+    have = destination.stat().st_size if destination.exists() else 0
+
+    if expected and have == expected:
+        if on_bytes:
+            on_bytes(expected, expected)
+        return
+    if have > expected > 0:
+        # Longer than the file it claims to be; start over rather than guess.
+        destination.unlink()
+        have = 0
+
+    headers = {"User-Agent": "dlss5-converter"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+
+    request = Request(url, headers=headers)
     with urlopen(request, timeout=60) as response:
-        total = int(response.headers.get("Content-Length") or TORCH_APPROX_BYTES)
-        done = 0
-        with open(destination, "wb") as handle:
+        resuming = response.status == 206
+        if not resuming:
+            have = 0
+        total = expected or (
+            int(response.headers.get("Content-Length") or TORCH_APPROX_BYTES) + have
+        )
+        done = have
+        with open(destination, "ab" if resuming else "wb") as handle:
             while True:
                 chunk = response.read(1024 * 512)
                 if not chunk:
@@ -109,6 +142,7 @@ def _download(url: str, destination: Path, on_bytes: BytesProgress | None) -> No
                 done += len(chunk)
                 if on_bytes:
                     on_bytes(done, total)
+
     if done < total * 0.99:
         raise OSError(
             f"Download stopped early: {done} of {total} bytes. "
@@ -142,11 +176,11 @@ def install(
     staging = target.with_name(target.name + ".partial")
     archive = target.with_name(target.name + ".whl.part")
 
-    for leftover in (staging, archive):
-        if leftover.is_dir():
-            shutil.rmtree(leftover, ignore_errors=True)
-        elif leftover.exists():
-            leftover.unlink()
+    # Only the staging tree is cleared up front. The archive is deliberately
+    # left alone so a retry resumes it: throwing away 1.8 GB because the
+    # *unpack* failed is a punishing way to handle a recoverable error.
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -164,13 +198,16 @@ def install(
         if target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
         staging.rename(target)
-    finally:
-        if archive.exists():
-            try:
-                archive.unlink()
-            except OSError:
-                pass
+    except BaseException:
+        # Keep the archive for the next attempt; drop only the half-unpacked
+        # tree, which is the part that would confuse is_ready().
         if staging.is_dir():
             shutil.rmtree(staging, ignore_errors=True)
+        raise
 
+    # Success: the archive has done its job and is 1.8 GB of dead weight.
+    try:
+        archive.unlink()
+    except OSError:
+        pass
     activate()

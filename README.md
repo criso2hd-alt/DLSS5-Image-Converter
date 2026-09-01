@@ -1,7 +1,8 @@
 # DLSS 5 Image Converter
 
 Run NVIDIA's DLSS 5 neural renderer over a **still image** instead of a game frame.
-Drag and drop, paste (Ctrl+V), or browse.
+Drag and drop, paste (Ctrl+V), or browse. Free to use; please link here rather
+than reuploading.
 
 This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of the look.
 
@@ -183,6 +184,17 @@ Reasonable question for a random executable:
 
 ## Licence
 
-[MIT](LICENSE), except that nothing here grants any rights to NVIDIA's binaries.
-`nvngx_dlssnr.dll` is a leaked pre-release NVIDIA file; this repository does not
-ship it, reference it by hash, or help anyone acquire it.
+**Source-available, not open source.** See [LICENSE](LICENSE).
+
+Free to use, personally or commercially. The source is here so you can read it,
+audit it, and build it yourself.
+
+Please do not redistribute it — no mirrors, reuploads, repacks, or packaged
+builds — and do not sell it or put it behind a paywall, supporter tier, or ad
+gateway. **Send people to this repository instead.** That way everyone gets the
+current version, and anyone worried about what an executable does can check the
+source it came from.
+
+Nothing here grants any rights to NVIDIA's binaries. `nvngx_dlssnr.dll` is a
+leaked pre-release NVIDIA file; this repository does not ship it, reference it
+by hash, or help anyone acquire it.

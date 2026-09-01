@@ -133,7 +133,10 @@ class RuntimeWorker(QObject):
     """Downloads and unpacks PyTorch off the UI thread."""
 
     progress = Signal(str)
-    bytes_progress = Signal(int, int)
+    # object, not int: Qt's int is 32-bit and these totals are not. The
+    # unpacked torch tree is 2.87 GB, which overflows a signed 32-bit int
+    # and made every progress emit raise OverflowError mid-extraction.
+    bytes_progress = Signal(object, object)
     finished = Signal()
     failed = Signal(str)
 
@@ -211,7 +214,10 @@ class DownloadWorker(QObject):
     """Fetches a depth model off the UI thread, reporting bytes as it goes."""
 
     progress = Signal(str)
-    bytes_progress = Signal(int, int)
+    # object, not int: Qt's int is 32-bit and these totals are not. The
+    # unpacked torch tree is 2.87 GB, which overflows a signed 32-bit int
+    # and made every progress emit raise OverflowError mid-extraction.
+    bytes_progress = Signal(object, object)
     finished = Signal()
     failed = Signal(str)
 

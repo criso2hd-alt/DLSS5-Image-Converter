@@ -64,10 +64,17 @@ $ErrorActionPreference = "Continue"
 # instead. Its own metadata comes from the wheel's dist-info, which lands on
 # sys.path with it.
 #
-# Its pure-Python dependencies do have to stay bundled, though. They are
-# separate packages, the torch wheel does not carry them, and with torch
-# excluded nothing else in the graph imports them - so without these the
-# downloaded torch would fail on "No module named sympy".
+# Its dependencies do have to stay bundled, though, and there are two kinds.
+#
+# Third-party (sympy, networkx, jinja2...) are separate packages the torch wheel
+# does not carry. Standard library (pickletools, dis, tarfile...) are modules
+# that only torch reaches for - with torch out of the analysis, PyInstaller sees
+# nothing referencing them and leaves them out of the bundle entirely.
+#
+# Both failures look identical and both are invisible until the first
+# conversion, because bootstrap.is_ready only locates torch rather than
+# importing it. `DLSS5Converter.exe --selftest` is what catches them; it found
+# "No module named 'pickletools'" in the first lean build.
 & $Python -m PyInstaller `
     --noconfirm `
     --windowed `
@@ -83,6 +90,56 @@ $ErrorActionPreference = "Continue"
     --hidden-import mpmath `
     --hidden-import filelock `
     --hidden-import typing_extensions `
+    --hidden-import pickletools `
+    --hidden-import dis `
+    --hidden-import ast `
+    --hidden-import tokenize `
+    --hidden-import inspect `
+    --hidden-import linecache `
+    --hidden-import difflib `
+    --hidden-import textwrap `
+    --hidden-import pprint `
+    --hidden-import copy `
+    --hidden-import copyreg `
+    --hidden-import weakref `
+    --hidden-import dataclasses `
+    --hidden-import contextlib `
+    --hidden-import sysconfig `
+    --hidden-import platform `
+    --hidden-import glob `
+    --hidden-import fnmatch `
+    --hidden-import tarfile `
+    --hidden-import gzip `
+    --hidden-import bz2 `
+    --hidden-import lzma `
+    --hidden-import zipfile `
+    --hidden-import shutil `
+    --hidden-import tempfile `
+    --hidden-import subprocess `
+    --hidden-import multiprocessing `
+    --hidden-import queue `
+    --hidden-import ctypes.util `
+    --hidden-import decimal `
+    --hidden-import fractions `
+    --hidden-import numbers `
+    --hidden-import statistics `
+    --hidden-import bisect `
+    --hidden-import heapq `
+    --hidden-import array `
+    --hidden-import mmap `
+    --hidden-import struct `
+    --hidden-import uuid `
+    --hidden-import string `
+    --hidden-import unicodedata `
+    --hidden-import csv `
+    --hidden-import logging.config `
+    --hidden-import logging.handlers `
+    --hidden-import unittest `
+    --hidden-import unittest.mock `
+    --hidden-import doctest `
+    --hidden-import argparse `
+    --hidden-import importlib.metadata `
+    --hidden-import importlib.machinery `
     --collect-all transformers `
     --collect-all tokenizers `
     --collect-data safetensors `

@@ -1,30 +1,67 @@
-MIT License
+DLSS 5 Image Converter — Licence
+Copyright (c) 2026 criso2hd-alt. All rights reserved.
 
-Copyright (c) 2026 criso2hd-alt
+This is source-available software, not open source. The source is published so
+that anyone can read it, audit it, and build it for themselves. It is not
+published for redistribution.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+YOU MAY
+
+  1. Use this software for any purpose, personal or commercial, free of charge.
+  2. Read, study, and audit the source code.
+  3. Build it from source for your own use.
+  4. Modify it for your own use.
+  5. Link to the official repository, and share screenshots, comparisons, videos
+     and reviews of output produced with it.
+
+
+YOU MAY NOT
+
+  6. Sell, licence, rent, or otherwise charge for this software, in whole or in
+     part, whether on its own or bundled with anything else.
+  7. Redistribute it — including builds, modified versions, forks published as
+     downloads, mirrors, reuploads, installers, or "repacks". Direct people to
+     the official repository instead:
+
+         https://github.com/criso2hd-alt/DLSS5-Image-Converter
+
+  8. Put it behind a paywall, a subscription, a "supporter" tier, an ad gateway,
+     a link shortener that pays you, or any other arrangement that extracts
+     money or attention as a condition of obtaining it.
+  9. Present it as your own work, or remove or obscure this notice.
+
+
+NO WARRANTY
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHOR BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
----
+
+THIRD-PARTY COMPONENTS
 
 This licence covers the source in this repository only.
 
-It grants no rights whatsoever to NVIDIA's binaries. `nvngx_dlssnr.dll`,
-`nvngx_dlss.dll`, the RenoDX add-on and ReShade are not distributed here, are
-not obtainable through this project, and remain under their own terms. Users
-supply their own copies.
+It grants no rights whatsoever to NVIDIA's binaries. nvngx_dlssnr.dll,
+nvngx_dlss.dll, the RenoDX add-on and ReShade are not distributed here, are not
+obtainable through this project, and remain entirely under their own terms.
+Users supply their own copies.
+
+The application downloads PyTorch and Depth Anything V2 at run time, directly
+from their own official hosts. Those are covered by their own licences (BSD-3
+for PyTorch; Apache 2.0 for Depth Anything V2 Small, CC-BY-NC-4.0 for Base and
+Large) and nothing here alters them.
+
+
+NOTE ON FORKING
+
+This repository is public on GitHub. GitHub's Terms of Service grant every
+GitHub user the right to view and fork public repositories through GitHub's own
+interface, and that permission comes from those Terms rather than from this
+licence — clause 7 cannot and does not override it. What clause 7 does prohibit
+is distributing this software outside that: reuploads, mirrors, packaged builds,
+and any copy offered for download elsewhere.
