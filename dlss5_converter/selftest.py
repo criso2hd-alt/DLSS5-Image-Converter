@@ -116,6 +116,34 @@ def run_selftest() -> int:
             _line(f"probe            : FAILED - {error}")
             failures += 1
 
+        # A real conversion, end to end. The probe only proves the harness
+        # starts; this drives the whole FRAME/WRITE protocol, the plane layout
+        # and the readback, which is what a user's first click actually does.
+        # Two passes because one silently skips the neural pass entirely.
+        try:
+            import numpy as np
+
+            from . import pipeline
+            from .settings import AppSettings
+
+            settings = AppSettings()
+            settings.evaluation.frames = 2
+            settings.evaluation.max_edge = 512
+
+            scratch = paths.scratch_dir()
+            sample = scratch / "selftest_input.png"
+            rng = np.random.default_rng(0)
+            pipeline.save_image(rng.random((256, 256, 3)).astype("float32"), sample)
+
+            result = pipeline.convert(sample, settings, DepthEngine())
+            _line(
+                f"conversion       : ok {result.enhanced.shape[1]}x"
+                f"{result.enhanced.shape[0]} ({result.notes})"
+            )
+        except Exception as error:  # noqa: BLE001
+            _line(f"conversion       : FAILED - {type(error).__name__}: {error}")
+            failures += 1
+
     _line("=" * 46)
     _line("PASS" if failures == 0 else f"{failures} problem(s)")
     return 1 if failures else 0
