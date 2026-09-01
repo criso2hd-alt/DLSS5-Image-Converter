@@ -105,7 +105,126 @@ class DropZone(QFrame):
         self.style().polish(self)
 
 
-class ImageView(QWidget):
+class CanvasView(QWidget):
+    """Shared zoom and pan for the image views.
+
+    Wheel zooms about the cursor, right-drag pans, double-click fits again.
+    Right rather than left because the comparison view already uses left-drag
+    for its divider, and losing that to panning would be a bad trade.
+
+    Zooming matters more here than in most viewers: people are running 6K and 8K
+    renders through this and judging changes — pore detail, fabric weave, hair
+    silhouettes — that simply are not visible in a fit-to-window view.
+    """
+
+    MIN_ZOOM = 1.0
+    MAX_ZOOM = 32.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._panning = False
+        self._pan_from = QPointF(0.0, 0.0)
+        self.setMinimumSize(480, 320)
+
+    # -- geometry ------------------------------------------------------------
+
+    def _fit_rect(self, size) -> QRectF:
+        """The image at 100% fit, centred, ignoring zoom and pan."""
+        if size.width() <= 0 or size.height() <= 0:
+            return QRectF()
+        scale = min(self.width() / size.width(), self.height() / size.height())
+        width, height = size.width() * scale, size.height() * scale
+        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+
+    def _display_rect(self, size) -> QRectF:
+        base = self._fit_rect(size)
+        if base.isEmpty():
+            return base
+        width, height = base.width() * self._zoom, base.height() * self._zoom
+        left = base.center().x() - width / 2 + self._pan.x()
+        top = base.center().y() - height / 2 + self._pan.y()
+        return QRectF(left, top, width, height)
+
+    def _content_size(self):
+        """Subclasses return the pixmap size they are drawing, or None."""
+        return None
+
+    def reset_view(self) -> None:
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self.update()
+
+    def _clamp_pan(self) -> None:
+        """Keep some of the image on screen at all times."""
+        size = self._content_size()
+        if size is None:
+            return
+        rect = self._display_rect(size)
+        margin_x = max(0.0, (rect.width() - self.width()) / 2)
+        margin_y = max(0.0, (rect.height() - self.height()) / 2)
+        self._pan.setX(float(np.clip(self._pan.x(), -margin_x, margin_x)))
+        self._pan.setY(float(np.clip(self._pan.y(), -margin_y, margin_y)))
+
+    # -- interaction ---------------------------------------------------------
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt name
+        size = self._content_size()
+        if size is None:
+            return
+        steps = event.angleDelta().y() / 120.0
+        if not steps:
+            return
+        previous = self._zoom
+        self._zoom = float(np.clip(previous * (1.25**steps), self.MIN_ZOOM, self.MAX_ZOOM))
+        if self._zoom == previous:
+            return
+
+        # Keep whatever is under the cursor under the cursor. Without this,
+        # zooming always creeps towards the centre and you lose the detail you
+        # were aiming at.
+        cursor = event.position()
+        before = self._display_rect(size)
+        if before.width() > 0 and before.height() > 0:
+            u = (cursor.x() - before.left()) / before.width()
+            v = (cursor.y() - before.top()) / before.height()
+            self._pan = QPointF(0.0, 0.0) + self._pan  # copy
+            after = self._display_rect(size)
+            self._pan.setX(self._pan.x() + cursor.x() - (after.left() + u * after.width()))
+            self._pan.setY(self._pan.y() + cursor.y() - (after.top() + v * after.height()))
+        if self._zoom <= self.MIN_ZOOM:
+            self._pan = QPointF(0.0, 0.0)
+        self._clamp_pan()
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        if event.button() == Qt.MouseButton.RightButton:
+            self._panning = True
+            self._pan_from = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        if self._panning:
+            delta = event.position() - self._pan_from
+            self._pan_from = event.position()
+            self._pan += delta
+            self._clamp_pan()
+            self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        if event.button() == Qt.MouseButton.RightButton:
+            self._panning = False
+            self.unsetCursor()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        self.reset_view()
+
+    def _zoom_caption(self) -> str:
+        return "" if self._zoom <= 1.001 else f"{self._zoom:.1f}x  ·  right-drag to pan"
+
+
+class ImageView(CanvasView):
     """One image, scaled to fit and centred.
 
     Used for the source photo and the depth mask. Deliberately not a QLabel with
@@ -118,11 +237,21 @@ class ImageView(QWidget):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self._caption = ""
-        self.setMinimumSize(480, 320)
+
+    def _content_size(self):
+        return self._pixmap.size() if self._pixmap is not None else None
 
     def set_pixmap(self, pixmap: QPixmap | None, caption: str = "") -> None:
+        # A new image at the old zoom would land the viewport somewhere
+        # arbitrary, so start fitted. Re-rendering the *same* image at a new
+        # depth contrast goes through here too, but that only changes colour.
+        changed = self._pixmap is None or pixmap is None or (
+            self._pixmap.size() != pixmap.size()
+        )
         self._pixmap = pixmap
         self._caption = caption
+        if changed:
+            self.reset_view()
         self.update()
 
     def set_image_u8(self, image_rgb: np.ndarray, caption: str = "") -> None:
@@ -140,11 +269,14 @@ class ImageView(QWidget):
         if self._pixmap is None:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        size = self._pixmap.size()
-        scale = min(self.width() / size.width(), self.height() / size.height())
-        width, height = size.width() * scale, size.height() * scale
-        rect = QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+        rect = self._display_rect(self._pixmap.size())
         painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
+        zoom = self._zoom_caption()
+        if zoom:
+            painter.setPen(self.palette().text().color())
+            painter.drawText(
+                QRectF(0, 6, self.width(), 20), Qt.AlignmentFlag.AlignCenter, zoom
+            )
         if self._caption:
             painter.setPen(self.palette().text().color())
             painter.drawText(
@@ -154,7 +286,7 @@ class ImageView(QWidget):
             )
 
 
-class WipeView(QWidget):
+class WipeView(CanvasView):
     """Before/after comparison with a divider the user drags.
 
     A wipe rather than side-by-side panes because the differences DLSS 5 makes —
@@ -169,12 +301,32 @@ class WipeView(QWidget):
         self._after: QPixmap | None = None
         self._split = 0.5
         self._dragging = False
-        self.setMinimumSize(480, 320)
         self.setMouseTracking(True)
 
+    def _content_size(self):
+        return self._before.size() if self._before is not None else None
+
     def set_images(self, before: np.ndarray, after: np.ndarray) -> None:
+        # Only refit when the image itself changes shape. Re-grading redraws
+        # this constantly, and snapping back to fit on every slider tick would
+        # make the grade impossible to judge while zoomed in.
+        changed = self._before is None or self._before.size() != QPixmap.fromImage(
+            to_qimage(before)
+        ).size()
         self._before = QPixmap.fromImage(to_qimage(before))
         self._after = QPixmap.fromImage(to_qimage(after))
+        if changed:
+            self.reset_view()
+        self.update()
+
+    def set_images_u8(self, before: np.ndarray, after: np.ndarray) -> None:
+        """Same as set_images but for 8-bit arrays, which the grade produces."""
+        pixmap = QPixmap.fromImage(to_qimage_u8(before))
+        changed = self._before is None or self._before.size() != pixmap.size()
+        self._before = pixmap
+        self._after = QPixmap.fromImage(to_qimage_u8(after))
+        if changed:
+            self.reset_view()
         self.update()
 
     def clear(self) -> None:
@@ -184,10 +336,7 @@ class WipeView(QWidget):
     def _target_rect(self) -> QRectF:
         if self._before is None:
             return QRectF()
-        size = self._before.size()
-        scale = min(self.width() / size.width(), self.height() / size.height())
-        width, height = size.width() * scale, size.height() * scale
-        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+        return self._display_rect(self._before.size())
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
@@ -210,15 +359,23 @@ class WipeView(QWidget):
         painter.drawLine(QPointF(split_x, rect.top()), QPointF(split_x, rect.bottom()))
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
-        self._dragging = True
-        self._move_split(event.position().x())
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._move_split(event.position().x())
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
         if self._dragging:
             self._move_split(event.position().x())
+        else:
+            super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
-        self._dragging = False
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+        else:
+            super().mouseReleaseEvent(event)
 
     def _move_split(self, x: float) -> None:
         rect = self._target_rect()
@@ -344,17 +501,19 @@ class SliderRow(QWidget):
         tooltip: str = "",
         parent: QWidget | None = None,
         maximum: float = 1.0,
+        minimum: float = 0.0,
     ) -> None:
         super().__init__(parent)
         self._on_change = on_change
         self._maximum = float(maximum)
+        self._minimum = float(minimum)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 4)
         layout.setSpacing(2)
 
         header = QHBoxLayout()
         name = QLabel(label)
-        self._value = QLabel(f"{value:.2f}")
+        self._value = QLabel(f"{value:+.2f}" if minimum < 0 else f"{value:.2f}")
         self._value.setObjectName("hint")
         header.addWidget(name)
         header.addStretch(1)
@@ -364,7 +523,7 @@ class SliderRow(QWidget):
         # Sliders are integers. The step is fixed at 0.01 of a unit rather than
         # a fraction of the range, so a 0..2 slider gets 200 positions and the
         # readout stays aimable at the same precision as a 0..1 one.
-        self._steps = max(1, int(round(self._maximum * 100)))
+        self._steps = max(1, int(round((self._maximum - self._minimum) * 100)))
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(0, self._steps)
         self._slider.setValue(self._to_raw(value))
@@ -376,12 +535,18 @@ class SliderRow(QWidget):
             name.setToolTip(tooltip)
 
     def _to_raw(self, value: float) -> int:
-        scaled = float(value) / self._maximum * self._steps
+        span = self._maximum - self._minimum
+        scaled = (float(value) - self._minimum) / span * self._steps
         return int(round(min(self._steps, max(0, scaled))))
 
+    def _from_raw(self, raw: int) -> float:
+        return self._minimum + raw / self._steps * (self._maximum - self._minimum)
+
     def _changed(self, raw: int) -> None:
-        value = raw / self._steps * self._maximum
-        self._value.setText(f"{value:.2f}")
+        value = self._from_raw(raw)
+        # A bipolar control reads much better with the sign shown: "+0.35" and
+        # "-0.35" are obviously opposites in a way "0.35" is not.
+        self._value.setText(f"{value:+.2f}" if self._minimum < 0 else f"{value:.2f}")
         self._on_change(value)
 
     def set_value(self, value: float) -> None:

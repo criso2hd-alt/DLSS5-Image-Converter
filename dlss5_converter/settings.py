@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .depth_engine import DEFAULT_MODEL
+from .grade import GradeSettings
 
 
 #: The add-on's own combo items, in its order. The ini stores the *index*, so
@@ -140,6 +141,9 @@ class AppSettings:
     neural: NeuralSettings = field(default_factory=NeuralSettings)
     depth: DepthSettings = field(default_factory=DepthSettings)
     evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
+    #: Applied to the finished image, after the neural pass. Neutral by default,
+    #: so it costs nothing until someone touches it.
+    grade: GradeSettings = field(default_factory=GradeSettings)
     #: Folder holding the user's own nvngx_dlssnr.dll and the RenoDX add-on.
     #: Empty means "search the usual places" (see paths.runtime_search_roots).
     runtime_dir: str = ""
