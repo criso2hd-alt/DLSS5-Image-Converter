@@ -10,6 +10,18 @@ This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of t
 > this project will not help you obtain them. You point it at the copies you
 > already have.
 
+![The converter, mid-comparison](app_images_examples/001.webp)
+
+Drag the divider to compare before and after. Everything on the right maps
+straight onto the RenoDX add-on's own controls.
+
+![The same frame, wiped to the result](app_images_examples/002.webp)
+
+![The depth mask](app_images_examples/003.webp)
+
+Depth is estimated the moment you open an image, so you can judge the mask — and
+tune its contrast live — before spending a DLSS pass on it. Near is red.
+
 ---
 
 ## How it works
