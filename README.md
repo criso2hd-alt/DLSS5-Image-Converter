@@ -10,12 +10,19 @@ This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of t
 > this project will not help you obtain them. You point it at the copies you
 > already have.
 
-![The converter, mid-comparison](app_images_examples/001.webp)
+The same frame, before and after. The blue line is the wipe divider — drag it
+across the image to compare; everything left of it is the original.
 
-Drag the divider to compare before and after. Everything on the right maps
-straight onto the RenoDX add-on's own controls.
+**Before** — divider at the right, so this is almost entirely the source image:
 
-![The same frame, wiped to the result](app_images_examples/002.webp)
+![Before: the source frame](app_images_examples/001.webp)
+
+**After** — divider at the left, so this is the DLSS 5 neural pass, at Intensity,
+Skin, Local Tone and Structure 2.00, Preset #1, Cinematic, 8 passes:
+
+![After: the neural pass at full strength](app_images_examples/002.webp)
+
+The controls on the right map straight onto the RenoDX add-on's own.
 
 ![The depth mask](app_images_examples/003.webp)
 
