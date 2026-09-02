@@ -318,6 +318,21 @@ Reasonable question for a random executable:
   and `huggingface.co`. Nothing else phones home, and there is no telemetry.
 - Roughly 2,500 lines of Python and one ~600-line C++ file.
 
+## Something not working?
+
+[**TROUBLESHOOTING.md**](TROUBLESHOOTING.md) covers every issue reported so far.
+Start with:
+
+```powershell
+DLSS5Converter.exe --selftest 2> report.txt
+```
+
+That runs a real conversion end to end and prints your GPU, driver, add-on
+version and what the add-on said. Most questions answer themselves from it.
+
+There is a Blender test scene in [`blender/`](blender/) that renders matched
+beauty and depth sequences for trying out sequence mode.
+
 ## Support
 
 This is free, and staying free. If it saved you time and you feel like it, there
