@@ -54,6 +54,10 @@ namespace {
 // stable matters because NGX caches per-app state between runs.
 constexpr unsigned long long kAppId = 0x44'4C'53'35'49'4D'47'01ull;
 
+// PCI vendor id for NVIDIA, used to choose the adapter deliberately rather than
+// taking whichever one Windows enumerates first.
+constexpr UINT kNvidiaVendorId = 0x10DE;
+
 struct Options {
     int width = 0;
     int height = 0;
@@ -201,6 +205,11 @@ private:
     ComPtr<ID3D12Resource> readback_;
     UINT readback_row_pitch_ = 0;
 
+    //: The adapter the device was actually created on, so diagnostics report
+    //: the GPU in use rather than the one that happened to enumerate first.
+    std::wstring adapter_description_;
+    bool adapter_is_nvidia_ = false;
+
     NVSDK_NGX_Parameter* params_ = nullptr;
     NVSDK_NGX_Handle* feature_ = nullptr;
     bool ngx_ready_ = false;
@@ -330,8 +339,36 @@ void Harness::Initialise(const Options& options) {
 
     ComPtr<IDXGIFactory4> factory;
     Require(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2");
+
+    // The default adapter, deliberately.
+    //
+    // Selecting the NVIDIA adapter explicitly looks like the obvious fix for a
+    // machine that has an integrated GPU as adapter 0 - and it was tried here -
+    // but passing any explicit adapter to D3D12CreateDevice makes NGX refuse the
+    // resulting device with FAIL_FeatureNotSupported, on a card that works
+    // perfectly through the default path. Verified with and without ReShade
+    // loaded, so it is not the proxy wrapping the factory.
+    //
+    // So the device stays on the default adapter, and the LUID lookup below only
+    // *reports* which GPU that turned out to be. If it is not the one the user
+    // expects, the fix is Windows' own per-application setting
+    // (Settings > Display > Graphics), which changes what "default" means.
     Require(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device_)),
             "D3D12CreateDevice");
+
+    // Name the adapter the device actually landed on. Reporting whichever one
+    // enumerates first would happily print an RTX name while the device ran on
+    // an integrated GPU, which is the exact confusion this exists to prevent.
+    {
+        const LUID luid = device_->GetAdapterLuid();
+        ComPtr<IDXGIAdapter1> in_use;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&in_use))) &&
+            SUCCEEDED(in_use->GetDesc1(&desc))) {
+            adapter_description_ = desc.Description;
+            adapter_is_nvidia_ = desc.VendorId == kNvidiaVendorId;
+        }
+    }
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -357,7 +394,36 @@ void Harness::Initialise(const Options& options) {
     // which is a useful diagnostic rather than a reason to abort.
     factory->CreateSwapChainForHwnd(queue_.Get(), window_, &sc, nullptr, nullptr, &swapchain_);
 
-    RequireNgx(NVSDK_NGX_D3D12_Init(kAppId, L".", device_.Get()), "NVSDK_NGX_D3D12_Init");
+    const NVSDK_NGX_Result init = NVSDK_NGX_D3D12_Init(kAppId, L".", device_.Get());
+    if (NVSDK_NGX_FAILED(init)) {
+        // "FeatureNotSupported" reads as "your GPU is too old", and sometimes is
+        // — but it is also what comes back when the device was created on an
+        // integrated GPU. Naming the adapter turns an opaque NGX code into
+        // something the user can act on.
+        std::ostringstream why;
+        const wchar_t* raw = GetNGXResultAsString(init);
+        why << "NGX could not start on \"" << Narrow(adapter_description_) << "\" ("
+            << Narrow(raw ? raw : L"") << "). ";
+        if (init == NVSDK_NGX_Result_FAIL_FeatureNotSupported) {
+            if (!adapter_is_nvidia_) {
+                why << "That is not an NVIDIA GPU, so DLSS cannot run on it. The "
+                       "app is using this machine's default graphics adapter. "
+                       "Force it onto the NVIDIA card in Windows: Settings > "
+                       "System > Display > Graphics, add DLSS5Converter.exe and "
+                       "engine\dlss5_eval.exe, and set both to High performance.";
+            } else {
+                why << "This NVIDIA GPU does not support DLSS. It needs an RTX "
+                       "card - GTX 10 and 16-series have CUDA but no tensor "
+                       "cores, so depth estimation works and DLSS cannot.";
+            }
+        } else if (init == NVSDK_NGX_Result_FAIL_OutOfDate) {
+            why << "The driver is too old for this DLSS runtime. Update it.";
+        } else {
+            const wchar_t* text = GetNGXResultAsString(init);
+            why << Narrow(text ? text : L"");
+        }
+        Fail(why.str());
+    }
     ngx_ready_ = true;
     RequireNgx(NVSDK_NGX_D3D12_GetCapabilityParameters(&params_),
                "NVSDK_NGX_D3D12_GetCapabilityParameters");
@@ -521,15 +587,11 @@ size_t Harness::WriteOutput(const std::wstring& path) {
 
 std::string Harness::Probe() {
     std::ostringstream out;
-    DXGI_ADAPTER_DESC1 adapter_desc{};
-    ComPtr<IDXGIFactory4> factory;
-    if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
-        ComPtr<IDXGIAdapter1> adapter;
-        if (SUCCEEDED(factory->EnumAdapters1(0, &adapter))) adapter->GetDesc1(&adapter_desc);
-    }
-    out << "adapter: ";
-    for (const wchar_t* p = adapter_desc.Description; *p; ++p) out << static_cast<char>(*p);
-    out << "\n";
+    // The adapter the device was actually created on. Reporting whichever
+    // adapter enumerates first would happily print an RTX name while the
+    // device ran on an integrated GPU, which is the exact confusion this
+    // line exists to prevent.
+    out << "adapter: " << Narrow(adapter_description_) << "\n";
 
     int value = 0;
     params_->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &value);

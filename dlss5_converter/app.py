@@ -16,12 +16,14 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -48,6 +50,9 @@ from .widgets import (
     WipeView,
     first_supported,
 )
+
+#: The sidebar's own width. The scroll area around it adds room for a bar.
+SIDEBAR_WIDTH = 320
 
 STYLE = """
 QMainWindow, QWidget { background: #16181d; color: #e6e8ec; }
@@ -271,7 +276,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DLSS 5 Image Converter")
-        self.resize(1280, 820)
+        # Sized to the screen rather than fixed: 1280x820 does not fit on a
+        # 1920x1080 display at 150% scaling, which reports 1280x720 of usable
+        # space, and the window came up taller than the desktop.
+        available = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1280, available.width() - 40), min(820, available.height() - 60))
+        self.setMinimumSize(900, 560)
 
         self.settings = AppSettings.load(paths.settings_path())
         # One engine for the window's lifetime. Reloading Depth Anything per
@@ -341,7 +351,20 @@ class MainWindow(QMainWindow):
         canvas_layout.addWidget(self.grade_panel)
 
         layout.addWidget(canvas, 1)
-        layout.addWidget(self._sidebar())
+        # The sidebar scrolls rather than being squeezed. It is a fixed stack of
+        # group boxes, and on a shorter window - or simply at 125% or 150%
+        # display scaling, where every widget is taller - the bottom of it was
+        # being clipped away silently. A user reported the neural sliders
+        # missing entirely and the HDR labels cut in half.
+        sidebar = QScrollArea()
+        sidebar.setWidget(self._sidebar())
+        sidebar.setWidgetResizable(True)
+        sidebar.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Room for the scrollbar so it never overlaps the slider readouts.
+        sidebar.setFixedWidth(SIDEBAR_WIDTH + 18)
+        layout.addWidget(sidebar)
 
         self.setCentralWidget(central)
         self.setStyleSheet(STYLE)
@@ -531,7 +554,7 @@ class MainWindow(QMainWindow):
 
     def _sidebar(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(320)
+        panel.setFixedWidth(SIDEBAR_WIDTH)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
