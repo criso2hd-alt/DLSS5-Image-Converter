@@ -37,6 +37,35 @@ from types import TracebackType
 
 from .settings import NeuralSettings
 
+#: Exit codes a crashing harness comes back with. Only the ones we have seen or
+#: can give advice about - anything else is reported as a raw hex code, which is
+#: still enough to identify in a bug report.
+_EXIT_CODES: dict[int, str] = {
+    0xC0000005: (
+        "access violation. Usually a DLSS runtime mismatched with the add-on, "
+        "or a driver too old for the neural pass - update the driver, and try "
+        "a smaller Max size."
+    ),
+    0xC0000017: (
+        "out of memory. Lower Max size, or use the Base depth model, which "
+        "leaves the harness more VRAM."
+    ),
+    0xC0000409: "stack buffer overrun inside the runtime.",
+    0xC0000374: "heap corruption inside the runtime.",
+    0xC000001D: "illegal instruction.",
+    0xC00000FD: "stack overflow.",
+    0xC0000135: "a required DLL was missing.",
+    0xC0000142: "a DLL failed to initialise.",
+    0x8007000E: "out of memory.",
+    0x887A0005: (
+        "the graphics device was removed or reset. A driver timeout, a crash "
+        "inside DLSS, or the GPU out of memory - lower Max size and retry."
+    ),
+    0x887A0006: "the graphics device hung.",
+    0x887A0020: "an internal driver error.",
+}
+
+
 # Every harness process currently alive, so shutdown can end them.
 #
 # An orphaned harness is not a tidy-up detail: it holds a D3D12 device, keeps a
@@ -182,17 +211,47 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError("The harness is not running.")
         line = process.stdout.readline()
         if not line:
-            stderr = ""
-            if process.stderr is not None:
-                stderr = process.stderr.read() or ""
-            raise HarnessError(
-                "The harness exited unexpectedly"
-                + (f":\n{stderr.strip()}" if stderr.strip() else ".")
-            )
+            raise HarnessError(self._died())
         line = line.strip()
         if line.startswith("ERROR"):
             raise HarnessError(line[len("ERROR") :].strip() or "Unknown DLSS failure.")
         return line
+
+    def _died(self) -> str:
+        """Explain a harness that stopped talking without saying why.
+
+        A handled failure arrives as an ``ERROR`` line, so reaching here means
+        the process died mid-sentence. Its exit code is then the only evidence
+        left, and the Windows codes are specific enough to be worth naming: a
+        bare "exited unexpectedly" cannot tell a crash inside NGX apart from the
+        GPU running out of memory, and those have opposite fixes.
+        """
+        process = self._process
+        if process is None:
+            return "The harness is not running."
+
+        stderr = ""
+        if process.stderr is not None:
+            try:
+                stderr = process.stderr.read() or ""
+            except Exception:  # noqa: BLE001 - a dead pipe must not mask this
+                stderr = ""
+        try:
+            code = process.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            code = process.poll()
+
+        message = f"The harness stopped at {self._width}x{self._height}"
+        if code is None:
+            message += "."
+        else:
+            unsigned = code & 0xFFFFFFFF
+            detail = _EXIT_CODES.get(unsigned)
+            message += f" (exit code 0x{unsigned:08X}"
+            message += f" - {detail})" if detail else ")"
+        if stderr.strip():
+            message += "\n" + stderr.strip()
+        return message
 
     def _send(self, line: str) -> None:
         process = self._process

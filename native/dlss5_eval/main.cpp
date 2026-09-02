@@ -213,6 +213,11 @@ private:
     //: the GPU in use rather than the one that happened to enumerate first.
     std::wstring adapter_description_;
     bool adapter_is_nvidia_ = false;
+    //: The installed NVIDIA driver, as the control panel spells it (576.02).
+    //: NGX reports the minimum it needs but never what is actually there, and
+    //: "update your driver" is unactionable advice to someone who believes
+    //: theirs is current.
+    std::string driver_version_;
     std::string probe_note_;
 
     NVSDK_NGX_Parameter* params_ = nullptr;
@@ -372,6 +377,23 @@ void Harness::Initialise(const Options& options) {
             SUCCEEDED(in_use->GetDesc1(&desc))) {
             adapter_description_ = desc.Description;
             adapter_is_nvidia_ = desc.VendorId == kNvidiaVendorId;
+
+            // The user-mode driver version, decoded the way NVIDIA packs it.
+            // DXGI reports the four-part Windows version (32.0.15.7602); the
+            // number people actually quote is the last digit of the third part
+            // followed by the fourth (576.02). There is no API that hands over
+            // the marketing version, so this reconstruction is the only way to
+            // print something a user can compare against nvidia.com.
+            LARGE_INTEGER umd{};
+            if (adapter_is_nvidia_ &&
+                SUCCEEDED(in_use->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+                const unsigned subversion = HIWORD(umd.LowPart);
+                const unsigned build = LOWORD(umd.LowPart);
+                const unsigned number = (subversion % 10) * 10000 + build;
+                char text[32];
+                snprintf(text, sizeof text, "%u.%02u", number / 100, number % 100);
+                driver_version_ = text;
+            }
         }
     }
 
@@ -415,7 +437,7 @@ void Harness::Initialise(const Options& options) {
                        "app is using this machine's default graphics adapter. "
                        "Force it onto the NVIDIA card in Windows: Settings > "
                        "System > Display > Graphics, add DLSS5Converter.exe and "
-                       "engine\dlss5_eval.exe, and set both to High performance.";
+                       "engine\\dlss5_eval.exe, and set both to High performance.";
             } else {
                 why << "This NVIDIA GPU does not support DLSS. It needs an RTX "
                        "card - GTX 10 and 16-series have CUDA but no tensor "
@@ -735,6 +757,16 @@ std::string Harness::Probe() {
     value = 0;
     params_->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &value);
     out << "needs_driver_update: " << value << "\n";
+
+    // Both halves of the driver question in one place. NGX only answers it for
+    // Super Resolution; the neural pass is newer than anything NGX knows about,
+    // so a driver can clear this bar and still be too old for DLSS 5. Printing
+    // the installed version is what makes a bug report diagnosable at all.
+    if (!driver_version_.empty()) out << "driver_version: " << driver_version_ << "\n";
+    int major = 0, minor = 0;
+    params_->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &major);
+    params_->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &minor);
+    if (major) out << "min_driver_version: " << major << "." << minor << "\n";
 
     // Whether the neural add-on attached at all. If this stays 0 the pipeline
     // still runs and still produces a picture — a plain DLAA resolve — which is
