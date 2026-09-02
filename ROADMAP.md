@@ -73,155 +73,36 @@ With the add-on live the same contract moves 169× further from its input
 (mean |Δ| 0.03042 against 0.00018 for plain DLAA, correlation 0.996). None of the
 three fallbacks were needed; they are struck from this plan.
 
-### `--frames 1` silently produces no neural pass at all
+### `--frames 1` silently produced no neural pass — fixed
 
-Not a wart — the sharpest edge found so far, and it is invisible.
+The sharpest edge this project had, and an invisible one. Measured, same image
+each time, all strengths at 2.0:
 
-The add-on installs its NGX hooks **lazily, on the first NGX call**, and that
-first call is therefore not intercepted. Measured on the reference machine, same
-3840×1678 image each time:
+| passes | before the fix | after |
+| ------ | -------------- | ----- |
+| 1 | 0.0027 (plain DLAA) | 0.0530 |
+| 2 | 0.0531 | 0.0538 |
+| 8 | 0.0546 | 0.0547 |
 
-| `--frames` | NR evaluations | what you get |
-| ---------- | -------------- | ------------ |
-| 1          | **0**          | plain DLAA, no neural pass, no warning |
-| 2          | 1              | neural pass runs |
-| 8          | ≥1             | neural pass runs |
+Two wrong theories died on the way, both worth recording.
 
-At `--frames 1` the log ends `... inline DLSS contract capture armed` and then
-unloads 143 ms later having never logged `first NGX evaluate intercepted`. The
-one evaluation is spent arming the hooks. The image still comes back, still looks
-plausible, and nothing anywhere says the point of the program did not happen —
-the exact failure the README warns about, reachable from the GUI, which lets the
-frame spinbox go to 1.
+**Not elapsed time.** The add-on takes ~900 ms after the first intercepted
+evaluate to build its NR resources, so a fast one-pass run looked like it was
+exiting before setup finished. It is not: inserting a 2.5 s delay before the
+single frame changed the result by nothing at all, while two frames with no
+delay worked.
 
-Two things to do:
+**Not simply "one more evaluation".** The first attempt added a single throwaway
+evaluate straight after feature creation, and `--frames 1` still came back a
+plain resolve. ReShade installs the add-on's hooks from its own *frame callback*,
+so before any `Present` there is nothing to intercept and that warm-up was
+invisible.
 
-- **Warm up before the real passes.** Issue one throwaway evaluate (or present a
-  frame) before the first counted frame, so the hooks are armed by the time
-  frame 1 runs. This also removes the `CreateFeature was not intercepted ...
-  registering lazily from evaluate contract` warning, since the feature would be
-  created behind live hooks.
-- Until that exists, **clamp the GUI spinbox to a minimum of 2**, or say plainly
-  in the tooltip that 1 disables the neural pass. `settings.frames` defaults to
-  8, so only a user who deliberately lowers it is exposed.
-
-Note the add-on logs `evaluation succeeded (count=1)` once and not per frame, so
-the log confirms *that* NR ran, never *how many times*.
-
-## Phase 2 — the knobs ✅
-
-**The knobs are not wired to anything.** Neither guessed route was live: the NGX
-parameters (`DLSS5.NeuralUplift.*`) are names nothing reads, and the environment
-variables are ignored too. The add-on ran at its own defaults during Phase 1 —
-`intensity=1.000000 color_strength=1.000000 transfer=1.000000 paper_white=1.000000
-preset=0 style=0` — regardless of what the harness was told.
-
-The real interface is the third guess: a ReShade `.ini` beside the executable.
-The add-on reads it through ReShade's own `ReShadeGetConfigValue`, under
-`[RenoDX.DLSS5]`. A working config, lifted from a game install:
-
-```ini
-[RenoDX.DLSS5]
-NeuralUplift=1
-NRAutoMask=0
-NRColorStrength=1
-NRDepthMode=0
-NREnableUpscaling=0
-NRIntensity=2
-NRLocalStructure=2
-NRLocalTone=2
-NRPaperWhiteScale=16
-NRPreset=0
-NRSkinStructure=2
-NRStyle=2
-NRTransferStrength=1
-NRUICorrection=0
-```
-
-### Measured: the ini knobs work, and the range is 0..1
-
-Same 512×512 contract, four passes, only `[RenoDX.DLSS5]` in
-`native\bin\ReShade.ini` changed between runs:
-
-| setting | mean abs Δ vs `NeuralUplift=0` |
-| ------- | ------------------------------ |
-| `NeuralUplift=0` | 0.000000 — bit-identical to plain DLAA |
-| `NRIntensity=0`  | 0.004022 |
-| `NRIntensity=1`  | 0.030329 |
-| `NRIntensity=4`  | 0.030329 — identical to 1 |
-
-Three things follow, and they settle Phase 2:
-
-- **The add-on reads the ini**, at process start. Writing the section before
-  launching the harness is all the wiring that is needed.
-- **`NeuralUplift=0` is a clean off switch**, reproducing plain DLAA exactly.
-  That is the A/B control Phase 3 wants, and a far better "intensity 0" than
-  asking the model for a weak pass.
-- **`NRIntensity` saturates at 1.0.** The `2` seen in a game's ini is above the
-  effective ceiling. The app's sliders are already 0..1, so they map straight
-  across with no rescaling. (`NRIntensity=0` still differs slightly from
-  `NeuralUplift=0`, so some part of the pass — probably the colour transfer —
-  runs regardless of intensity.)
-
-The UI labels, recovered from the add-on binary, name the rest:
-
-| ini key | label | kind |
-| ------- | ----- | ---- |
-| `NeuralUplift` | Enable DLSS Neural Rendering | bool |
-| `NRIntensity` | NR Intensity | float, `%.2f` |
-| `NRSkinStructure` | Skin Structure Strength | float |
-| `NRLocalTone` | Local Tone Strength | float |
-| `NRLocalStructure` | Local Structure Strength | float |
-| `NRColorStrength` | Color Strength | float |
-| `NRTransferStrength` | HDR Transfer Strength | float |
-| `NRPaperWhiteScale` | Scene Paper-White Scale | float, `%.3f` |
-| `NRPreset` | Default / Preset #1 / #2 / #3 | enum |
-| `NRStyle` | Natural / Cinematic | enum |
-| `NRAutoMask`, `NRUICorrection` | masking | bool |
-| `NRDepthMode` | Use game NGX flag / Force normal / **Force inverted** | enum |
-| `NRMVecScaleX`, `NRMVecScaleY` | motion scale multipliers | float |
-
-`NRDepthMode` is worth Phase 3's attention: it overrides the depth convention
-directly, which is the assumption the whole project rests on.
-
-So Phase 2 is now concrete:
-
-- Map the app's four settings onto `NRIntensity`, `NRSkinStructure`,
-  `NRLocalTone`, `NRLocalStructure`. Note the values are **small integers**, not
-  the 0..1 floats the GUI currently carries — find the range before scaling.
-- Write `[RenoDX.DLSS5]` into `native\bin\ReShade.ini` before launching the
-  harness. ReShade rewrites that file on exit, so merge into it rather than
-  overwriting it.
-- Delete both dead paths from `main.cpp`: the `params_->Set("DLSS5.NeuralUplift.*")`
-  calls and the `SetEnvironmentVariableA` block in `main()`, plus the comment
-  apologising for setting them twice.
-- `NREnableUpscaling=0` matches the DLAA-only non-goal below. `NRAutoMask` and
-  `NRUICorrection` are the masking controls Phase 4 wants.
-
-### Done
-
-`runtime.write_addon_config` merges `[RenoDX.DLSS5]` into the harness folder's
-`ReShade.ini` before every launch, mapping the four sliders straight across at
-0..1. Measured through the app, 1280×560, four passes:
-
-| sliders | mean abs Δ vs intensity 0 |
-| ------- | ------------------------- |
-| intensity 0 | 0.000000 |
-| 0.25 | 0.001892 |
-| 0.65 (defaults) | 0.008900 |
-| 1.0 | 0.029264 |
-
-Monotonic, and the individual knobs separate: skin 1.0 with tone and structure
-at 0.1 lands at 0.002032, well away from the 0.0089 the same intensity gives
-with balanced settings.
-
-Both dead paths are deleted. The `--intensity` family of CLI flags stays so the
-harness is still drivable by hand with the arguments the pipeline has always
-passed, but nothing reads them any more.
-
-Intensity 0 writes `NeuralUplift=0` rather than `NRIntensity=0`, because those
-are not the same thing — the former is bit-identical to plain DLAA, which is what
-the UI promises at zero, and the latter still moves the image slightly.
+What works is both, in order: **present a frame first**, so the hooks exist, then
+run **two** throwaway evaluations — the first intercepted one is where the add-on
+registers the feature and builds its resources, and the neural pass only lands
+from the next. The caller's first real frame still passes `InReset = 1`, so the
+accumulation it asked for starts from empty regardless.
 
 ### Correction: the strength range is 0..2, not 0..1
 

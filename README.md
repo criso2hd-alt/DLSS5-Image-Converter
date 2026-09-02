@@ -202,9 +202,12 @@ Findings from bring-up, measured rather than assumed. Full detail and method in
   bit-identical, though the add-on echoes the value back in its log. It most likely
   selects a Super Resolution preset that a DLAA-only path never reaches.
 - **`NeuralUplift=0` is a clean off switch**, bit-identical to a plain DLAA resolve.
-- **`--frames 1` silently skips the neural pass entirely.** The add-on installs its
-  NGX hooks on the first evaluate, so that one cannot be intercepted. Use 2 or more;
-  the default is 8, and the result stops changing by about 8.
+- **Passes can be 1 again.** The add-on installs its NGX hooks from ReShade's
+  frame callback and only applies the neural pass from the *second* intercepted
+  evaluation, so a one-pass run used to come back a plain DLAA resolve with no
+  warning. The harness now presents a frame and runs two throwaway evaluations
+  before the counted ones, so every pass count works. More passes still help a
+  little (0.0530 at one pass, 0.0547 at eight, on the same image).
 - Settings are read **once, at add-on load**. Flipping the ini mid-run does nothing.
 
 ## Build from source

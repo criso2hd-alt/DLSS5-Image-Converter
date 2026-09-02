@@ -478,6 +478,51 @@ void Harness::Initialise(const Options& options) {
                "NGX_D3D12_CREATE_DLSS_EXT");
     Execute();
 
+    // One throwaway evaluation, before the caller's first frame.
+    //
+    // The RenoDX add-on installs its NGX hooks during the first evaluate it
+    // sees, which means that first evaluate is itself never intercepted. With
+    // --frames 1 the only evaluation was that one, so the neural pass silently
+    // did not run: the image came back a plain DLAA resolve with no error and
+    // nothing to indicate the point of the program had not happened.
+    //
+    // Spending a frame here arms the hooks against the colour texture in its
+    // initial state. Nothing is read back from it, and the caller's first real
+    // frame passes InReset = 1, which discards this frame's history — so the
+    // accumulation the user asked for still starts from empty.
+    // Present first. ReShade installs the add-on's NGX hooks from its own frame
+    // callback, so before any Present there is nothing to intercept and a
+    // warm-up evaluation here would be invisible — which is exactly what the
+    // first attempt at this fix did.
+    if (swapchain_) swapchain_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+
+    // Then two throwaway evaluations, because one is not enough either: the
+    // first intercepted evaluate is where the add-on registers the feature and
+    // builds its NR resources, and the neural pass only lands from the next one.
+    // Measured — with a single warm-up, --frames 1 still came back a plain DLAA
+    // resolve.
+    for (int warmup = 0; warmup < 2; ++warmup) {
+        NVSDK_NGX_D3D12_DLSS_Eval_Params warm{};
+        warm.Feature.pInColor = colour_.resource.Get();
+        warm.Feature.pInOutput = output_.resource.Get();
+        warm.pInDepth = depth_.resource.Get();
+        warm.pInMotionVectors = motion_.resource.Get();
+        warm.InJitterOffsetX = 0.0f;
+        warm.InJitterOffsetY = 0.0f;
+        warm.InRenderSubrectDimensions.Width = static_cast<unsigned>(options_.width);
+        warm.InRenderSubrectDimensions.Height = static_cast<unsigned>(options_.height);
+        warm.InReset = 1;
+        warm.InMVScaleX = 1.0f;
+        warm.InMVScaleY = 1.0f;
+        // Not fatal if it fails: this is a warm-up, and the real frames report
+        // their own errors with far more context.
+        if (NVSDK_NGX_FAILED(NGX_D3D12_EVALUATE_DLSS_EXT(list_.Get(), feature_, params_, &warm))) {
+            break;
+        }
+        Execute();
+        if (swapchain_) swapchain_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    }
+
     // The neural add-on's knobs used to be set here as NGX parameters, and
     // again in main() as environment variables, because there was no public
     // DLSS 5 header and one of the two was assumed to be live. Measurement said
