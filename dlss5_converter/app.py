@@ -22,15 +22,17 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from . import bootstrap, contract, evaluator, grade, paths, pipeline, runtime
+from . import bootstrap, contract, evaluator, grade, paths, pipeline, runtime, sequence
 from .depth_engine import MODELS, DepthEngine
 from .settings import (
     MAX_EDGE_CHOICES,
@@ -272,6 +274,157 @@ class DownloadWorker(QObject):
         self.finished.emit()
 
 
+class SequenceWorker(QObject):
+    """Drives a whole sequence off the UI thread, reporting each frame."""
+
+    progress = Signal(str)
+    frame_done = Signal(object)
+    finished = Signal(int)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        frames: list[Path],
+        depth_frames: list[Path] | None,
+        invert_depth: bool,
+        settings: AppSettings,
+        engine: DepthEngine,
+        destination: Path,
+    ) -> None:
+        super().__init__()
+        self._frames = frames
+        self._depth = depth_frames
+        self._invert = invert_depth
+        self._settings = settings
+        self._engine = engine
+        self._destination = destination
+        self._stop = False
+
+    def stop(self) -> None:
+        """Asked for from the UI thread; read between frames, never mid-frame."""
+        self._stop = True
+
+    def run(self) -> None:
+        done = 0
+        try:
+            for frame in pipeline.convert_sequence(
+                self._frames,
+                self._settings,
+                self._engine,
+                self._destination,
+                depth_frames=self._depth,
+                invert_depth=self._invert,
+                grade_settings=self._settings.grade,
+                progress=self.progress.emit,
+                should_stop=lambda: self._stop,
+            ):
+                done += 1
+                self.frame_done.emit(frame)
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(done)
+
+
+class SequencePage(QWidget):
+    """Page two: a rendered image sequence, frame by frame.
+
+    Shares the sidebar with single-image mode, because the settings mean the
+    same thing here — and using identical settings across every frame is most of
+    what makes a sequence look consistent.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.frames: list[Path] = []
+        self.depth_frames: list[Path] = []
+        self.outputs: list[Path] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.preview = ImageView()
+        layout.addWidget(self.preview, 1)
+
+        self.frames_label = QLabel("No sequence chosen")
+        self.frames_label.setObjectName("hint")
+        self.depth_label = QLabel("Depth: estimated per frame (Depth Anything)")
+        self.depth_label.setObjectName("hint")
+        self.output_label = QLabel("")
+        self.output_label.setObjectName("hint")
+
+        pick_row = QHBoxLayout()
+        self.pick_frames = QPushButton("Choose first frame…")
+        self.pick_depth = QPushButton("Choose first depth frame…")
+        self.pick_depth.setObjectName("secondary")
+        self.pick_depth.setToolTip(
+            "Optional, and the reason this mode can be temporally stable.\n\n"
+            "Depth Anything estimates depth per frame and wobbles slightly "
+            "between them, which the neural pass follows as flicker. A depth "
+            "pass out of Blender or Maya is geometrically exact and does not "
+            "move, so the result is steady."
+        )
+        self.clear_depth = QPushButton("Use estimated depth")
+        self.clear_depth.setObjectName("secondary")
+        self.clear_depth.setVisible(False)
+        pick_row.addWidget(self.pick_frames)
+        pick_row.addWidget(self.pick_depth)
+        pick_row.addWidget(self.clear_depth)
+        pick_row.addStretch(1)
+
+        self.invert_depth = QCheckBox("Depth is inverted (near is dark)")
+        self.invert_depth.setToolTip(
+            "Renderers disagree about which way up a depth pass goes. A Blender "
+            "mist pass is near-dark, so tick this. Watch the preview and pick "
+            "whichever looks right - near should read as red on the depth mask."
+        )
+        self.invert_depth.setVisible(False)
+
+        layout.addLayout(pick_row)
+        layout.addWidget(self.frames_label)
+        layout.addWidget(self.depth_label)
+        layout.addWidget(self.invert_depth)
+
+        out_row = QHBoxLayout()
+        self.pick_output = QPushButton("Output folder…")
+        self.pick_output.setObjectName("secondary")
+        self.write_video = QCheckBox("Also write MP4")
+        self.fps = QSpinBox()
+        self.fps.setRange(1, 240)
+        self.fps.setValue(24)
+        self.fps.setSuffix(" fps")
+        self.fps.setEnabled(False)
+        self.write_video.toggled.connect(self.fps.setEnabled)
+        self.write_video.setToolTip(
+            "Encoded with mp4v, not H.264 - OpenCV ships no H.264 encoder. The "
+            "PNG frames are always written too, so you can re-encode them with "
+            "anything you like."
+        )
+        out_row.addWidget(self.pick_output)
+        out_row.addWidget(self.write_video)
+        out_row.addWidget(self.fps)
+        out_row.addStretch(1)
+        layout.addLayout(out_row)
+        layout.addWidget(self.output_label)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.setVisible(False)
+        layout.addWidget(self.bar)
+
+        run_row = QHBoxLayout()
+        self.start = QPushButton("Convert sequence")
+        self.start.setEnabled(False)
+        self.stop = QPushButton("Stop")
+        self.stop.setObjectName("secondary")
+        self.stop.setVisible(False)
+        run_row.addStretch(1)
+        run_row.addWidget(self.stop)
+        run_row.addWidget(self.start)
+        layout.addLayout(run_row)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -308,6 +461,8 @@ class MainWindow(QMainWindow):
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: DownloadDialog | None = None
+        self._seq_thread: QThread | None = None
+        self._seq_worker: SequenceWorker | None = None
 
         # Debounce. A slider drag emits a change per pixel and each one costs a
         # harness restart, so wait for the drag to settle before spending one.
@@ -352,7 +507,16 @@ class MainWindow(QMainWindow):
         self.grade_panel = self._grade_panel()
         canvas_layout.addWidget(self.grade_panel)
 
-        layout.addWidget(canvas, 1)
+        # Two pages, one shared sidebar. The settings mean the same thing in
+        # both, and using identical settings across every frame is most of what
+        # makes a sequence look consistent - so they should not be duplicated.
+        self.sequence_page = SequencePage()
+        self.tabs = QTabWidget()
+        self.tabs.addTab(canvas, "Single image")
+        self.tabs.addTab(self.sequence_page, "Image sequence")
+        self._wire_sequence_page()
+
+        layout.addWidget(self.tabs, 1)
         # The sidebar scrolls rather than being squeezed. It is a fixed stack of
         # group boxes, and on a shorter window - or simply at 125% or 150%
         # display scaling, where every widget is taller - the bottom of it was
@@ -817,6 +981,163 @@ class MainWindow(QMainWindow):
         layout.addWidget(diagnose)
         return panel
 
+    # -- sequence page -------------------------------------------------------
+
+    def _wire_sequence_page(self) -> None:
+        page = self.sequence_page
+        page.pick_frames.clicked.connect(self._pick_sequence)
+        page.pick_depth.clicked.connect(self._pick_depth_sequence)
+        page.clear_depth.clicked.connect(self._clear_depth_sequence)
+        page.pick_output.clicked.connect(self._pick_sequence_output)
+        page.start.clicked.connect(self._start_sequence)
+        page.stop.clicked.connect(self._stop_sequence)
+        page.output_label.setText(f"Output: {paths.output_dir()}")
+        self._sequence_output = paths.output_dir()
+
+    def _pick_sequence(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose the first frame of the sequence",
+            str(self.sequence_page.frames[0].parent) if self.sequence_page.frames else "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.exr *.webp *.bmp)",
+        )
+        if not chosen:
+            return
+        frames = sequence.find_sequence(Path(chosen))
+        self.sequence_page.frames = frames
+        self.sequence_page.frames_label.setText(sequence.describe(frames))
+        self.sequence_page.start.setEnabled(bool(frames))
+        # Show the frame they picked, so it is obvious which sequence this is.
+        try:
+            first = contract.fit_to_budget(contract.load_image(Path(chosen)), _PREVIEW_EDGE)
+            self.sequence_page.preview.set_image(first, Path(chosen).name)
+        except Exception:  # noqa: BLE001 - a preview is not worth failing over
+            pass
+        self._check_depth_pairing()
+
+    def _pick_depth_sequence(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Choose the first depth frame",
+            "",
+            "Depth maps (*.png *.tif *.tiff *.exr *.jpg *.jpeg)",
+        )
+        if not chosen:
+            return
+        depth = sequence.find_sequence(Path(chosen))
+        self.sequence_page.depth_frames = depth
+        self.sequence_page.invert_depth.setVisible(True)
+        self.sequence_page.clear_depth.setVisible(True)
+        self.sequence_page.depth_label.setText(f"Depth from renderer: {sequence.describe(depth)}")
+        self._check_depth_pairing()
+
+    def _clear_depth_sequence(self) -> None:
+        self.sequence_page.depth_frames = []
+        self.sequence_page.invert_depth.setVisible(False)
+        self.sequence_page.clear_depth.setVisible(False)
+        self.sequence_page.depth_label.setText(
+            "Depth: estimated per frame (Depth Anything)"
+        )
+
+    def _check_depth_pairing(self) -> None:
+        """Warn about a count mismatch now, not 200 frames into a render."""
+        page = self.sequence_page
+        if not page.frames or not page.depth_frames:
+            return
+        if len(page.frames) != len(page.depth_frames):
+            page.depth_label.setText(
+                f"Mismatch: {len(page.frames)} frames but {len(page.depth_frames)} "
+                "depth frames. They must pair one to one."
+            )
+            page.start.setEnabled(False)
+        else:
+            page.start.setEnabled(True)
+
+    def _pick_sequence_output(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Where should the frames go?", str(self._sequence_output)
+        )
+        if chosen:
+            self._sequence_output = Path(chosen)
+            self.sequence_page.output_label.setText(f"Output: {chosen}")
+
+    def _start_sequence(self) -> None:
+        page = self.sequence_page
+        if not page.frames or self._seq_thread is not None:
+            return
+        page.outputs = []
+        page.start.setEnabled(False)
+        page.stop.setVisible(True)
+        page.bar.setVisible(True)
+        page.bar.setRange(0, len(page.frames))
+        page.bar.setValue(0)
+
+        self._seq_thread = QThread(self)
+        self._seq_worker = SequenceWorker(
+            page.frames,
+            page.depth_frames or None,
+            page.invert_depth.isChecked(),
+            self.settings,
+            self.engine,
+            self._sequence_output,
+        )
+        self._seq_worker.moveToThread(self._seq_thread)
+        self._seq_thread.started.connect(self._seq_worker.run)
+        self._seq_worker.progress.connect(self.statusBar().showMessage)
+        self._seq_worker.frame_done.connect(self._sequence_frame_done)
+        self._seq_worker.finished.connect(self._sequence_finished)
+        self._seq_worker.failed.connect(self._sequence_failed)
+        self._seq_thread.start()
+
+    def _stop_sequence(self) -> None:
+        if self._seq_worker is not None:
+            self._seq_worker.stop()
+            self.statusBar().showMessage("Stopping after this frame…")
+
+    def _sequence_frame_done(self, frame: pipeline.SequenceFrame) -> None:
+        page = self.sequence_page
+        page.outputs.append(frame.output)
+        page.bar.setValue(frame.index + 1)
+        page.bar.setFormat(f"%v of %m — {frame.source.name}")
+        page.preview.set_image(_downscale_for_preview(frame.image), frame.output.name)
+
+    def _sequence_teardown(self) -> None:
+        if self._seq_thread is not None:
+            self._seq_thread.quit()
+            self._seq_thread.wait(10000)
+            self._seq_thread = None
+        self._seq_worker = None
+        page = self.sequence_page
+        page.stop.setVisible(False)
+        page.start.setEnabled(bool(page.frames))
+
+    def _sequence_finished(self, done: int) -> None:
+        page = self.sequence_page
+        self._sequence_teardown()
+        message = f"{done} frame(s) written to {self._sequence_output}"
+        if page.write_video.isChecked() and page.outputs:
+            try:
+                self.statusBar().showMessage("Encoding MP4…")
+                video = pipeline.write_video(
+                    page.outputs,
+                    self._sequence_output / f"{page.outputs[0].stem}_sequence.mp4",
+                    float(page.fps.value()),
+                )
+                message += f" — {video.name}"
+            except Exception as error:  # noqa: BLE001 - the frames are safe either way
+                QMessageBox.warning(
+                    self,
+                    "Frames written, MP4 failed",
+                    f"{error}\n\nThe PNG frames are in the output folder and can "
+                    "be encoded with anything.",
+                )
+        self.statusBar().showMessage(message)
+
+    def _sequence_failed(self, message: str) -> None:
+        self._sequence_teardown()
+        QMessageBox.warning(self, "Sequence failed", message)
+        self.statusBar().showMessage("Sequence failed")
+
     # -- first run -----------------------------------------------------------
 
     def ensure_model_downloaded(self, model_id: str | None = None) -> None:
@@ -1186,7 +1507,14 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 - closing must not fail
             pass
 
-        for thread in (self._thread, self._depth_thread, self._download_thread):
+        if self._seq_worker is not None:
+            self._seq_worker.stop()
+        for thread in (
+            self._thread,
+            self._depth_thread,
+            self._download_thread,
+            self._seq_thread,
+        ):
             if thread is None:
                 continue
             thread.quit()
@@ -1197,6 +1525,7 @@ class MainWindow(QMainWindow):
             if not thread.wait(5000):
                 thread.terminate()
         self._thread = self._depth_thread = self._download_thread = None
+        self._seq_thread = None
         self._worker = self._depth_worker = self._download_worker = None
         super().closeEvent(event)
 

@@ -17,6 +17,8 @@
 //
 // Protocol (stdin/stdout, one line each way, see evaluator.py):
 //   <- READY <notes>
+//   -> DEPTH <depth.bin>                     (optional, sequence mode)
+//   <- DEPTH_OK
 //   -> FRAME <colour.bin> <jitter_x> <jitter_y> <reset 0|1>
 //   <- FRAME_OK <index>
 //   -> WRITE <out.bin>
@@ -178,6 +180,7 @@ class Harness {
 public:
     void Initialise(const Options& options);
     void UploadColour(const std::wstring& path);
+    void UploadDepth(const std::wstring& path);
     void Evaluate(float jitter_x, float jitter_y, bool reset);
     size_t WriteOutput(const std::wstring& path);
     void ProbeWarmUp();
@@ -537,6 +540,16 @@ void Harness::UploadColour(const std::wstring& path) {
     UploadTexture(colour_, ReadFile(path, pixels * 8));
 }
 
+void Harness::UploadDepth(const std::wstring& path) {
+    // Sequence mode replaces the depth plane between frames. Everything else
+    // about the session - the device, the NGX feature and its warmed-up hooks -
+    // is reused, which is the whole point: start-up costs about 3.5 s and a
+    // hundred-frame sequence should pay that once, not a hundred times.
+    const size_t pixels = static_cast<size_t>(options_.width) * options_.height;
+    UploadTexture(depth_, ReadFile(path, pixels * 4));
+    Execute();
+}
+
 void Harness::Evaluate(float jitter_x, float jitter_y, bool reset) {
     NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
     eval.Feature.pInColor = colour_.resource.Get();
@@ -827,6 +840,13 @@ int main(int argc, char** argv) {
             harness.UploadColour(Widen(path));
             harness.Evaluate(jx, jy, reset != 0);
             Emit("FRAME_OK " + std::to_string(++evaluated));
+        } else if (command == "DEPTH") {
+            std::string rest;
+            std::getline(parts, rest);
+            const std::string path = Trim(rest);
+            if (path.empty()) Fail("Malformed DEPTH: expected a depth plane path.");
+            harness.UploadDepth(Widen(path));
+            Emit("DEPTH_OK");
         } else if (command == "WRITE") {
             std::string rest;
             std::getline(parts, rest);

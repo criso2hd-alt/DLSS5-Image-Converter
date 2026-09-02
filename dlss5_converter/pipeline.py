@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import contract, evaluator, paths, runtime
+from . import contract, evaluator, grade, paths, runtime, sequence
 from .depth_engine import DepthEngine
 from .settings import AppSettings
 
@@ -158,6 +158,188 @@ def convert(
         depth_preview=depth_preview(inverse_depth),
         notes=f"{width}x{height}, {settings.evaluation.frames} DLSS passes",
     )
+
+
+@dataclass
+class SequenceFrame:
+    """One finished frame, handed back as the sequence runs."""
+
+    index: int
+    total: int
+    source: Path
+    output: Path
+    image: np.ndarray  # 0..1 float RGB, graded
+
+
+def convert_sequence(
+    frames: list[Path],
+    settings: AppSettings,
+    engine: DepthEngine,
+    destination: Path,
+    depth_frames: list[Path] | None = None,
+    invert_depth: bool = False,
+    grade_settings=None,
+    progress: Progress | None = None,
+    should_stop: Callable[[], bool] | None = None,
+):
+    """Convert a whole sequence, yielding each frame as it finishes.
+
+    One harness for the entire run. Start-up is ~3.5 s and dominates a single
+    conversion, so paying it per frame would make a 200-frame sequence mostly
+    idle time; here it is paid once and each frame costs only its evaluations.
+
+    Every frame resets DLSS's temporal history. Motion vectors are zero — the
+    contract says nothing moved — so carrying accumulation between two genuinely
+    different frames would drag the previous image into this one wherever the
+    scene changed. Consistency between frames comes from feeding identical
+    settings and stable depth, not from shared history.
+
+    `depth_frames`, when given, replaces depth estimation entirely with the
+    renderer's own depth pass. That is the reason this mode can be temporally
+    stable: an estimated depth map wobbles slightly frame to frame and the
+    neural pass follows it, while a rendered depth pass does not move at all.
+    """
+
+    def say(message: str) -> None:
+        if progress:
+            progress(message)
+
+    if not frames:
+        return
+    if depth_frames and len(depth_frames) != len(frames):
+        raise ValueError(
+            f"{len(frames)} image frames but {len(depth_frames)} depth frames. "
+            "They have to correspond one to one."
+        )
+
+    status = runtime.detect(settings.runtime_dir or None)
+    if not status.ready:
+        raise RuntimeError("\n".join(status.problems))
+    staged = runtime.stage_runtime(status)
+    assert status.harness is not None
+    runtime.write_addon_config(staged, settings.neural)
+
+    destination.mkdir(parents=True, exist_ok=True)
+    scratch = paths.scratch_dir()
+    colour_path = scratch / "seq_colour.bin"
+    depth_path = scratch / "seq_depth.bin"
+    motion_path = scratch / "seq_motion.bin"
+    out_path = scratch / "seq_out.bin"
+
+    # The first frame fixes the size for the whole run: one harness means one
+    # set of NGX buffers, and DLSS cannot be handed a different resolution
+    # halfway through without recreating the feature.
+    say("Loading the first frame…")
+    first = contract.fit_to_budget(contract.load_image(frames[0]), settings.evaluation.max_edge)
+    height, width = first.shape[:2]
+
+    if depth_frames is None:
+        engine.load(settings.depth.model_id, progress=progress)
+
+    np.zeros((height, width, 2), np.float16).tofile(motion_path)
+    # The harness reads both planes at launch, before any DEPTH command can
+    # arrive, so a placeholder has to exist. It is overwritten for real by the
+    # first frame of the loop below.
+    np.zeros((height, width), np.float32).tofile(depth_path)
+    offsets = contract.jitter_sequence(settings.evaluation.frames)
+    if not settings.evaluation.jitter:
+        offsets = [(0.0, 0.0)] * len(offsets)
+
+    with evaluator.Harness(
+        status.harness,
+        width=width,
+        height=height,
+        depth_path=depth_path,
+        motion_path=motion_path,
+        neural=settings.neural,
+        frames=settings.evaluation.frames,
+    ) as harness:
+        for index, frame_path in enumerate(frames):
+            if should_stop is not None and should_stop():
+                say("Stopped.")
+                return
+            say(f"Frame {index + 1} of {len(frames)} — {frame_path.name}")
+
+            source = contract.load_image(frame_path)
+            source = contract.fit_to_budget(source, settings.evaluation.max_edge)
+            if source.shape[:2] != (height, width):
+                raise RuntimeError(
+                    f"{frame_path.name} is {source.shape[1]}x{source.shape[0]}, but the "
+                    f"sequence started at {width}x{height}. Frames must all be one size."
+                )
+
+            if depth_frames is not None:
+                inverse_depth = sequence.load_depth_map(depth_frames[index], invert_depth)
+                if inverse_depth.shape != (height, width):
+                    inverse_depth = cv2.resize(
+                        inverse_depth, (width, height), interpolation=cv2.INTER_NEAREST
+                    )
+            else:
+                inverse_depth = engine.infer(
+                    (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8),
+                    input_size=settings.depth.input_size,
+                    tiled=settings.depth.tiled,
+                )
+
+            shaped = contract.to_hardware_depth(inverse_depth, settings.depth.contrast)
+            np.ascontiguousarray(shaped).tofile(depth_path)
+            harness.set_depth(depth_path)
+
+            linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
+            harness.reset_history()
+            for offset in offsets:
+                shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+                plane = np.empty((height, width, 4), np.float16)
+                plane[..., :3] = shifted.astype(np.float16)
+                plane[..., 3] = np.float16(1.0)
+                plane.tofile(colour_path)
+                harness.frame(colour_path, offset)
+
+            harness.write(out_path)
+            enhanced = np.clip(
+                contract.linear_to_srgb(contract.read_output(out_path, width, height)), 0.0, 1.0
+            )
+            if grade_settings is not None:
+                enhanced = grade.apply(enhanced, grade_settings)
+
+            output = destination / f"{frame_path.stem}_dlss5.png"
+            save_image(enhanced, output)
+            yield SequenceFrame(index, len(frames), frame_path, output, enhanced)
+
+
+def write_video(images: list[Path], destination: Path, fps: float) -> Path:
+    """Encode finished frames to an MP4.
+
+    mp4v rather than H.264: OpenCV's shipped builds carry no H.264 encoder for
+    licensing reasons, so asking for one silently produces an empty file. mp4v
+    is larger at the same quality but it plays everywhere, and the PNG sequence
+    is written regardless, so anyone who wants H.264 has the frames to encode.
+    """
+    if not images:
+        raise ValueError("No frames to encode.")
+    first = cv2.imread(str(images[0]), cv2.IMREAD_UNCHANGED)
+    if first is None:
+        raise OSError(f"Could not read {images[0]}")
+    height, width = first.shape[:2]
+
+    writer = cv2.VideoWriter(
+        str(destination), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height)
+    )
+    if not writer.isOpened():
+        raise OSError(f"Could not open {destination.name} for writing.")
+    try:
+        for path in images:
+            frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if frame is None:
+                continue
+            if frame.dtype == np.uint16:
+                frame = (frame // 257).astype(np.uint8)
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            writer.write(frame[:, :, :3])
+    finally:
+        writer.release()
+    return destination
 
 
 def save_image(image_rgb: np.ndarray, path: str | Path) -> None:

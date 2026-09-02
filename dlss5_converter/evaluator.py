@@ -213,6 +213,30 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Unexpected reply to FRAME: {response}")
         self._index += 1
 
+    def set_depth(self, depth_path: Path) -> None:
+        """Replace the depth plane without restarting the harness.
+
+        Sequence mode only. Everything expensive about a session — the device,
+        the NGX feature, the add-on's warmed-up hooks — is reused across frames,
+        so a hundred-frame sequence pays the ~3.5 s start-up once rather than a
+        hundred times. Depth is the only per-frame input that was fixed at
+        launch, so it needs its own command.
+        """
+        self._send(f"DEPTH {depth_path}")
+        response = self._read()
+        if not response.startswith("DEPTH_OK"):
+            raise HarnessError(f"Unexpected reply to DEPTH: {response}")
+
+    def reset_history(self) -> None:
+        """Make the next frame start a fresh accumulation.
+
+        Between frames of a sequence, not within one. Each frame is an
+        independent still: the motion vectors are zero, so carrying temporal
+        history from the previous frame would smear the last image into this one
+        wherever anything moved.
+        """
+        self._index = 0
+
     def write(self, out_path: Path) -> None:
         self._send(f"WRITE {out_path}")
         response = self._read()
