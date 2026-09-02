@@ -14,7 +14,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import contract, evaluator, grade, paths, runtime, sequence
+from . import contract, evaluator, grade, hdr, paths, runtime, sequence, wic
 from .depth_engine import DepthEngine
 from .settings import AppSettings
 
@@ -29,6 +29,18 @@ class Result:
     enhanced: np.ndarray  # 0..1 float32 RGB
     depth_preview: np.ndarray  # uint8 RGB, turbo-mapped
     notes: str = ""
+    #: The enhanced image before tone mapping, in linear light, when the source
+    #: was HDR. This is the real output in that case - `enhanced` is a version
+    #: of it made fit for an 8-bit screen - so an HDR export must come from
+    #: here or the highlights it exists to preserve are already gone.
+    enhanced_linear: np.ndarray | None = None
+    #: The tone mapping white point, shared with `original` so the wipe does
+    #: not change exposure halfway across.
+    white: float = 1.0
+
+    @property
+    def hdr(self) -> bool:
+        return self.enhanced_linear is not None
 
 
 @dataclass
@@ -41,8 +53,15 @@ class Prepared:
     and then re-convert repeatedly without paying for it again.
     """
 
-    source: np.ndarray  # 0..1 float32 RGB, already fitted to the size budget
+    source: np.ndarray  # 0..1 float32 sRGB RGB, already fitted to the size budget
     inverse_depth: np.ndarray  # 0..1, near at 1.0 — see contract.to_hardware_depth
+    #: The same image in linear light, which is what DLSS is fed. Above 1.0 for
+    #: an HDR source. Pre-computed here rather than in convert() because the
+    #: sRGB decode is the most expensive per-pixel step in the pipeline and
+    #: nothing the user tunes afterwards changes it.
+    linear: np.ndarray | None = None
+    hdr: bool = False
+    white: float = 1.0
 
 
 def prepare(
@@ -58,17 +77,32 @@ def prepare(
             progress(message)
 
     say("Loading image…")
-    source = contract.load_image(image_path)
-    source = contract.fit_to_budget(source, settings.evaluation.max_edge)
+    loaded = contract.load_source(image_path)
+    # Fit the linear copy, then re-derive the display copy from it. Resizing
+    # sRGB-encoded values averages the wrong quantity and darkens edges;
+    # resizing the linear one and tone mapping afterwards does not.
+    linear = contract.fit_to_budget(loaded.linear, settings.evaluation.max_edge)
+    if loaded.hdr:
+        source = hdr.tonemap(linear, loaded.white)
+    else:
+        source = np.clip(contract.linear_to_srgb(linear), 0.0, 1.0)
 
     engine.load(settings.depth.model_id, progress=progress)
+    # Depth Anything wants an ordinary 8-bit picture. The tone mapped copy is
+    # exactly that, and gives the model the same scene an SDR capture would.
     inverse_depth = engine.infer(
         (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8),
         progress=progress,
         input_size=settings.depth.input_size,
         tiled=settings.depth.tiled,
     )
-    return Prepared(source=source, inverse_depth=inverse_depth)
+    return Prepared(
+        source=source,
+        inverse_depth=inverse_depth,
+        linear=linear,
+        hdr=loaded.hdr,
+        white=loaded.white,
+    )
 
 
 def depth_preview(inverse_depth: np.ndarray) -> np.ndarray:
@@ -109,23 +143,25 @@ def convert(
     inverse_depth = prepared.inverse_depth
     height, width = source.shape[:2]
 
+    # Older Prepared values, and any caller building one by hand, may not carry
+    # the linear copy. Deriving it is cheap next to depth estimation.
+    linear = prepared.linear
+    if linear is None:
+        linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
+
     say("Building the DLAA contract…")
     plan = contract.build(
-        source,
+        linear,
         inverse_depth,
         depth_contrast=settings.depth.contrast,
         frames=settings.evaluation.frames,
         jitter=settings.evaluation.jitter,
+        already_linear=True,
     )
     scratch = paths.scratch_dir()
     plane_paths = contract.write_planes(plan, scratch)
     colour_path = plane_paths["colour"]
     out_path = scratch / "out.bin"
-
-    # Pre-linearise once. Jittering resamples this every frame, and doing the
-    # sRGB decode inside that loop would repeat the most expensive per-pixel
-    # maths in the pipeline eight times for an identical result.
-    linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
 
     def write_colour(path: Path, offset: tuple[float, float]) -> None:
         shifted = contract.shift_subpixel(linear, offset[0], offset[1])
@@ -150,13 +186,27 @@ def convert(
 
     say("Encoding…")
     enhanced_linear = contract.read_output(out_path, width, height)
-    enhanced = np.clip(contract.linear_to_srgb(enhanced_linear), 0.0, 1.0)
+
+    notes = f"{width}x{height}, {settings.evaluation.frames} DLSS passes"
+    if prepared.hdr:
+        # Tone map with the source's white point, not one measured on this
+        # image: the two are shown side by side under a wipe, and a different
+        # mapping on each half would read as an exposure change the neural pass
+        # did not make.
+        return Result(
+            original=source,
+            enhanced=hdr.tonemap(enhanced_linear, prepared.white),
+            depth_preview=depth_preview(inverse_depth),
+            notes=f"{notes}, {hdr.describe(enhanced_linear)}",
+            enhanced_linear=enhanced_linear,
+            white=prepared.white,
+        )
 
     return Result(
         original=np.clip(source, 0.0, 1.0),
-        enhanced=enhanced,
+        enhanced=np.clip(contract.linear_to_srgb(enhanced_linear), 0.0, 1.0),
         depth_preview=depth_preview(inverse_depth),
-        notes=f"{width}x{height}, {settings.evaluation.frames} DLSS passes",
+        notes=notes,
     )
 
 
@@ -169,6 +219,53 @@ class SequenceFrame:
     source: Path
     output: Path
     image: np.ndarray  # 0..1 float RGB, graded
+
+
+def hdr_output_path(destination: Path, stem: str, source: Path) -> Path:
+    """Where a converted frame goes, in a format that can hold what it holds.
+
+    Decided from the *input* extension rather than from the decoded pixels,
+    because the batch has to know the output name before it loads anything -
+    that is what lets it skip files it has already done.
+    """
+    suffix = ".jxr" if hdr.is_hdr_source(source) else ".png"
+    return destination / f"{stem}_dlss5{suffix}"
+
+
+def _finish(
+    enhanced_linear: np.ndarray,
+    *,
+    is_hdr: bool,
+    grade_settings,
+    white: float,
+) -> tuple[np.ndarray, bool, np.ndarray]:
+    """Grade and encode one result. Returns (payload, linear, preview).
+
+    `payload` is what gets written and `linear` says which space it is in;
+    `preview` is always display-referred, because the UI shows a thumbnail of
+    every frame and cannot show linear light.
+    """
+    if is_hdr:
+        graded = (
+            enhanced_linear
+            if grade_settings is None
+            else grade.apply_linear(enhanced_linear, grade_settings)
+        )
+        return graded, True, hdr.tonemap(graded, white)
+
+    enhanced = np.clip(contract.linear_to_srgb(enhanced_linear), 0.0, 1.0)
+    if grade_settings is not None:
+        enhanced = grade.apply(enhanced, grade_settings)
+    return enhanced, False, enhanced
+
+
+def _load_for_evaluation(path: Path, max_edge: int):
+    """Load one frame as (display sRGB, linear, hdr flag, white point)."""
+    loaded = contract.load_source(path)
+    linear = contract.fit_to_budget(loaded.linear, max_edge)
+    if loaded.hdr:
+        return hdr.tonemap(linear, loaded.white), linear, True, loaded.white
+    return np.clip(contract.linear_to_srgb(linear), 0.0, 1.0), linear, False, 1.0
 
 
 def convert_sequence(
@@ -260,8 +357,9 @@ def convert_sequence(
                 return
             say(f"Frame {index + 1} of {len(frames)} — {frame_path.name}")
 
-            source = contract.load_image(frame_path)
-            source = contract.fit_to_budget(source, settings.evaluation.max_edge)
+            source, linear, is_hdr, white = _load_for_evaluation(
+                frame_path, settings.evaluation.max_edge
+            )
             if source.shape[:2] != (height, width):
                 raise RuntimeError(
                     f"{frame_path.name} is {source.shape[1]}x{source.shape[0]}, but the "
@@ -285,7 +383,6 @@ def convert_sequence(
             np.ascontiguousarray(shaped).tofile(depth_path)
             harness.set_depth(depth_path)
 
-            linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
             harness.reset_history()
             for offset in offsets:
                 shifted = contract.shift_subpixel(linear, offset[0], offset[1])
@@ -296,15 +393,15 @@ def convert_sequence(
                 harness.frame(colour_path, offset)
 
             harness.write(out_path)
-            enhanced = np.clip(
-                contract.linear_to_srgb(contract.read_output(out_path, width, height)), 0.0, 1.0
+            payload, is_linear, preview = _finish(
+                contract.read_output(out_path, width, height),
+                is_hdr=is_hdr,
+                grade_settings=grade_settings,
+                white=white,
             )
-            if grade_settings is not None:
-                enhanced = grade.apply(enhanced, grade_settings)
-
-            output = destination / f"{frame_path.stem}_dlss5.png"
-            save_image(enhanced, output)
-            yield SequenceFrame(index, len(frames), frame_path, output, enhanced)
+            output = hdr_output_path(destination, frame_path.stem, frame_path)
+            save_image(payload, output, linear=is_linear)
+            yield SequenceFrame(index, len(frames), frame_path, output, preview)
 
 
 @dataclass
@@ -388,15 +485,15 @@ def convert_batch(
                 say("Stopped.")
                 return
 
-            output = destination / f"{path.stem}_dlss5.png"
+            output = hdr_output_path(destination, path.stem, path)
             if skip_existing and output.exists():
                 yield BatchItem(index, len(images), path, output, skipped=True)
                 continue
 
             say(f"{index + 1} of {len(images)} — {path.name}")
             try:
-                source = contract.fit_to_budget(
-                    contract.load_image(path), settings.evaluation.max_edge
+                source, linear, is_hdr, white = _load_for_evaluation(
+                    path, settings.evaluation.max_edge
                 )
                 height, width = source.shape[:2]
 
@@ -425,7 +522,6 @@ def convert_batch(
                 np.ascontiguousarray(shaped).tofile(depth_path)
                 harness.set_depth(depth_path)
 
-                linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
                 harness.reset_history()
                 for offset in offsets:
                     shifted = contract.shift_subpixel(linear, offset[0], offset[1])
@@ -436,14 +532,13 @@ def convert_batch(
                     harness.frame(colour_path, offset)
 
                 harness.write(out_path)
-                enhanced = np.clip(
-                    contract.linear_to_srgb(contract.read_output(out_path, width, height)),
-                    0.0,
-                    1.0,
+                payload, is_linear, _preview = _finish(
+                    contract.read_output(out_path, width, height),
+                    is_hdr=is_hdr,
+                    grade_settings=grade_settings,
+                    white=white,
                 )
-                if grade_settings is not None:
-                    enhanced = grade.apply(enhanced, grade_settings)
-                save_image(enhanced, output)
+                save_image(payload, output, linear=is_linear)
                 yield BatchItem(index, len(images), path, output)
 
             except Exception as error:  # noqa: BLE001 - one bad file, not the batch
@@ -505,18 +600,44 @@ def write_video(images: list[Path], destination: Path, fps: float) -> Path:
     return destination
 
 
-def save_image(image_rgb: np.ndarray, path: str | Path) -> None:
-    """Write 0..1 float RGB, choosing bit depth from the extension.
+def save_image(image_rgb: np.ndarray, path: str | Path, *, linear: bool = False) -> None:
+    """Write an image, choosing bit depth and encoding from the extension.
+
+    `image_rgb` is 0..1 sRGB float by default. With ``linear=True`` it is
+    scene-referred linear light and may exceed 1.0 — that is the form an HDR
+    result arrives in, and it is preserved for the formats that can hold it and
+    tone mapped for the ones that cannot.
 
     16-bit for PNG and TIFF because the neural pass genuinely widens tonal
     range in skin and shadows, and 8 bits puts visible banding into exactly the
     gradients this tool exists to improve.
     """
     target = Path(path)
-    rgb = np.clip(image_rgb, 0.0, 1.0)
-    if target.suffix.lower() in {".png", ".tif", ".tiff"}:
+    suffix = target.suffix.lower()
+
+    if suffix in wic.SUFFIXES:
+        # JPEG XR is stored in linear scRGB, so an SDR image has to be decoded
+        # into that space rather than written as-is.
+        wic.write(target, image_rgb if linear else contract.srgb_to_linear(
+            np.clip(image_rgb, 0.0, 1.0)
+        ))
+        return
+
+    if suffix in {".exr", ".hdr"} and linear:
+        # The one path where values above 1.0 survive into an OpenCV format.
+        # Written linear, which is what both formats mean by convention.
+        data = np.maximum(image_rgb, 0.0).astype(np.float32)
+        if not cv2.imwrite(str(target), data[:, :, ::-1]):
+            raise OSError(f"Could not write {target}")
+        return
+
+    # Everything below is display-referred and bounded. An HDR image reaching
+    # here is being asked for in a format that cannot hold it, so it is tone
+    # mapped rather than clipped - clipping is what turns a bright sky white.
+    rgb = hdr.tonemap(image_rgb) if linear else np.clip(image_rgb, 0.0, 1.0)
+    if suffix in {".png", ".tif", ".tiff"}:
         data = np.round(rgb * 65535.0).astype(np.uint16)
-    elif target.suffix.lower() in {".exr", ".hdr"}:
+    elif suffix in {".exr", ".hdr"}:
         data = rgb.astype(np.float32)
     else:
         data = np.round(rgb * 255.0).astype(np.uint8)

@@ -48,6 +48,7 @@ from . import (
     runtime,
     sequence,
 )
+from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
 from .settings import (
     MAX_EDGE_CHOICES,
@@ -1347,7 +1348,18 @@ class MainWindow(QMainWindow):
         """
         if self.result is None or self._preview_after_linear is None:
             return
-        graded = grade.apply_preview(self._preview_after_linear, self.settings.grade)
+        if self.result.hdr:
+            # Grade the scene-referred data and tone map afterwards, which is
+            # the order the export uses. Grading the tone mapped copy instead
+            # would preview an exposure change behaving quite differently from
+            # the one that ends up in the file.
+            graded = hdr_mod.tonemap(
+                grade.apply_linear(self._preview_after_linear, self.settings.grade),
+                self.result.white,
+            )
+            graded = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+        else:
+            graded = grade.apply_preview(self._preview_after_linear, self.settings.grade)
         self.wipe.set_images_u8(self._preview_before_u8, graded)
 
     def show_view(self, which: str) -> None:
@@ -1695,7 +1707,7 @@ class MainWindow(QMainWindow):
             self,
             "Choose the first frame of the sequence",
             str(self.sequence_page.frames[0].parent) if self.sequence_page.frames else "",
-            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.exr *.webp *.bmp)",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.exr *.hdr *.webp *.bmp *.jxr *.wdp *.hdp)",
         )
         if not chosen:
             return
@@ -1915,7 +1927,7 @@ class MainWindow(QMainWindow):
             self,
             "Choose an image",
             str(self.image_path.parent) if self.image_path else "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.exr *.hdr)",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.exr *.hdr *.jxr *.wdp *.hdp)",
         )
         if chosen:
             self.open_image(Path(chosen))
@@ -2000,10 +2012,19 @@ class MainWindow(QMainWindow):
         else:
             passes = 2
 
-        target = paths.scratch_dir() / f"{stem}_pass{passes}.png"
+        # An HDR result goes round as HDR. Writing the intermediate to PNG
+        # would tone map it, and pass two would then be working on an SDR
+        # image while the app still called the run HDR.
+        is_hdr = self.result.hdr
+        target = paths.scratch_dir() / f"{stem}_pass{passes}.{'jxr' if is_hdr else 'png'}"
         try:
-            pipeline.save_image(grade.apply(self.result.enhanced, self.settings.grade), target)
-        except OSError as error:
+            if is_hdr:
+                assert self.result.enhanced_linear is not None
+                payload = grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
+            else:
+                payload = grade.apply(self.result.enhanced, self.settings.grade)
+            pipeline.save_image(payload, target, linear=is_hdr)
+        except (OSError, RuntimeError) as error:
             QMessageBox.warning(self, "Could not start another pass", str(error))
             return
         self.open_image(target)
@@ -2185,9 +2206,15 @@ class MainWindow(QMainWindow):
         self._preview_before_u8 = np.clip(self._preview_before, 0.0, 1.0).astype(np.float32)
         self._preview_before_u8 = (self._preview_before_u8 * 255.0).astype(np.uint8)
         self._preview_after = _downscale_for_preview(result.enhanced)
-        self._preview_after_linear = contract.srgb_to_linear(
-            np.clip(self._preview_after, 0.0, 1.0).astype(np.float32)
-        )
+        if result.hdr:
+            # Keep the preview scene-referred for an HDR result, so the grade
+            # sliders act on the same numbers the export will.
+            assert result.enhanced_linear is not None
+            self._preview_after_linear = _downscale_for_preview(result.enhanced_linear)
+        else:
+            self._preview_after_linear = contract.srgb_to_linear(
+                np.clip(self._preview_after, 0.0, 1.0).astype(np.float32)
+            )
         self._render_result()
         self.save_button.setEnabled(True)
         self.feedback_button.setEnabled(True)
@@ -2228,10 +2255,15 @@ class MainWindow(QMainWindow):
         # of exports at three sizes is still readable a week later.
         if target != (width, height):
             stem = f"{stem}_{target[0]}x{target[1]}"
-        default = str(Path(suggested) / f"{stem}_dlss5.png")
-        chosen, _ = QFileDialog.getSaveFileName(
-            self, "Save result", default, "PNG (*.png);;TIFF (*.tif);;OpenEXR (*.exr);;JPEG (*.jpg)"
-        )
+        # An HDR result defaults to a format that can hold it. Offering PNG
+        # first would quietly tone map away the entire reason the source was
+        # opened as HDR.
+        is_hdr = self.result.hdr
+        default = str(Path(suggested) / f"{stem}_dlss5.{'jxr' if is_hdr else 'png'}")
+        hdr_filters = "JPEG XR (*.jxr);;OpenEXR (*.exr);;"
+        sdr_filters = "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)"
+        filters = (hdr_filters + sdr_filters) if is_hdr else (sdr_filters + ";;" + hdr_filters.rstrip(";"))
+        chosen, _ = QFileDialog.getSaveFileName(self, "Save result", default, filters)
         if not chosen:
             return
         try:
@@ -2239,15 +2271,22 @@ class MainWindow(QMainWindow):
             # Grade first, then resample: the grade is a per-pixel curve, and
             # running it after an enlargement would apply it to interpolated
             # pixels that the contrast S-curve then pushes apart again.
-            image = grade.apply(self.result.enhanced, self.settings.grade)
-            image = resample.resize(image, *target)
-            pipeline.save_image(image, chosen)
-        except (OSError, ValueError) as error:
+            if is_hdr:
+                assert self.result.enhanced_linear is not None
+                image = grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
+                image = resample.resize_linear(image, *target)
+            else:
+                image = grade.apply(self.result.enhanced, self.settings.grade)
+                image = resample.resize(image, *target)
+            pipeline.save_image(image, chosen, linear=is_hdr)
+        except (OSError, ValueError, RuntimeError) as error:
             QMessageBox.warning(self, "Could not save", str(error))
             return
         self.settings.last_output_dir = str(Path(chosen).parent)
         self.settings.save(paths.settings_path())
-        self.statusBar().showMessage(f"Saved {Path(chosen).name}")
+        kept = Path(chosen).suffix.lower() in hdr_mod.SUFFIXES
+        note = "" if not is_hdr else (" (HDR kept)" if kept else " (tone mapped to SDR)")
+        self.statusBar().showMessage(f"Saved {Path(chosen).name}{note}")
 
     def diagnose(self) -> None:
         status = runtime.detect(self.settings.runtime_dir or None)

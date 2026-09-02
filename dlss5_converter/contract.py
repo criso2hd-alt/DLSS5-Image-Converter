@@ -131,23 +131,84 @@ def fit_to_budget(image: np.ndarray, max_edge: int) -> np.ndarray:
     return cv2.resize(image, (target_w, target_h), interpolation=interpolation)
 
 
-def load_image(path: str | Path) -> np.ndarray:
-    """Read any supported image as 0..1 float32 RGB.
+@dataclass
+class Source:
+    """A loaded image in both of the forms the pipeline needs.
 
-    ``IMREAD_UNCHANGED`` so 16-bit PNG/TIFF and HDR sources keep their range
-    instead of being silently crushed to 8 bits on the way in.
+    ``linear`` is what goes to DLSS: linear light, and for an HDR source it runs
+    above 1.0. ``rgb`` is the sRGB-encoded 0..1 version for the screen and for
+    depth estimation, which is tone mapped rather than clipped when the source
+    is HDR. Keeping both costs one extra copy and removes every opportunity to
+    hand the wrong one to the wrong consumer.
     """
-    source = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if source is None:
-        raise ValueError(f"Could not read {Path(path).name} — unsupported or corrupt.")
-    if source.ndim == 2:
-        source = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
-    source = source[:, :, :3]
-    if np.issubdtype(source.dtype, np.integer):
-        source = source.astype(np.float32) / float(np.iinfo(source.dtype).max)
+
+    rgb: np.ndarray  # 0..1 float32, sRGB encoded
+    linear: np.ndarray  # linear light; > 1.0 when hdr
+    hdr: bool = False
+    #: The luminance tone mapping brings down to 1.0. Held so the result can be
+    #: displayed with the same mapping as the original - recomputing it on the
+    #: enhanced image would make the before/after wipe change exposure halfway
+    #: across, which reads as the neural pass having done something it did not.
+    white: float = 1.0
+
+
+def load_image(path: str | Path) -> np.ndarray:
+    """Read any supported image as 0..1 float32 sRGB RGB.
+
+    HDR sources are tone mapped rather than clipped. Callers that want the
+    scene-referred data want ``load_source``.
+    """
+    return load_source(path).rgb
+
+
+def load_source(path: str | Path) -> Source:
+    """Read an image, keeping HDR range where the format carries it.
+
+    ``IMREAD_UNCHANGED`` so 16-bit PNG/TIFF keep their range instead of being
+    silently crushed to 8 bits on the way in. JPEG XR goes through Windows'
+    own codec, which is the only decoder for it on a normal machine.
+    """
+    # Imported here rather than at module scope: hdr needs this module's
+    # transfer curves, so importing it at the top would be a cycle.
+    from . import hdr, wic
+
+    target = Path(path)
+    is_hdr = hdr.is_hdr_source(target)
+
+    if wic.handles(target):
+        linear = wic.read(target)
     else:
-        source = np.nan_to_num(source.astype(np.float32), nan=0.0, posinf=1.0, neginf=0.0)
-    return np.ascontiguousarray(source[:, :, ::-1])  # BGR -> RGB
+        source = cv2.imread(str(target), cv2.IMREAD_UNCHANGED)
+        if source is None:
+            raise ValueError(f"Could not read {target.name} — unsupported or corrupt.")
+        if source.ndim == 2:
+            source = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
+        source = source[:, :, :3]
+        if np.issubdtype(source.dtype, np.integer):
+            source = source.astype(np.float32) / float(np.iinfo(source.dtype).max)
+        else:
+            # posinf to 0 rather than 1: an infinity in an EXR is a dead pixel,
+            # and calling it "diffuse white" would put a bright dot in the plate.
+            source = np.nan_to_num(source.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        rgb = np.ascontiguousarray(source[:, :, ::-1])  # BGR -> RGB
+        if not is_hdr:
+            # An ordinary file. Its numbers are sRGB encoded and bounded.
+            rgb = np.clip(rgb, 0.0, 1.0)
+            return Source(rgb=rgb, linear=srgb_to_linear(rgb), hdr=False, white=1.0)
+        # .exr and .hdr are linear by convention. Reading them as though they
+        # carried an sRGB curve is what used to crush them.
+        linear = np.maximum(rgb, 0.0)
+
+    white = hdr.white_point(linear)
+    return Source(
+        rgb=hdr.tonemap(linear, white),
+        linear=np.ascontiguousarray(linear),
+        # An HDR container holding nothing above diffuse white is an SDR image
+        # with an unusual extension; treating it as HDR would only cost a
+        # pointless tone map.
+        hdr=float(np.max(linear)) > 1.0 if linear.size else False,
+        white=white,
+    )
 
 
 def build(

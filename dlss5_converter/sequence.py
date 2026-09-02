@@ -31,9 +31,11 @@ import cv2
 import numpy as np
 
 #: What we will treat as a frame. EXR is included because renderers emit depth
-#: that way and it is the only common format that survives real Z values.
+#: that way and it is the only common format that survives real Z values. JPEG
+#: XR because that is what an HDR screenshot is on Windows.
 SEQUENCE_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".hdr", ".webp", ".bmp",
+    ".jxr", ".wdp", ".hdp",
 }
 
 _TRAILING_DIGITS = re.compile(r"^(?P<prefix>.*?)(?P<digits>\d+)$")

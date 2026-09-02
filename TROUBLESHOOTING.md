@@ -270,6 +270,33 @@ anything specific to that code.
 
 ---
 
+## HDR: my .jxr will not open / the result looks flat
+
+`.jxr` is decoded by Windows' own imaging codecs. `--selftest` proves they work
+on your machine by writing an HDR file and reading it back:
+
+```
+jpeg xr          : ok (peak 8.00, expected 8.00)
+```
+
+If that line says `unavailable` or `FAILED`, the codec is missing or blocked —
+unusual, and not something this app installs.
+
+**A result that looks flat or washed out is the tone mapping, not the pipeline.**
+Your monitor gets 0..1, so the preview has to compress a highlight at 12x diffuse
+white into it. That is a display step only: the exported `.jxr` or `.exr` still
+has the full range, and looks right in something that can show HDR.
+
+**A `.jxr` that is not actually HDR is treated as SDR.** If nothing in the file
+exceeds diffuse white, tone mapping it would only cost quality, so it is skipped.
+The status bar after a conversion says which happened.
+
+**PNG from an HDR result is tone mapped, not clipped.** Clipping is what turns a
+bright sky into a flat white shape. If you want the range, save `.jxr` or `.exr`
+— those are offered first when the result is HDR.
+
+---
+
 ## Still stuck
 
 Open an issue with `report.txt` from `--selftest` attached, plus your GPU, driver

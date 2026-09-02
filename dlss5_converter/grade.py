@@ -125,3 +125,14 @@ def _grade_linear(linear: np.ndarray, grade: GradeSettings) -> np.ndarray:
 def apply_to_linear(linear: np.ndarray, grade: GradeSettings) -> np.ndarray:
     """Grade already-linear RGB, returning 0..1 sRGB float."""
     return np.clip(linear_to_srgb(_grade_linear(linear, grade)), 0.0, 1.0)
+
+
+def apply_linear(linear: np.ndarray, grade: GradeSettings) -> np.ndarray:
+    """Grade linear RGB and leave it linear, for an HDR result.
+
+    The maths in `_grade_linear` is already unbounded — exposure is a multiply,
+    the contrast curve is a power about middle grey, and both are meaningful
+    above 1.0. All this adds is not throwing the range away at the end, which
+    is what the sRGB encode in the other two entry points does.
+    """
+    return _grade_linear(linear, grade)

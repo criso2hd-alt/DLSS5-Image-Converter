@@ -93,6 +93,30 @@ def run_selftest() -> int:
         _line(f"depth inference  : FAILED - {type(error).__name__}: {error}")
         failures += 1
 
+    # HDR input and output both go through Windows' own imaging codecs, which
+    # are not something this app installs. A round trip through the encoder and
+    # back is the only way to know they are really there on this machine.
+    try:
+        import numpy as np
+
+        from . import wic
+
+        if not wic.available():
+            _line("jpeg xr          : unavailable (Windows imaging codecs)")
+        else:
+            probe_path = paths.scratch_dir() / "selftest_hdr.jxr"
+            sample = np.full((8, 8, 3), 0.25, np.float32)
+            sample[:, 4:, 0] = 8.0  # a highlight well above diffuse white
+            wic.write(probe_path, sample)
+            peak = float(wic.read(probe_path).max())
+            ok = abs(peak - 8.0) < 0.05
+            _line(f"jpeg xr          : {'ok' if ok else 'FAILED'} (peak {peak:.2f}, expected 8.00)")
+            if not ok:
+                failures += 1
+    except Exception as error:  # noqa: BLE001
+        _line(f"jpeg xr          : FAILED - {error}")
+        failures += 1
+
     _line("")
 
     # --- the DLSS side --------------------------------------------------

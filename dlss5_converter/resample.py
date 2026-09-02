@@ -95,6 +95,28 @@ def resize(image_rgb: np.ndarray, width: int, height: int) -> np.ndarray:
     return np.clip(linear_to_srgb(scaled), 0.0, 1.0)
 
 
+def resize_linear(linear_rgb: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resample linear light directly, keeping values above 1.0.
+
+    Shorter than `resize` because the hard part is already done: this data is
+    linear, so there is no transfer curve to undo and redo. The clamp is only
+    against Lanczos ringing, and it has no ceiling — the highlights that ring
+    are exactly the ones an HDR export exists to keep.
+    """
+    source_height, source_width = linear_rgb.shape[:2]
+    if width <= 0 or height <= 0:
+        raise ValueError("Export size must be positive.")
+    if width > MAX_EDGE or height > MAX_EDGE:
+        raise ValueError(f"Export size is capped at {MAX_EDGE} px on a side.")
+    if (width, height) == (source_width, source_height):
+        return linear_rgb
+
+    enlarging = width * height > source_width * source_height
+    interpolation = cv2.INTER_LANCZOS4 if enlarging else cv2.INTER_AREA
+    scaled = cv2.resize(linear_rgb.astype(np.float32), (width, height), interpolation=interpolation)
+    return np.clip(scaled, 0.0, None)
+
+
 def describe(size: tuple[int, int], target: tuple[int, int]) -> str:
     """One line for the dialog, naming the operation rather than the numbers."""
     width, height = size

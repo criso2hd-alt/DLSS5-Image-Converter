@@ -249,6 +249,39 @@ allocations rather than by the image. Architectural and product renders at
 5–6K should just raise this. The field is editable, so an odd size can be typed
 in directly.
 
+### HDR
+
+Open a `.jxr` — what Xbox Game Bar and NVIDIA's capture write when you screenshot
+an HDR game — and the whole pipeline stays in linear light. `.exr` and `.hdr` are
+treated the same way.
+
+This is not a format convenience. DLSS 5's neural pass is built to work in HDR;
+that is why the add-on has paper white, HDR transfer and colour sliders at all.
+Feeding it a real HDR image is the input the model was designed for, and the
+highlights that an SDR screenshot has already thrown away are exactly the ones
+it has the most to say about.
+
+What happens where:
+
+| stage | HDR source |
+| ----- | ---------- |
+| decode | Windows' own JPEG XR codec — no extra download |
+| DLSS | linear scRGB, values above 1.0 intact |
+| depth | tone mapped copy, because Depth Anything wants a normal picture |
+| preview | tone mapped, with the same white point for both halves of the wipe |
+| export | `.jxr` or `.exr` keep the range; PNG/TIFF/JPEG tone map rather than clip |
+
+`Save result…` defaults to `.jxr` for an HDR result, and the status bar says
+whether the range was kept or tone mapped. Folder batch and image sequences
+follow the source: an HDR frame in, an HDR frame out.
+
+Tone mapping is extended Reinhard on luminance, with the white point taken from
+the 99.9th percentile rather than the maximum — one specular pixel at 300x
+diffuse white should not drag the whole image into the floor.
+
+Nothing here converts to absolute nits. scRGB's 1.0 is diffuse white, and how
+bright that ends up is the add-on's paper-white slider, not ours.
+
 ### Command line
 
 ```powershell

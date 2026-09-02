@@ -20,7 +20,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr", ".hdr"}
+SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr",
+             ".hdr", ".jxr", ".wdp", ".hdp"}
 
 
 def to_qimage_u8(image_rgb: np.ndarray) -> QImage:
@@ -94,7 +95,7 @@ class DropZone(QFrame):
             self,
             "Choose an image",
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.exr *.hdr)",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.exr *.hdr *.jxr *.wdp *.hdp)",
         )
         if chosen:
             self.opened.emit(Path(chosen))
