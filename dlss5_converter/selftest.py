@@ -144,6 +144,45 @@ def run_selftest() -> int:
             _line(f"conversion       : FAILED - {type(error).__name__}: {error}")
             failures += 1
 
+    # --- what the add-on itself said -------------------------------------
+    #
+    # The probe can only report whether nvngx_dlssnr.dll ended up in the
+    # process. When it did not, the reason is always in the add-on's own log and
+    # never in ours: it refuses runtimes it does not recognise, and says so.
+    # Reprinting its lines here saves a round trip asking for the file.
+    if status.harness is not None:
+        engine = status.harness.parent
+        staged = sorted(
+            p.name for p in engine.glob("*") if p.suffix.lower() in {".dll", ".addon64"}
+        )
+        _line("")
+        _line(f"staged beside the harness: {', '.join(staged) or 'nothing'}")
+
+        log = engine / "ReShade.log"
+        if log.is_file():
+            try:
+                lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                lines = []
+            addon = [line for line in lines if "DLSS 5 Neural Rendering" in line]
+            interesting = [
+                line
+                for line in addon
+                if any(
+                    word in line.lower()
+                    for word in ("sha256", "runtime", "unavailable", "fail", "error", "reject")
+                )
+            ]
+            if interesting:
+                _line("")
+                _line("what the add-on reported:")
+                for line in interesting[-8:]:
+                    # Strip the timestamp and level, keep the message.
+                    _line("  " + line.split("| INFO  |")[-1].split("| WARN  |")[-1]
+                          .split("| ERROR |")[-1].strip()[:200])
+        else:
+            _line("(no ReShade.log yet - run a conversion first)")
+
     _line("=" * 46)
     _line("PASS" if failures == 0 else f"{failures} problem(s)")
     return 1 if failures else 0
