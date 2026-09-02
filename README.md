@@ -298,6 +298,12 @@ Reasonable question for a random executable:
   and `huggingface.co`. Nothing else phones home, and there is no telemetry.
 - Roughly 2,500 lines of Python and one ~600-line C++ file.
 
+## Support
+
+This is free, and staying free. If it saved you time and you feel like it, there
+is a **Sponsor** button at the top of the repository. Entirely optional — bug
+reports and screenshots of what you made are worth just as much.
+
 ## Licence
 
 **Source-available, not open source.** See [LICENSE](LICENSE).

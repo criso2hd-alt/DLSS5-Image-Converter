@@ -1,0 +1,8 @@
+# Puts a "Sponsor" button on the repository.
+#
+# This only does anything once the account has been approved for GitHub
+# Sponsors at https://github.com/sponsors — that step needs bank details, tax
+# forms and identity verification, so it has to be done by hand. The file is
+# committed ahead of time so the button appears the moment approval lands,
+# rather than needing a second commit nobody remembers to make.
+github: [criso2hd-alt]
