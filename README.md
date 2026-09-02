@@ -66,8 +66,19 @@ process. That was the open question the whole project rested on.
 | `renodx-dlss5.addon64` | the RenoDX DLSS 5 add-on |
 | `dxgi.dll` | ReShade. Already have it in a game? Copy that game's `bin\x64\dxgi.dll` — no need to touch the installer. |
 
-**If DLSS 5 already works in a game for you, copy all four files out of that
-game's folder.** They sit beside the game executable, usually in `bin\x64`. A set
+**Easiest: click "Find my DLSS files…" in the app.** It searches your Steam
+libraries, Downloads and Documents, and copies the four files in for you.
+Nothing is downloaded — it only looks at files already on your machine.
+
+It prefers a folder that has a **complete matched set**, because mixing a
+runtime from one source with an add-on from another is a common way to get
+`NR is unavailable in this session`. The one exception is the add-on itself: the
+newest one found anywhere wins, since games keep whichever build was current
+when they were modded, and an out-of-date add-on makes the neural pass silently
+not run.
+
+**Or by hand — if DLSS 5 already works in a game for you, copy all four files
+out of that game's folder.** They sit beside the game executable, usually in `bin\x64`. A set
 already running on your card is a set your GPU, your driver and the add-on have
 all accepted, which saves guessing about versions — and keeping the four
 together matters, since mixing a runtime from one source with an add-on from

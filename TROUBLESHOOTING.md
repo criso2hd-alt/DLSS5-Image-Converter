@@ -74,8 +74,13 @@ The file is present and found — the add-on **refused** it. Its own message:
 > nvngx_dlssnr.dll with the reference build (sha256 in the addon README) and
 > restart.
 
-**The reliable fix: if DLSS 5 already works in a game for you, copy all four
-files out of that game's folder** into `dlss_files\`. They sit beside the game
+**Easiest fix: click "Find my DLSS files…"** in the app. It searches your Steam
+libraries, Downloads and Documents and copies a matched set in — including the
+newest add-on it can find anywhere, which is usually the fix for this exact
+symptom.
+
+**By hand: if DLSS 5 already works in a game for you, copy all four files out of
+that game's folder** into `dlss_files\`. They sit beside the game
 executable, usually in `bin\x64`. A set already running on your card is a set
 your GPU, your driver and the add-on all accept — no version guessing.
 

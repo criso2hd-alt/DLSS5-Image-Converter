@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -34,7 +36,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import bootstrap, contract, evaluator, grade, paths, pipeline, runtime, sequence
+from . import (
+    bootstrap,
+    contract,
+    discovery,
+    evaluator,
+    grade,
+    paths,
+    pipeline,
+    runtime,
+    sequence,
+)
 from .depth_engine import MODELS, DepthEngine
 from .settings import (
     MAX_EDGE_CHOICES,
@@ -274,6 +286,244 @@ class DownloadWorker(QObject):
             self.failed.emit(str(error))
             return
         self.finished.emit()
+
+
+class FindFilesWorker(QObject):
+    """Searches the disk for the user's DLSS files, off the UI thread."""
+
+    progress = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, roots: list[Path]) -> None:
+        super().__init__()
+        self._roots = roots
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            found = discovery.scan(
+                self._roots,
+                on_progress=self.progress.emit,
+                should_stop=lambda: self._stop,
+            )
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(found)
+
+
+class FindFilesDialog(QDialog):
+    """Find the four files on the user's own disk and copy them in.
+
+    The single biggest step between "downloaded it" and "it works". Most people
+    arriving here have already made DLSS 5 run in a game, so the files exist —
+    they just should not have to know that `nvngx_dlssnr.dll` is the one that
+    matters or which of their games has the newest add-on.
+    """
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__(window)
+        self._window = window
+        self._candidates: list[discovery.Candidate] = []
+        self._extra_roots: list[Path] = []
+        self._thread: QThread | None = None
+        self._worker: FindFilesWorker | None = None
+
+        self.setWindowTitle("Find my DLSS files")
+        self.setModal(False)
+        self.setMinimumWidth(720)
+        self.setStyleSheet(STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        blurb = QLabel(
+            "Searches your Steam libraries, Downloads and Documents for the four "
+            "files, and copies them here.\n\n"
+            "Nothing is downloaded — this only looks at files already on your "
+            "machine. If DLSS 5 works in a game for you, that game's folder is "
+            "what it is looking for."
+        )
+        blurb.setWordWrap(True)
+        blurb.setObjectName("hint")
+        layout.addWidget(blurb)
+
+        self.results = QListWidget()
+        self.results.setMinimumHeight(180)
+        self.results.currentRowChanged.connect(self._selection_changed)
+        layout.addWidget(self.results)
+
+        self.summary = QLabel("")
+        self.summary.setObjectName("hint")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        self.status = QLabel("Ready.")
+        self.status.setObjectName("hint")
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("secondary")
+        self.add_folder = QPushButton("Search another folder…")
+        self.add_folder.setObjectName("secondary")
+        self.rescan = QPushButton("Search again")
+        self.rescan.setObjectName("secondary")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("secondary")
+        self.stop_button.setVisible(False)
+        self.copy_button = QPushButton("Copy these files")
+        self.copy_button.setEnabled(False)
+        buttons.addWidget(self.close_button)
+        buttons.addWidget(self.add_folder)
+        buttons.addWidget(self.rescan)
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.copy_button)
+        layout.addLayout(buttons)
+
+        self.close_button.clicked.connect(self.close)
+        self.add_folder.clicked.connect(self._add_folder)
+        self.rescan.clicked.connect(self.start_scan)
+        self.stop_button.clicked.connect(self._stop)
+        self.copy_button.clicked.connect(self._copy)
+
+    # -- scanning ------------------------------------------------------------
+
+    def start_scan(self) -> None:
+        if self._thread is not None:
+            return
+        roots = discovery.default_roots() + self._extra_roots
+        if not roots:
+            self.status.setText("Nowhere obvious to look. Use 'Search another folder…'.")
+            return
+        self.results.clear()
+        self.summary.setText("")
+        self.copy_button.setEnabled(False)
+        self.rescan.setEnabled(False)
+        self.stop_button.setVisible(True)
+        self.status.setText("Searching…")
+
+        self._thread = QThread(self)
+        self._worker = FindFilesWorker(roots)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status.setText)
+        self._worker.finished.connect(self._scan_done)
+        self._worker.failed.connect(self._scan_failed)
+        self._thread.start()
+
+    def _stop(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self.status.setText("Stopping…")
+
+    def _teardown(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(10000)
+            self._thread = None
+        self._worker = None
+        self.stop_button.setVisible(False)
+        self.rescan.setEnabled(True)
+
+    def _scan_done(self, candidates: list[discovery.Candidate]) -> None:
+        self._teardown()
+        self._candidates = candidates
+        if not candidates:
+            self.status.setText(
+                "Nothing found. If DLSS 5 works in a game, use 'Search another "
+                "folder…' and point it at that game."
+            )
+            return
+
+        complete = [c for c in candidates if c.complete]
+        for candidate in candidates:
+            self.results.addItem(QListWidgetItem(candidate.describe()))
+        self.results.setCurrentRow(0)
+        self.status.setText(
+            f"{len(candidates)} folder(s) found, {len(complete)} with all four. "
+            "The best is selected."
+        )
+
+    def _scan_failed(self, message: str) -> None:
+        self._teardown()
+        self.status.setText(message)
+
+    def _add_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Also search this folder")
+        if chosen:
+            self._extra_roots.append(Path(chosen))
+            self.start_scan()
+
+    # -- choosing and copying ------------------------------------------------
+
+    def _plan(self) -> dict[str, Path]:
+        """What would be copied for the current selection."""
+        row = self.results.currentRow()
+        if row < 0 or row >= len(self._candidates):
+            return {}
+        # The selected folder first, then anything else fills the gaps and the
+        # newest add-on wins - same rule as the automatic choice.
+        ordered = [self._candidates[row]] + [
+            c for i, c in enumerate(self._candidates) if i != row
+        ]
+        return discovery.best_set(ordered)
+
+    def _selection_changed(self, _row: int) -> None:
+        plan = self._plan()
+        self.copy_button.setEnabled(len(plan) == len(discovery.WANTED))
+        if not plan:
+            self.summary.setText("")
+            return
+        lines = []
+        for name in discovery.WANTED:
+            path = plan.get(name)
+            if path is None:
+                lines.append(f"   {name} — still missing")
+            else:
+                size = path.stat().st_size / 1048576
+                lines.append(f"   {name}  ({size:.1f} MB)  from  {path.parent}")
+        note = ""
+        if len({p.parent for p in plan.values()}) > 1:
+            note = (
+                "\nFiles come from more than one folder. That is usually fine — the "
+                "newest add-on is always preferred, because an out-of-date one is a "
+                "known cause of the neural pass silently not running."
+            )
+        self.summary.setText("Would copy:\n" + "\n".join(lines) + note)
+
+    def _copy(self) -> None:
+        plan = self._plan()
+        if not plan:
+            return
+        destination = paths.dlss_files_dir()
+        copied, skipped = discovery.install(plan, destination)
+        parts = []
+        if copied:
+            parts.append(f"copied {', '.join(copied)}")
+        if skipped:
+            parts.append(f"left alone (already there): {', '.join(skipped)}")
+        self.status.setText("; ".join(parts) or "Nothing to do.")
+        self._window.refresh_runtime_status()
+        if copied:
+            QMessageBox.information(
+                self,
+                "Files copied",
+                f"{len(copied)} file(s) copied into:\n{destination}\n\n"
+                "Use Check runtime to confirm everything is working.",
+            )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._worker is not None:
+            self._worker.stop()
+        self._teardown()
+        super().closeEvent(event)
 
 
 class BatchWorker(QObject):
@@ -1253,6 +1503,18 @@ class MainWindow(QMainWindow):
         self.feedback_button.clicked.connect(self.use_result_as_input)
         layout.addWidget(self.feedback_button)
 
+        self.find_button = QPushButton("Find my DLSS files…")
+        self.find_button.setObjectName("secondary")
+        self.find_button.setToolTip(
+            "Search your Steam libraries, Downloads and Documents for the four "
+            "files, and copy them in.\n\n"
+            "Nothing is downloaded - this only looks at files already on your "
+            "machine. If DLSS 5 works in a game for you, that game's folder is "
+            "what it is looking for."
+        )
+        self.find_button.clicked.connect(self.open_find_files)
+        layout.addWidget(self.find_button)
+
         diagnose = QPushButton("Check runtime")
         diagnose.setObjectName("secondary")
         diagnose.clicked.connect(self.diagnose)
@@ -1531,6 +1793,24 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage("Nothing on the clipboard to paste.")
+
+    def refresh_runtime_status(self) -> None:
+        try:
+            message = runtime.describe(runtime.detect(self.settings.runtime_dir))
+        except Exception as error:  # noqa: BLE001 - status must never raise
+            message = f"Could not check the DLSS runtime: {error}"
+        self.statusBar().showMessage(message)
+
+    def open_find_files(self) -> None:
+        existing = getattr(self, "_find_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._find_dialog = FindFilesDialog(self)
+        self._find_dialog.show()
+        # Straight into a search: the user clicked a button that says find.
+        QTimer.singleShot(0, self._find_dialog.start_scan)
 
     def open_batch(self) -> None:
         """The folder dialog, created on demand and remembered while open."""
