@@ -198,6 +198,14 @@ Put your own DLSS 5 files in this folder.
 
 None of these ship with the app and it will not help you obtain them.
 
+EASIEST WAY, if DLSS 5 already works in a game for you:
+copy all four files out of that game's folder. They sit next to the game
+executable, usually in bin\x64. A set that is already running on your card
+is a set the add-on has accepted on your GPU and driver, which saves you
+guessing about versions - and keeping them together matters, because mixing
+a runtime from one source with an add-on from another is a common way to
+get "NR is unavailable in this session".
+
   nvngx_dlssnr.dll        the DLSS 5 neural renderer (about 158 MB)
                           on an RTX 40-series card this must be the
                           RTX-40-patched build, not the raw one

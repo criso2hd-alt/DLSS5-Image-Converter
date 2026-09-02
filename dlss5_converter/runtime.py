@@ -133,8 +133,13 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     # A release build has one obvious place for these, so name it. Telling a
     # user of a packaged app to "point the runtime folder somewhere" when the
     # app shipped them an empty folder for exactly this is needless friction.
+    # The single most useful instruction we can give, so it goes on every
+    # missing-file message: a set already running in a game is a set this
+    # machine's GPU, driver and add-on all accept.
     where = (
-        f"Put it in the {paths.DLSS_FILES_DIR} folder next to the application."
+        f"Put it in the {paths.DLSS_FILES_DIR} folder next to the application. "
+        "If DLSS 5 already works in a game for you, copy all four files out of "
+        "that game's folder - they sit beside the game executable."
         if paths.is_frozen()
         else "Point the runtime folder at your own copy of the DLSS 5 files."
     )
