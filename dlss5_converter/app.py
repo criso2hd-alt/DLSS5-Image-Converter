@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 from pathlib import Path
@@ -975,6 +976,22 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(self.save)
         layout.addWidget(self.save_button)
 
+        self.feedback_button = QPushButton("Use result as input")
+        self.feedback_button.setObjectName("secondary")
+        self.feedback_button.setEnabled(False)
+        self.feedback_button.setToolTip(
+            "Feed the result back in for another pass.\n\n"
+            "The colour grade is baked in, and depth is re-estimated from the "
+            "new image.\n\n"
+            "Worth knowing: the pass amplifies what it already did, so a second "
+            "run compounds artefacts as readily as detail. It is genuinely "
+            "useful on renders that started out flat, and it is the quickest "
+            "way to make a portrait look plastic. Lower the strengths for the "
+            "second pass rather than repeating the first."
+        )
+        self.feedback_button.clicked.connect(self.use_result_as_input)
+        layout.addWidget(self.feedback_button)
+
         diagnose = QPushButton("Check runtime")
         diagnose.setObjectName("secondary")
         diagnose.clicked.connect(self.diagnose)
@@ -1254,11 +1271,46 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Nothing on the clipboard to paste.")
 
+    def use_result_as_input(self) -> None:
+        """Feed the result back in, for a second pass.
+
+        Written to disk rather than handed over in memory, so the rest of the
+        app keeps working in paths and the intermediate is something the user
+        can actually find and inspect. 16-bit, because a second pass reads
+        gradients the first one just widened and 8 bits would band them.
+
+        The grade is baked in deliberately: it is what is on screen, and
+        grading after pass one then again after pass two is the natural way to
+        work.
+        """
+        if self.result is None:
+            return
+        stem = (self.image_path or Path("image")).stem
+        match = re.search(r"^(?P<base>.*)_pass(?P<n>\d+)$", stem)
+        if match:
+            stem = match.group("base")
+            passes = int(match.group("n")) + 1
+        else:
+            passes = 2
+
+        target = paths.scratch_dir() / f"{stem}_pass{passes}.png"
+        try:
+            pipeline.save_image(grade.apply(self.result.enhanced, self.settings.grade), target)
+        except OSError as error:
+            QMessageBox.warning(self, "Could not start another pass", str(error))
+            return
+        self.open_image(target)
+        self.statusBar().showMessage(
+            f"Pass {passes}: the previous result is now the input. "
+            "Consider lowering the strengths."
+        )
+
     def open_image(self, path: Path) -> None:
         self.image_path = path
         self.result = None
         self.prepared = None
         self.save_button.setEnabled(False)
+        self.feedback_button.setEnabled(False)
         self.convert_button.setEnabled(True)
         self.view_depth.setEnabled(False)
         self.view_result.setEnabled(False)
@@ -1431,6 +1483,7 @@ class MainWindow(QMainWindow):
         )
         self._render_result()
         self.save_button.setEnabled(True)
+        self.feedback_button.setEnabled(True)
         self.show_view("result")
         if self._previewing:
             neural = self.settings.neural

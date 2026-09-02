@@ -148,6 +148,19 @@ the saved file is graded at full resolution through the exact transfer curve.
 Left-drag still moves the comparison divider. Worth using — at 6K the things
 this tool changes are invisible at fit-to-window.
 
+### A second pass
+
+**Use result as input** feeds the finished image back in, with the colour grade
+baked and depth re-estimated from the new picture. The intermediate is written
+to the scratch folder as `name_pass2.png`, `name_pass3.png` and so on, so you
+can find it.
+
+It compounds. Measured on a render at full strength: pass one moves the image
+0.057 from the source, and pass two moves it a further 0.035 — roughly as much
+again. That is what makes it worth having on a flat render, and it is also the
+quickest way to make a portrait look plastic. **Lower the strengths for the
+second pass** rather than repeating the first.
+
 ### Image sequences
 
 The **Image sequence** tab converts a rendered sequence frame by frame. Pick the
