@@ -118,6 +118,25 @@ Sliders map onto the add-on's own controls: Intensity, Skin, Local Tone, Structu
 (0–2), plus Preset/Style and an HDR group — Paper White (0–16), HDR Transfer (0–1),
 Colour Strength (0–1) — for HDR and OLED displays.
 
+### Colour, and looking closely
+
+**Colour** in the bottom row opens exposure, contrast, saturation and vibrance,
+applied to the finished image. It is live — around 27 ms a redraw — because it
+runs *after* the neural pass rather than before it. Grading the input would
+change what the model sees, since the pass reasons about light transport, and
+would cost a full re-evaluation for every nudge.
+
+All of it happens in linear light. Vibrance scales its boost by how colourful a
+pixel already is, so skies and materials lift while skin mostly does not — reach
+for that before saturation on anything with a face in it.
+
+The preview is graded at 1200 px so the sliders stay responsive on an 8K image;
+the saved file is graded at full resolution through the exact transfer curve.
+
+**Wheel zooms** about the cursor, **right-drag pans**, double-click fits again.
+Left-drag still moves the comparison divider. Worth using — at 6K the things
+this tool changes are invisible at fit-to-window.
+
 ### Working above 4K
 
 **Max size** under Evaluation is the longest edge sent to DLSS, and therefore the
