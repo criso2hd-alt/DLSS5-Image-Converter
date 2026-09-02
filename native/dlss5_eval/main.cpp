@@ -180,6 +180,7 @@ public:
     void UploadColour(const std::wstring& path);
     void Evaluate(float jitter_x, float jitter_y, bool reset);
     size_t WriteOutput(const std::wstring& path);
+    void ProbeWarmUp();
     std::string Probe();
     void Shutdown();
 
@@ -209,6 +210,7 @@ private:
     //: the GPU in use rather than the one that happened to enumerate first.
     std::wstring adapter_description_;
     bool adapter_is_nvidia_ = false;
+    std::string probe_note_;
 
     NVSDK_NGX_Parameter* params_ = nullptr;
     NVSDK_NGX_Handle* feature_ = nullptr;
@@ -585,6 +587,82 @@ size_t Harness::WriteOutput(const std::wstring& path) {
     return static_cast<size_t>(row_bytes) * rows;
 }
 
+void Harness::ProbeWarmUp() {
+    // Run a real, tiny evaluation before reporting module state.
+    //
+    // Without this the probe is not just incomplete, it is misleading. The
+    // add-on pre-loads nvngx_dlssnr.dll at device init on some setups and
+    // defers to "retry lazily on first evaluate" on others — and a probe that
+    // returns before creating a feature never reaches the lazy path, so it
+    // reports dlssnr_module_loaded: 0 on a machine where a conversion would
+    // have worked perfectly.
+    //
+    // Two frames, not one: the add-on installs its NGX hooks during the first
+    // evaluate, so that one cannot be intercepted.
+    options_.width = 64;
+    options_.height = 64;
+    const size_t pixels = 64 * 64;
+
+    colour_ = CreateTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, 8, D3D12_RESOURCE_FLAG_NONE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    depth_ = CreateTexture(DXGI_FORMAT_R32_FLOAT, 4, D3D12_RESOURCE_FLAG_NONE,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    motion_ = CreateTexture(DXGI_FORMAT_R16G16_FLOAT, 4, D3D12_RESOURCE_FLAG_NONE,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    output_ = CreateTexture(DXGI_FORMAT_R16G16B16A16_FLOAT, 8,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    UploadTexture(colour_, std::vector<uint8_t>(pixels * 8, 0));
+    UploadTexture(depth_, std::vector<uint8_t>(pixels * 4, 0));
+    UploadTexture(motion_, std::vector<uint8_t>(pixels * 4, 0));
+    Execute();
+
+    NVSDK_NGX_DLSS_Create_Params create{};
+    create.Feature.InWidth = 64;
+    create.Feature.InHeight = 64;
+    create.Feature.InTargetWidth = 64;
+    create.Feature.InTargetHeight = 64;
+    create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR |
+                                  NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
+                                  NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+
+    const NVSDK_NGX_Result created =
+        NGX_D3D12_CREATE_DLSS_EXT(list_.Get(), 1, 1, &feature_, params_, &create);
+    if (NVSDK_NGX_FAILED(created)) {
+        const wchar_t* text = GetNGXResultAsString(created);
+        probe_note_ = "feature creation failed: " + Narrow(text ? text : L"");
+        return;
+    }
+    Execute();
+
+    for (int i = 0; i < 2; ++i) {
+        NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
+        eval.Feature.pInColor = colour_.resource.Get();
+        eval.Feature.pInOutput = output_.resource.Get();
+        eval.pInDepth = depth_.resource.Get();
+        eval.pInMotionVectors = motion_.resource.Get();
+        eval.InJitterOffsetX = 0.0f;
+        eval.InJitterOffsetY = 0.0f;
+        eval.InRenderSubrectDimensions.Width = 64;
+        eval.InRenderSubrectDimensions.Height = 64;
+        eval.InReset = i == 0 ? 1 : 0;
+        eval.InMVScaleX = 1.0f;
+        eval.InMVScaleY = 1.0f;
+        const NVSDK_NGX_Result evaluated =
+            NGX_D3D12_EVALUATE_DLSS_EXT(list_.Get(), feature_, params_, &eval);
+        if (NVSDK_NGX_FAILED(evaluated)) {
+            const wchar_t* text = GetNGXResultAsString(evaluated);
+            probe_note_ = "evaluation failed: " + Narrow(text ? text : L"");
+            return;
+        }
+        Execute();
+        if (swapchain_) swapchain_->Present(0, DXGI_PRESENT_ALLOW_TEARING);
+    }
+    probe_note_ = "ok";
+}
+
 std::string Harness::Probe() {
     std::ostringstream out;
     // The adapter the device was actually created on. Reporting whichever
@@ -619,6 +697,9 @@ std::string Harness::Probe() {
     out << "reshade_proxy_loaded: "
         << (proxy && GetProcAddress(proxy, "ReShadeRegisterAddon") ? 1 : 0) << "\n";
     out << "dlssnr_module_loaded: " << (GetModuleHandleW(L"nvngx_dlssnr.dll") ? 1 : 0) << "\n";
+    // The line above only means anything because ProbeWarmUp ran a real
+    // evaluation first; this says whether that evaluation actually worked.
+    if (!probe_note_.empty()) out << "test_evaluation: " << probe_note_ << "\n";
     return out.str();
 }
 
@@ -672,6 +753,7 @@ int main(int argc, char** argv) {
     harness.Initialise(options);
 
     if (options.probe) {
+        harness.ProbeWarmUp();
         std::cout << harness.Probe();
         std::cout.flush();
         harness.Shutdown();

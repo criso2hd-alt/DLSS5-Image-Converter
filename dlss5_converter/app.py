@@ -337,9 +337,11 @@ class MainWindow(QMainWindow):
         self.drop.opened.connect(self.open_image)
         self.wipe = WipeView()
         self.depth_view = ImageView()
+        self.diff_view = ImageView()
         self.stack.addWidget(self.drop)
         self.stack.addWidget(self.wipe)
         self.stack.addWidget(self.depth_view)
+        self.stack.addWidget(self.diff_view)
 
         canvas = QWidget()
         canvas_layout = QVBoxLayout(canvas)
@@ -398,12 +400,20 @@ class MainWindow(QMainWindow):
         self.view_photo = QPushButton("Photo")
         self.view_depth = QPushButton("Depth mask")
         self.view_result = QPushButton("Result")
-        for button in (self.view_photo, self.view_depth, self.view_result):
+        self.view_diff = QPushButton("Difference")
+        self.view_diff.setToolTip(
+            "What the neural pass actually changed, amplified to fill the range.\n\n"
+            "The honest answer to 'did anything happen?' - at conservative "
+            "settings on already-realistic content the change can be real and "
+            "still invisible side by side. Black means nothing changed there."
+        )
+        for button in (self.view_photo, self.view_depth, self.view_result, self.view_diff):
             button.setObjectName("secondary")
             button.setCheckable(True)
         self.view_photo.clicked.connect(lambda: self.show_view("photo"))
         self.view_depth.clicked.connect(lambda: self.show_view("depth"))
         self.view_result.clicked.connect(lambda: self.show_view("result"))
+        self.view_diff.clicked.connect(lambda: self.show_view("difference"))
         self.view_grade = QPushButton("Colour")
         self.view_grade.setObjectName("secondary")
         self.view_grade.setCheckable(True)
@@ -420,7 +430,8 @@ class MainWindow(QMainWindow):
         row.addWidget(self.view_photo)
         row.addWidget(self.view_depth)
         row.addWidget(self.view_result)
-        # Set apart: it is not a fourth view, it changes the one you are on.
+        row.addWidget(self.view_diff)
+        # Set apart: it is not another view, it changes the one you are on.
         row.addSpacing(28)
         row.addWidget(self.view_grade)
         row.addStretch(1)
@@ -484,6 +495,33 @@ class MainWindow(QMainWindow):
             row.set_value(getattr(self.settings.grade, field))
         self._render_result()
 
+    def _render_difference(self) -> None:
+        """Show what the neural pass changed, amplified to fill the range.
+
+        This exists because "it doesn't work, the image is identical" is the
+        most common report, and it is usually wrong: at the default strengths,
+        on content that is already photographic, a real change of a few percent
+        is genuinely invisible side by side. Amplifying it settles the question
+        in one click, and the caption gives the number so nobody has to squint.
+
+        Deliberately measured against the ungraded result. The colour grade is a
+        separate, later step and folding it in here would flatter the neural
+        pass with changes it did not make.
+        """
+        if self._preview_after is None or self._preview_before is None:
+            return
+        difference = np.abs(
+            self._preview_after.astype(np.float32) - self._preview_before.astype(np.float32)
+        )
+        mean = float(difference.mean())
+        peak = float(difference.max())
+        gain = 1.0 / max(peak, 1e-4)
+        self.diff_view.set_image(
+            np.clip(difference * gain, 0.0, 1.0),
+            f"Difference — mean {mean:.4f}, peak {peak:.4f}, amplified {gain:.0f}x"
+            + ("   (nothing changed)" if peak < 1e-4 else ""),
+        )
+
     def _render_result(self) -> None:
         """Redraw the comparison with the current grade applied.
 
@@ -499,12 +537,15 @@ class MainWindow(QMainWindow):
 
     def show_view(self, which: str) -> None:
         """Switch the canvas, falling back when the requested view has no data."""
-        if which == "result" and self.result is None:
+        if which in ("result", "difference") and self.result is None:
             which = "depth" if self.prepared is not None else "photo"
         if which == "depth" and self.prepared is None:
             which = "photo"
 
-        if which == "result":
+        if which == "difference":
+            self._render_difference()
+            self.stack.setCurrentWidget(self.diff_view)
+        elif which == "result":
             self._render_result()
             self.stack.setCurrentWidget(self.wipe)
         elif which == "depth":
@@ -521,6 +562,8 @@ class MainWindow(QMainWindow):
         self.view_photo.setChecked(which == "photo")
         self.view_depth.setChecked(which == "depth")
         self.view_result.setChecked(which == "result")
+        self.view_diff.setChecked(which == "difference")
+        self.view_diff.setEnabled(self.result is not None)
         self.view_depth.setEnabled(self.prepared is not None)
         self.view_result.setEnabled(self.result is not None)
         self.view_photo.setEnabled(self.prepared is not None)
