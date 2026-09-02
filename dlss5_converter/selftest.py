@@ -170,7 +170,14 @@ def run_selftest() -> int:
                 for line in addon
                 if any(
                     word in line.lower()
-                    for word in ("sha256", "runtime", "unavailable", "fail", "error", "reject")
+                    # "renodx" and "registered" catch the add-on's version
+                    # banner. Worth always showing: an outdated add-on is a
+                    # confirmed cause of dlssnr_module_loaded: 0 on newer cards,
+                    # and the version is the first thing to check.
+                    for word in (
+                        "sha256", "runtime", "unavailable", "fail", "error",
+                        "reject", "renodx", "registered",
+                    )
                 )
             ]
             if interesting:
