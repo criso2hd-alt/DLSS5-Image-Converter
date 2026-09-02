@@ -224,10 +224,17 @@ roughly as much again on the second run as the first.
 There is no certified answer, because DLSS 5 is not released. `nvngx_dlssnr.dll`
 is a pre-release binary and NVIDIA has published no minimum for it.
 
-What is known:
+**Confirmed case: 572.83 fails.** An RTX 4070 Ti SUPER, all four files correct,
+every indicator in Check runtime green including `test_evaluation: ok` — and
+every conversion died with the harness crashing. Updating the driver, and
+changing nothing else, fixed it. 616.56 is verified working here.
+
+What is known beyond that:
 
 - **Run the latest Game Ready driver.** Every confirmed-working report is on a
-  recent one; the confirmed failures skew old.
+  recent one; the one confirmed failure was on a driver about eighteen months
+  old. There is not enough data to name a cutoff, and guessing one would give
+  false warnings to people whose driver is fine.
 - **Ignore `min_driver_version` in the runtime check.** That number comes from
   NGX and is the minimum for *Super Resolution* — it reads 470.0, which DLSS 5
   will not honour. It is printed because NGX offers it, not because it answers
@@ -246,8 +253,9 @@ take the harness down on a real image.
 The harness crashed rather than reporting a failure, so all there is to go on is
 the exit code, which the message now names. In order of likelihood:
 
-1. **Update your NVIDIA driver.** See above. This is the first thing to try when
-   the runtime check is green but conversion is not.
+1. **Update your NVIDIA driver.** This is the confirmed cause of the only report
+   of this so far — green runtime check, crash on every real conversion, fixed
+   by a driver update alone. Try it first.
 2. **Lower Max size** to 1920 and convert again. If 1920 works and 3840 does
    not, it is a size limit — VRAM, or the driver refusing a buffer that large.
 3. **Switch the depth model to Base.** The Large model stays resident on the GPU
