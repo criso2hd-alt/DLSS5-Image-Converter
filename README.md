@@ -148,6 +148,35 @@ the saved file is graded at full resolution through the exact transfer curve.
 Left-drag still moves the comparison divider. Worth using — at 6K the things
 this tool changes are invisible at fit-to-window.
 
+### Image sequences
+
+The **Image sequence** tab converts a rendered sequence frame by frame. Pick the
+first frame and the rest are found by their trailing counter — matching prefix,
+matching padding width, so two renders in one folder do not interleave.
+
+**Give it your renderer's depth pass.** Pick the first frame of a depth sequence
+and Depth Anything is bypassed entirely. This is what makes a sequence look
+steady: estimated depth wobbles slightly from frame to frame and the neural pass
+follows that as flicker, while a depth pass out of Blender or Maya is
+geometrically exact and does not move at all. There is an invert toggle, because
+renderers disagree about which way up depth goes and it cannot be inferred — a
+Blender mist pass is near-dark, so tick it, and check the result looks right.
+
+Every frame resets DLSS's temporal history. Motion vectors are zero, so carrying
+accumulation between two genuinely different frames would drag the previous
+image into this one wherever the scene moved. Consistency comes from identical
+settings and stable depth, not from shared history — and it is exact: identical
+inputs produce bit-identical outputs.
+
+The whole sequence runs on **one** harness. Start-up is ~3.5 s and dominates a
+single conversion, so a sequence pays it once: five 640×360 frames take 6.2 s in
+total, 1.23 s each, against roughly 4 s each if every frame started its own.
+
+Output is a PNG sequence, plus an MP4 if you want one. That is encoded with mp4v
+rather than H.264, because OpenCV ships no H.264 encoder — the frames are always
+written, so re-encode them with anything you prefer. All frames must be the same
+size: one harness means one set of NGX buffers.
+
 ### Working above 4K
 
 **Max size** under Evaluation is the longest edge sent to DLSS, and therefore the
