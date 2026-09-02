@@ -44,6 +44,7 @@ from . import (
     grade,
     paths,
     pipeline,
+    resample,
     runtime,
     sequence,
 )
@@ -924,6 +925,157 @@ class SequencePage(QWidget):
         layout.addLayout(run_row)
 
 
+class ExportDialog(QDialog):
+    """Choose the size of the file being written.
+
+    This exists because "Max size" was being read as an output resolution
+    picker. It is not — it is the resolution DLSS runs at, picked for VRAM and
+    time — and the question people were actually asking, "how big is the image I
+    get?", had nowhere to be asked. So it gets asked here, at the moment it
+    means something.
+
+    It defaults to native and does not remember a different answer between
+    launches, so the fast path stays Save ▸ Enter ▸ Enter for anyone who does
+    not care.
+    """
+
+    def __init__(self, parent: QWidget, size: tuple[int, int]) -> None:
+        super().__init__(parent)
+        self._source = size
+        self._syncing = False
+
+        self.setWindowTitle("Export size")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self.setStyleSheet(STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        width, height = size
+        heading = QLabel(f"The result is {width} x {height}.")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Size"))
+        self.preset = QComboBox()
+        self.preset.addItem("Native", 0.0)
+        for multiple in (1.5, 2.0, 3.0, 4.0):
+            self.preset.addItem(f"{multiple:g}x", multiple)
+        # Absolute long edges as well: someone delivering to a 4K spec thinks in
+        # the target, not in a multiplier of whatever DLSS happened to run at.
+        for edge in (1920, 2560, 3840, 5120, 7680):
+            self.preset.addItem(f"{edge} px long edge", float(-edge))
+        preset_row.addStretch(1)
+        preset_row.addWidget(self.preset)
+        layout.addLayout(preset_row)
+
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Width"))
+        self.width_box = QSpinBox()
+        self.width_box.setRange(1, resample.MAX_EDGE)
+        self.width_box.setValue(width)
+        size_row.addWidget(self.width_box)
+        size_row.addWidget(QLabel("Height"))
+        self.height_box = QSpinBox()
+        self.height_box.setRange(1, resample.MAX_EDGE)
+        self.height_box.setValue(height)
+        size_row.addWidget(self.height_box)
+        size_row.addStretch(1)
+        layout.addLayout(size_row)
+
+        self.lock = QCheckBox("Keep proportions")
+        self.lock.setChecked(True)
+        self.lock.setToolTip(
+            "Untick only if you mean to change the aspect ratio. Everything "
+            "here stretches the image; nothing crops it."
+        )
+        layout.addWidget(self.lock)
+
+        self.hint = QLabel()
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+
+        note = QLabel(
+            "Plain resampling, not a second AI pass — Lanczos when enlarging, "
+            "area averaging when shrinking, both computed in linear light. "
+            "Enlarging cannot add detail the neural pass did not produce; for "
+            "more real detail, raise Max size instead and convert again."
+        )
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("secondary")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save…")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+
+        self.preset.currentIndexChanged.connect(self._preset_chosen)
+        self.width_box.valueChanged.connect(lambda v: self._edited(v, from_width=True))
+        self.height_box.valueChanged.connect(lambda v: self._edited(v, from_width=False))
+        self._describe()
+
+    # -- behaviour -----------------------------------------------------------
+
+    def chosen(self) -> tuple[int, int]:
+        return (self.width_box.value(), self.height_box.value())
+
+    def _preset_chosen(self) -> None:
+        data = self.preset.currentData()
+        # Clearing the selection (index -1, when a size is typed by hand) fires
+        # this too, with no data attached. It is not a choice; ignore it.
+        if self._syncing or data is None:
+            return
+        value = float(data)
+        if value == 0.0:
+            target = self._source
+        elif value < 0:
+            target = resample.fit(self._source, int(-value))
+        else:
+            target = resample.proportional(self._source, value)
+        self._set(target)
+
+    def _edited(self, value: int, *, from_width: bool) -> None:
+        if self._syncing:
+            return
+        if self.lock.isChecked():
+            target = resample.match(
+                self._source,
+                value if from_width else None,
+                None if from_width else value,
+            )
+        else:
+            target = self.chosen()
+        # Typing a size by hand means the preset no longer describes it.
+        self._syncing = True
+        self.preset.setCurrentIndex(-1)
+        self._syncing = False
+        self._set(target, keep_edited=from_width)
+
+    def _set(self, target: tuple[int, int], keep_edited: bool | None = None) -> None:
+        self._syncing = True
+        if keep_edited is not True:
+            self.width_box.setValue(target[0])
+        if keep_edited is not False:
+            self.height_box.setValue(target[1])
+        self._syncing = False
+        self._describe()
+
+    def _describe(self) -> None:
+        self.hint.setText(resample.describe(self._source, self.chosen()))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1439,7 +1591,10 @@ class MainWindow(QMainWindow):
             self.max_edge.setCurrentText(str(current))
         self.max_edge.setToolTip(
             "Longest edge sent to DLSS. Anything bigger is downscaled first, so "
-            "this is also the size you get back.\n\n"
+            "this is the resolution the neural pass actually runs at.\n\n"
+            "It is not an export setting. To write a file at a different size, "
+            "use Save result… and pick one there — but detail comes from this "
+            "number, not from that one.\n\n"
             "Raise it to keep the full resolution of large renders. Verified to "
             "8K here (25 s, 5.3 GB of VRAM) with the neural pass confirmed "
             "running at full size. 4K is the default because it is the size "
@@ -1470,6 +1625,7 @@ class MainWindow(QMainWindow):
 
         self.save_button = QPushButton("Save result…")
         self.save_button.setObjectName("secondary")
+        self.save_button.setToolTip("Asks for an export size first. Defaults to native.")
         self.save_button.setEnabled(False)
         self.save_button.clicked.connect(self.save)
         layout.addWidget(self.save_button)
@@ -2058,10 +2214,21 @@ class MainWindow(QMainWindow):
     def save(self) -> None:
         if self.result is None:
             return
+        height, width = self.result.enhanced.shape[:2]
+        sizer = ExportDialog(self, (width, height))
+        if sizer.exec() != QDialog.Accepted:
+            return
+        target = sizer.chosen()
+
         # The app's own output folder, not the home directory: a release build
         # ships one, and defaulting anywhere else scatters results.
         suggested = self.settings.last_output_dir or str(paths.output_dir())
-        default = str(Path(suggested) / f"{(self.image_path or Path('image')).stem}_dlss5.png")
+        stem = (self.image_path or Path("image")).stem
+        # Name the size in the file when it is not the native one, so a folder
+        # of exports at three sizes is still readable a week later.
+        if target != (width, height):
+            stem = f"{stem}_{target[0]}x{target[1]}"
+        default = str(Path(suggested) / f"{stem}_dlss5.png")
         chosen, _ = QFileDialog.getSaveFileName(
             self, "Save result", default, "PNG (*.png);;TIFF (*.tif);;OpenEXR (*.exr);;JPEG (*.jpg)"
         )
@@ -2069,8 +2236,13 @@ class MainWindow(QMainWindow):
             return
         try:
             # Full resolution, not the preview the sliders were dragged against.
-            pipeline.save_image(grade.apply(self.result.enhanced, self.settings.grade), chosen)
-        except OSError as error:
+            # Grade first, then resample: the grade is a per-pixel curve, and
+            # running it after an enlargement would apply it to interpolated
+            # pixels that the contrast S-curve then pushes apart again.
+            image = grade.apply(self.result.enhanced, self.settings.grade)
+            image = resample.resize(image, *target)
+            pipeline.save_image(image, chosen)
+        except (OSError, ValueError) as error:
             QMessageBox.warning(self, "Could not save", str(error))
             return
         self.settings.last_output_dir = str(Path(chosen).parent)

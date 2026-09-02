@@ -223,9 +223,15 @@ size: one harness means one set of NGX buffers.
 
 ### Working above 4K
 
-**Max size** under Evaluation is the longest edge sent to DLSS, and therefore the
-size you get back. Anything larger is downscaled first, so leaving it at 4K
+**Max size** under Evaluation is the longest edge sent to DLSS — the resolution
+the neural pass runs at. Anything larger is downscaled first, so leaving it at 4K
 silently shrinks a 6000 px render.
+
+It is not the export setting. **Save result…** asks for an output size of its
+own: native by default, with presets for 1.5x/2x/3x/4x and for a fixed long edge,
+or type a width and the height follows. That is plain resampling — Lanczos,
+computed in linear light, not a second AI pass — so it fits a delivery spec but
+cannot add detail. Detail comes from Max size.
 
 The default is 4K because that is the size NVIDIA validated, not a limit of the
 tool. Measured here on a 16 GB RTX 4080, with the add-on confirming the neural

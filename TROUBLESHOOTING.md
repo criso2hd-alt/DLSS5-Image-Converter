@@ -124,13 +124,33 @@ bar to a stream that was not there. Update.
 
 ---
 
-## My renders come out at 3840 px
+## My renders come out at 3840 px / how do I choose the export resolution?
 
-**Max size**, under Evaluation, is the longest edge sent to DLSS and therefore
-the size you get back. Anything larger is downscaled first. Raise it — 8K is
-verified here at 25 s and 5.3 GB of VRAM, barely more than 4K, because the cost
-is dominated by fixed NGX allocations rather than by the image. The field is
-editable if you want an exact number.
+Two different settings, and conflating them is the most common confusion there
+is.
+
+**Max size**, under Evaluation, is the longest edge sent to DLSS — the
+resolution the neural pass actually runs at. Anything larger is downscaled
+first. This is where detail comes from. Raise it: 8K is verified here at 25 s
+and 5.3 GB of VRAM, barely more than 4K, because the cost is dominated by fixed
+NGX allocations rather than by the image. The field is editable if you want an
+exact number.
+
+**Save result…** now asks for an export size before writing the file. Native by
+default; presets for 1.5x/2x/3x/4x and for a fixed long edge (1920 … 7680); or
+type a width and the height follows. Proportions are kept unless you untick.
+
+Which one you want:
+
+| you want | change |
+| -------- | ------ |
+| more actual detail | **Max size**, then convert again |
+| a file at a delivery spec | **Save result…** |
+
+Enlarging on export is plain resampling — Lanczos, computed in linear light. It
+cannot invent detail the neural pass did not produce. It is deliberately not a
+second AI upscaler: stacking one on the neural pass compounds the waxiness
+people already hit on a second pass.
 
 ---
 
@@ -196,6 +216,49 @@ photograph already has them.
 
 Lower **Skin** first. If you ran a second pass, lower everything: it compounds,
 roughly as much again on the second run as the first.
+
+---
+
+## What driver version do I need?
+
+There is no certified answer, because DLSS 5 is not released. `nvngx_dlssnr.dll`
+is a pre-release binary and NVIDIA has published no minimum for it.
+
+What is known:
+
+- **Run the latest Game Ready driver.** Every confirmed-working report is on a
+  recent one; the confirmed failures skew old.
+- **Ignore `min_driver_version` in the runtime check.** That number comes from
+  NGX and is the minimum for *Super Resolution* — it reads 470.0, which DLSS 5
+  will not honour. It is printed because NGX offers it, not because it answers
+  this question.
+- **`driver_version` is yours**, decoded the way NVIDIA Control Panel spells it,
+  so you can compare it against nvidia.com directly.
+
+An old driver does not fail cleanly. It can pass every indicator in the runtime
+check — including `test_evaluation: ok`, which is a 64x64 evaluation — and then
+take the harness down on a real image.
+
+---
+
+## `The harness stopped at 3840x2160 (exit code 0x…)`
+
+The harness crashed rather than reporting a failure, so all there is to go on is
+the exit code, which the message now names. In order of likelihood:
+
+1. **Update your NVIDIA driver.** See above. This is the first thing to try when
+   the runtime check is green but conversion is not.
+2. **Lower Max size** to 1920 and convert again. If 1920 works and 3840 does
+   not, it is a size limit — VRAM, or the driver refusing a buffer that large.
+3. **Switch the depth model to Base.** The Large model stays resident on the GPU
+   while the harness allocates its own full-size buffers; on a 12 GB card at 4K
+   they compete.
+4. **Update `renodx-dlss5.addon64`**, or click **Find my DLSS files…** which
+   takes the newest one on your disk.
+
+`0x887A0005` is the graphics device being removed or reset, and `0xC0000005` is
+a crash inside the runtime; both are usually one of the four above rather than
+anything specific to that code.
 
 ---
 
