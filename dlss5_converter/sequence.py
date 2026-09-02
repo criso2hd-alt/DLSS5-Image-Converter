@@ -32,7 +32,9 @@ import numpy as np
 
 #: What we will treat as a frame. EXR is included because renderers emit depth
 #: that way and it is the only common format that survives real Z values.
-SEQUENCE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".webp", ".bmp"}
+SEQUENCE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".hdr", ".webp", ".bmp",
+}
 
 _TRAILING_DIGITS = re.compile(r"^(?P<prefix>.*?)(?P<digits>\d+)$")
 

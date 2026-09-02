@@ -161,6 +161,26 @@ again. That is what makes it worth having on a flat render, and it is also the
 quickest way to make a portrait look plastic. **Lower the strengths for the
 second pass** rather than repeating the first.
 
+### A folder at a time
+
+**Apply to folder…** runs a whole folder with whatever is in the sidebar — neural
+strengths, depth settings, passes, size and the colour grade. Tune them on one
+image first; that image is your reference, and the rest of the folder gets the
+same treatment.
+
+It is a dialog rather than a third tab because batch is not really a separate
+mode — it is "do that again, to these" — so it belongs to the page where the
+settings were chosen and it goes away afterwards.
+
+One bad file does not stop the run: it is reported and skipped. **Skip images
+already converted** is on by default, so an interrupted batch can simply be
+started again. The harness is kept alive between images and restarted only when
+the frame size changes, so a folder of renders at one resolution pays the ~3.5 s
+start-up once.
+
+Use the **Image sequence** tab instead for animation — that keeps frames
+consistent with one another and can take your renderer's depth pass.
+
 ### Image sequences
 
 The **Image sequence** tab converts a rendered sequence frame by frame. Pick the

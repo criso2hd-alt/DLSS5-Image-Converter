@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QGroupBox,
@@ -273,6 +274,253 @@ class DownloadWorker(QObject):
             self.failed.emit(str(error))
             return
         self.finished.emit()
+
+
+class BatchWorker(QObject):
+    """Runs a folder through the current settings, off the UI thread."""
+
+    progress = Signal(str)
+    item_done = Signal(object)
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        images: list[Path],
+        settings: AppSettings,
+        engine: DepthEngine,
+        destination: Path,
+        skip_existing: bool,
+    ) -> None:
+        super().__init__()
+        self._images = images
+        self._settings = settings
+        self._engine = engine
+        self._destination = destination
+        self._skip = skip_existing
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            for item in pipeline.convert_batch(
+                self._images,
+                self._settings,
+                self._engine,
+                self._destination,
+                grade_settings=self._settings.grade,
+                skip_existing=self._skip,
+                progress=self.progress.emit,
+                should_stop=lambda: self._stop,
+            ):
+                self.item_done.emit(item)
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit()
+
+
+class BatchDialog(QDialog):
+    """Apply the settings you just tuned to a whole folder.
+
+    A dialog rather than a third tab. Batch is not a different mode — it is
+    "do that again, to these" — so it belongs to the page where the settings
+    were chosen, and it should disappear again afterwards. A permanent panel
+    would sit there empty most of the time and make the main page busier for a
+    feature used occasionally.
+    """
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__(window)
+        self._window = window
+        self.images: list[Path] = []
+        self.destination = paths.output_dir()
+        self._thread: QThread | None = None
+        self._worker: BatchWorker | None = None
+        self._done = 0
+        self._failed = 0
+        self._skipped = 0
+
+        self.setWindowTitle("Apply to folder")
+        self.setModal(False)
+        self.setMinimumWidth(560)
+        self.setStyleSheet(STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        summary = QLabel(
+            "Every image in the folder gets the settings currently in the "
+            "sidebar — neural strengths, depth, passes, size and the colour "
+            "grade. Tune them on one image first, then point this at the rest."
+        )
+        summary.setWordWrap(True)
+        summary.setObjectName("hint")
+        layout.addWidget(summary)
+
+        source_row = QHBoxLayout()
+        self.pick_source = QPushButton("Input folder…")
+        self.source_label = QLabel("No folder chosen")
+        self.source_label.setObjectName("hint")
+        source_row.addWidget(self.pick_source)
+        source_row.addWidget(self.source_label, 1)
+        layout.addLayout(source_row)
+
+        dest_row = QHBoxLayout()
+        self.pick_dest = QPushButton("Output folder…")
+        self.pick_dest.setObjectName("secondary")
+        self.dest_label = QLabel(str(self.destination))
+        self.dest_label.setObjectName("hint")
+        dest_row.addWidget(self.pick_dest)
+        dest_row.addWidget(self.dest_label, 1)
+        layout.addLayout(dest_row)
+
+        self.recursive = QCheckBox("Include sub-folders")
+        self.skip_existing = QCheckBox("Skip images already converted")
+        self.skip_existing.setChecked(True)
+        self.skip_existing.setToolTip(
+            "Lets an interrupted run be restarted without redoing everything."
+        )
+        layout.addWidget(self.recursive)
+        layout.addWidget(self.skip_existing)
+
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+        layout.addWidget(self.bar)
+        self.status = QLabel("")
+        self.status.setObjectName("hint")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("secondary")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("secondary")
+        self.stop_button.setVisible(False)
+        self.start_button = QPushButton("Convert folder")
+        self.start_button.setEnabled(False)
+        buttons.addWidget(self.close_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.start_button)
+        layout.addLayout(buttons)
+
+        self.pick_source.clicked.connect(self._choose_source)
+        self.pick_dest.clicked.connect(self._choose_destination)
+        self.recursive.toggled.connect(self._rescan)
+        self.start_button.clicked.connect(self._start)
+        self.stop_button.clicked.connect(self._stop)
+        self.close_button.clicked.connect(self.close)
+
+    # -- choosing ------------------------------------------------------------
+
+    def _choose_source(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Folder of images to convert")
+        if chosen:
+            self._source = Path(chosen)
+            self._rescan()
+
+    def _rescan(self) -> None:
+        source = getattr(self, "_source", None)
+        if source is None:
+            return
+        self.images = pipeline.list_images(source, self.recursive.isChecked())
+        self.source_label.setText(f"{source}  —  {len(self.images)} image(s)")
+        self.start_button.setEnabled(bool(self.images))
+        if not self.images:
+            self.status.setText("Nothing here this app can read.")
+
+    def _choose_destination(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Where should the results go?", str(self.destination)
+        )
+        if chosen:
+            self.destination = Path(chosen)
+            self.dest_label.setText(chosen)
+
+    # -- running -------------------------------------------------------------
+
+    def _start(self) -> None:
+        if not self.images or self._thread is not None:
+            return
+        self._done = self._failed = self._skipped = 0
+        self.bar.setVisible(True)
+        self.bar.setRange(0, len(self.images))
+        self.bar.setValue(0)
+        self.start_button.setEnabled(False)
+        self.pick_source.setEnabled(False)
+        self.pick_dest.setEnabled(False)
+        self.stop_button.setVisible(True)
+
+        self._thread = QThread(self)
+        self._worker = BatchWorker(
+            self.images,
+            self._window.settings,
+            self._window.engine,
+            self.destination,
+            self.skip_existing.isChecked(),
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status.setText)
+        self._worker.item_done.connect(self._item_done)
+        self._worker.finished.connect(self._finished)
+        self._worker.failed.connect(self._failed_run)
+        self._thread.start()
+
+    def _stop(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self.status.setText("Stopping after this image…")
+
+    def _item_done(self, item: pipeline.BatchItem) -> None:
+        if item.skipped:
+            self._skipped += 1
+        elif item.error:
+            self._failed += 1
+        else:
+            self._done += 1
+        self.bar.setValue(item.index + 1)
+        self.bar.setFormat(f"%v of %m — {item.source.name}")
+        if item.error:
+            # Named, not swallowed: a batch that quietly drops files is worse
+            # than one that stops.
+            self.status.setText(f"{item.source.name} failed — {item.error}")
+
+    def _teardown(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(10000)
+            self._thread = None
+        self._worker = None
+        self.stop_button.setVisible(False)
+        self.start_button.setEnabled(bool(self.images))
+        self.pick_source.setEnabled(True)
+        self.pick_dest.setEnabled(True)
+
+    def _finished(self) -> None:
+        self._teardown()
+        parts = [f"{self._done} converted"]
+        if self._skipped:
+            parts.append(f"{self._skipped} already done")
+        if self._failed:
+            parts.append(f"{self._failed} failed")
+        self.status.setText(", ".join(parts) + f" — {self.destination}")
+
+    def _failed_run(self, message: str) -> None:
+        self._teardown()
+        self.status.setText(message)
+        QMessageBox.warning(self, "Batch failed", message)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._worker is not None:
+            self._worker.stop()
+        self._teardown()
+        super().closeEvent(event)
 
 
 class SequenceWorker(QObject):
@@ -976,6 +1224,19 @@ class MainWindow(QMainWindow):
         self.save_button.clicked.connect(self.save)
         layout.addWidget(self.save_button)
 
+        self.batch_button = QPushButton("Apply to folder…")
+        self.batch_button.setObjectName("secondary")
+        self.batch_button.setToolTip(
+            "Run a whole folder with the settings above.\n\n"
+            "Tune them on one image first - whatever is in this sidebar is what "
+            "every image in the folder gets, colour grade included.\n\n"
+            "For an animation use the Image sequence tab instead: that keeps "
+            "frames consistent with each other and can take your renderer's "
+            "depth pass."
+        )
+        self.batch_button.clicked.connect(self.open_batch)
+        layout.addWidget(self.batch_button)
+
         self.feedback_button = QPushButton("Use result as input")
         self.feedback_button.setObjectName("secondary")
         self.feedback_button.setEnabled(False)
@@ -1270,6 +1531,16 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage("Nothing on the clipboard to paste.")
+
+    def open_batch(self) -> None:
+        """The folder dialog, created on demand and remembered while open."""
+        existing = getattr(self, "_batch_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._batch_dialog = BatchDialog(self)
+        self._batch_dialog.show()
 
     def use_result_as_input(self) -> None:
         """Feed the result back in, for a second pass.

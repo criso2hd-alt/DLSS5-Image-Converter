@@ -307,6 +307,169 @@ def convert_sequence(
             yield SequenceFrame(index, len(frames), frame_path, output, enhanced)
 
 
+@dataclass
+class BatchItem:
+    """One file's outcome, handed back as the batch runs."""
+
+    index: int
+    total: int
+    source: Path
+    output: Path | None  # None when skipped
+    skipped: bool = False
+    error: str = ""
+
+
+def convert_batch(
+    images: list[Path],
+    settings: AppSettings,
+    engine: DepthEngine,
+    destination: Path,
+    grade_settings=None,
+    skip_existing: bool = True,
+    progress: Progress | None = None,
+    should_stop: Callable[[], bool] | None = None,
+):
+    """Apply the current settings to a folder of unrelated images.
+
+    Distinct from `convert_sequence`, and deliberately so. A sequence is one
+    shot: same size throughout, a shared depth pass, and frames that have to
+    look consistent with each other. A batch is a pile of images that happen to
+    want the same treatment, so the sizes vary and each is judged on its own.
+
+    The harness is kept alive across files and restarted only when the frame
+    size changes. A folder of renders straight out of one scene is all one size,
+    which is the common case and gets the whole batch on a single ~3.5 s
+    start-up; a mixed folder pays it once per run of matching sizes.
+
+    One file failing does not stop the batch. An unreadable image in the middle
+    of two hundred should cost that file, not the afternoon — the failure is
+    reported on the item and the run carries on.
+    """
+
+    def say(message: str) -> None:
+        if progress:
+            progress(message)
+
+    if not images:
+        return
+
+    status = runtime.detect(settings.runtime_dir or None)
+    if not status.ready:
+        raise RuntimeError("\n".join(status.problems))
+    staged = runtime.stage_runtime(status)
+    assert status.harness is not None
+    runtime.write_addon_config(staged, settings.neural)
+
+    destination.mkdir(parents=True, exist_ok=True)
+    scratch = paths.scratch_dir()
+    colour_path = scratch / "batch_colour.bin"
+    depth_path = scratch / "batch_depth.bin"
+    motion_path = scratch / "batch_motion.bin"
+    out_path = scratch / "batch_out.bin"
+
+    engine.load(settings.depth.model_id, progress=progress)
+    offsets = contract.jitter_sequence(settings.evaluation.frames)
+    if not settings.evaluation.jitter:
+        offsets = [(0.0, 0.0)] * len(offsets)
+
+    harness: evaluator.Harness | None = None
+    harness_size: tuple[int, int] | None = None
+
+    def close_harness() -> None:
+        nonlocal harness, harness_size
+        if harness is not None:
+            harness.__exit__(None, None, None)
+            harness = None
+            harness_size = None
+
+    try:
+        for index, path in enumerate(images):
+            if should_stop is not None and should_stop():
+                say("Stopped.")
+                return
+
+            output = destination / f"{path.stem}_dlss5.png"
+            if skip_existing and output.exists():
+                yield BatchItem(index, len(images), path, output, skipped=True)
+                continue
+
+            say(f"{index + 1} of {len(images)} — {path.name}")
+            try:
+                source = contract.fit_to_budget(
+                    contract.load_image(path), settings.evaluation.max_edge
+                )
+                height, width = source.shape[:2]
+
+                if harness is None or harness_size != (width, height):
+                    close_harness()
+                    np.zeros((height, width, 2), np.float16).tofile(motion_path)
+                    np.zeros((height, width), np.float32).tofile(depth_path)
+                    harness = evaluator.Harness(
+                        status.harness,
+                        width=width,
+                        height=height,
+                        depth_path=depth_path,
+                        motion_path=motion_path,
+                        neural=settings.neural,
+                        frames=settings.evaluation.frames,
+                    )
+                    harness.__enter__()
+                    harness_size = (width, height)
+
+                inverse_depth = engine.infer(
+                    (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8),
+                    input_size=settings.depth.input_size,
+                    tiled=settings.depth.tiled,
+                )
+                shaped = contract.to_hardware_depth(inverse_depth, settings.depth.contrast)
+                np.ascontiguousarray(shaped).tofile(depth_path)
+                harness.set_depth(depth_path)
+
+                linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
+                harness.reset_history()
+                for offset in offsets:
+                    shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+                    plane = np.empty((height, width, 4), np.float16)
+                    plane[..., :3] = shifted.astype(np.float16)
+                    plane[..., 3] = np.float16(1.0)
+                    plane.tofile(colour_path)
+                    harness.frame(colour_path, offset)
+
+                harness.write(out_path)
+                enhanced = np.clip(
+                    contract.linear_to_srgb(contract.read_output(out_path, width, height)),
+                    0.0,
+                    1.0,
+                )
+                if grade_settings is not None:
+                    enhanced = grade.apply(enhanced, grade_settings)
+                save_image(enhanced, output)
+                yield BatchItem(index, len(images), path, output)
+
+            except Exception as error:  # noqa: BLE001 - one bad file, not the batch
+                # The harness may be in an unknown state after a failure, so
+                # drop it; the next file starts a clean one.
+                close_harness()
+                yield BatchItem(
+                    index, len(images), path, None, error=f"{type(error).__name__}: {error}"
+                )
+    finally:
+        close_harness()
+
+
+def list_images(folder: Path, recursive: bool = False) -> list[Path]:
+    """Every image in `folder`, sorted.
+
+    Suffixes come from `sequence`, not from the widgets module: this file has to
+    stay importable without Qt so the pipeline can be driven headlessly.
+    """
+    walker = folder.rglob("*") if recursive else folder.glob("*")
+    found = [
+        p for p in walker if p.is_file() and p.suffix.lower() in sequence.SEQUENCE_SUFFIXES
+    ]
+    return sorted(found)
+
+
 def write_video(images: list[Path], destination: Path, fps: float) -> Path:
     """Encode finished frames to an MP4.
 
