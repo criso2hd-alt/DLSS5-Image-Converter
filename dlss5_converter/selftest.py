@@ -159,11 +159,39 @@ def run_selftest() -> int:
             rng = np.random.default_rng(0)
             pipeline.save_image(rng.random((256, 256, 3)).astype("float32"), sample)
 
-            result = pipeline.convert(sample, settings, DepthEngine())
+            engine = DepthEngine()
+            result = pipeline.convert(sample, settings, engine)
             _line(
                 f"conversion       : ok {result.enhanced.shape[1]}x"
                 f"{result.enhanced.shape[0]} ({result.notes})"
             )
+
+            # The same again in HDR. The codec check above only proves the
+            # decoder works; this proves the range makes it all the way through
+            # DLSS and back, which is the part with a clip in every stage.
+            try:
+                from . import wic
+
+                if wic.available():
+                    hdr_sample = scratch / "selftest_input.jxr"
+                    plate = np.full((256, 256, 3), 0.25, "float32")
+                    plate[:, 128:, 0] = 8.0
+                    wic.write(hdr_sample, plate)
+
+                    hdr_result = pipeline.convert(hdr_sample, settings, engine)
+                    if hdr_result.enhanced_linear is None:
+                        raise RuntimeError("the result came back SDR")
+                    peak = float(hdr_result.enhanced_linear.max())
+                    ok = peak > 4.0
+                    _line(
+                        f"hdr conversion   : {'ok' if ok else 'FAILED'} "
+                        f"(peak {peak:.2f}x diffuse white, expected about 8)"
+                    )
+                    if not ok:
+                        failures += 1
+            except Exception as error:  # noqa: BLE001
+                _line(f"hdr conversion   : FAILED - {type(error).__name__}: {error}")
+                failures += 1
         except Exception as error:  # noqa: BLE001
             _line(f"conversion       : FAILED - {type(error).__name__}: {error}")
             failures += 1
