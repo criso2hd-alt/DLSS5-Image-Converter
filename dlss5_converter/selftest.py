@@ -117,6 +117,46 @@ def run_selftest() -> int:
         _line(f"jpeg xr          : FAILED - {error}")
         failures += 1
 
+    # The window itself, off screen. Every other check here exercises the
+    # pipeline, and v0.1.15 shipped with three dead buttons while all of them
+    # passed - the break was a missing method on MainWindow, reached only by a
+    # click. Constructing the window and running the main-thread half of those
+    # clicks costs a second and covers the artifact rather than the source.
+    try:
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        import numpy as np
+        from PySide6.QtWidgets import QApplication
+
+        from . import pipeline
+        from .app import MainWindow
+
+        owned = QApplication.instance() is None
+        application = QApplication.instance() or QApplication([])
+        window = MainWindow()
+        window.prepared = pipeline.Prepared(
+            source=np.full((64, 96, 3), 0.5, np.float32),
+            inverse_depth=np.zeros((64, 96), np.float32),
+            linear=np.full((64, 96, 3), 0.2, np.float32),
+        )
+        window._begin_progress()
+        window._report_progress("DLSS 5 pass 4 of 8")
+        swept = window.depth_view._progress
+        window._end_progress()
+        for view in ("photo", "depth", "result", "difference"):
+            window.show_view(view)
+        window.deleteLater()
+        if owned:
+            application.processEvents()
+        ok = swept == 0.5
+        _line(f"window           : {'ok' if ok else 'FAILED'} (buttons reachable)")
+        if not ok:
+            failures += 1
+    except Exception as error:  # noqa: BLE001
+        _line(f"window           : FAILED - {type(error).__name__}: {error}")
+        failures += 1
+
     _line("")
 
     # --- the DLSS side --------------------------------------------------
@@ -182,10 +222,19 @@ def run_selftest() -> int:
                     if hdr_result.enhanced_linear is None:
                         raise RuntimeError("the result came back SDR")
                     peak = float(hdr_result.enhanced_linear.max())
-                    ok = peak > 4.0
+                    # The invariant is that the range survived, not what the
+                    # neural pass did with it. An SDR round trip clips to 1.0,
+                    # so anything comfortably above that proves the point. How
+                    # far above is the model's business and moves with the
+                    # driver and the card: an earlier version of this line
+                    # expected "about 8" from an input peak of 8, and the same
+                    # plate on the same machine later measured 4.59. Asserting
+                    # the model's output on a synthetic plate is how you build
+                    # a self test that cries wolf on someone else's GPU.
+                    ok = peak > 1.5
                     _line(
                         f"hdr conversion   : {'ok' if ok else 'FAILED'} "
-                        f"(peak {peak:.2f}x diffuse white, expected about 8)"
+                        f"(peak {peak:.2f}x diffuse white; SDR would clip to 1.00)"
                     )
                     if not ok:
                         failures += 1
