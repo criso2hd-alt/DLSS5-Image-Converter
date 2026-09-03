@@ -270,12 +270,24 @@ def _resolve_av_wheel() -> tuple[str, int]:
     request = Request(api, headers={"User-Agent": "dlss5-converter"})
     with urlopen(request, timeout=30) as response:
         data = json.load(response)
-    want = f"cp312-cp312-win_amd64"
-    for entry in data.get("urls", []):
-        name = entry.get("filename", "")
-        if name.endswith(".whl") and want in name:
-            return entry["url"], int(entry.get("size") or AV_APPROX_BYTES)
-    raise OSError(f"No PyAV {AV_VERSION} wheel for this Python on PyPI.")
+
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    windows = [
+        entry for entry in data.get("urls", [])
+        if entry.get("filename", "").endswith("win_amd64.whl")
+        # Free-threaded builds (a trailing "t" on the interpreter tag) are a
+        # different ABI and would fail to load in the ordinary interpreter.
+        and "t-win_amd64" not in entry["filename"]
+    ]
+    # Prefer the stable-ABI (abi3) wheel: PyAV ships one built for the oldest
+    # supported Python that loads on every newer one, so it is the safe pick
+    # regardless of which 3.x the app is frozen against. Fall back to an exact
+    # version-tagged wheel if a release ever drops the abi3 one.
+    for match in (lambda n: "abi3" in n, lambda n: tag in n):
+        for entry in windows:
+            if match(entry["filename"]):
+                return entry["url"], int(entry.get("size") or AV_APPROX_BYTES)
+    raise OSError(f"No compatible PyAV {AV_VERSION} wheel for this Python on PyPI.")
 
 
 def install_av(
