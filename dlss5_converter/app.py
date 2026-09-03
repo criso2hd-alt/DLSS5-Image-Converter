@@ -1424,6 +1424,7 @@ class MainWindow(QMainWindow):
         self._video_worker = None
         self._video_dl_thread: QThread | None = None
         self._video_dl_worker = None
+        self._video_after_download = None
         self.style_results: dict[int, pipeline.Result] = {}
         self._style_signature_used: tuple | None = None
         self._style_worker: StyleWorker | None = None
@@ -2631,9 +2632,21 @@ class MainWindow(QMainWindow):
         page.stop.setVisible(False)
 
     def _download_video_support(self, then) -> None:
-        """Fetch PyAV, then run `then`. Blocks the tab with a progress bar."""
+        """Fetch PyAV, then run `then`. Blocks the tab with a progress bar.
+
+        The slots below are bound methods, not the nested closures they used to
+        be, and that is a correctness fix rather than tidiness. A worker's signal
+        can only be marshalled onto the UI thread when its slot is a bound method
+        of a QObject that lives there; a plain closure has no thread affinity, so
+        Qt connects it *directly* and runs it on the worker thread. The progress
+        slot touches a QWidget, and touching a widget off the GUI thread is
+        undefined - it survived here and crashed a user with an access violation
+        mid-download. Bound methods of the window get a queued connection and run
+        where they must.
+        """
         if self._video_dl_thread is not None:
             return
+        self._video_after_download = then
         page = self.video_page
         page.bar.setVisible(True)
         page.bar.setMaximum(0)  # indeterminate until byte totals arrive
@@ -2645,34 +2658,37 @@ class MainWindow(QMainWindow):
         self._video_dl_worker = VideoDownloadWorker()
         self._video_dl_worker.moveToThread(self._video_dl_thread)
         self._video_dl_thread.started.connect(self._video_dl_worker.run)
+        self._video_dl_worker.progress.connect(self._video_dl_bytes)
+        self._video_dl_worker.status.connect(self.video_page.info_label.setText)
+        self._video_dl_worker.finished.connect(self._video_dl_done)
+        self._video_dl_worker.failed.connect(self._video_dl_failed)
+        self._video_dl_thread.start()
 
-        def on_bytes(done, total):
-            page.bar.setMaximum(int(total) or 0)
-            page.bar.setValue(int(done))
-        self._video_dl_worker.progress.connect(on_bytes)
-        self._video_dl_worker.status.connect(page.info_label.setText)
+    def _video_dl_bytes(self, done, total) -> None:
+        self.video_page.bar.setMaximum(int(total) or 0)
+        self.video_page.bar.setValue(int(done))
 
-        def done():
+    def _end_video_download(self) -> None:
+        if self._video_dl_thread is not None:
             self._video_dl_thread.quit()
             self._video_dl_thread.wait()
             self._video_dl_thread = None
-            self._video_dl_worker = None
-            page.bar.setVisible(False)
-            page.pick_video.setEnabled(True)
+        self._video_dl_worker = None
+        self.video_page.bar.setVisible(False)
+        self.video_page.pick_video.setEnabled(True)
+
+    def _video_dl_done(self) -> None:
+        self._end_video_download()
+        then = self._video_after_download
+        self._video_after_download = None
+        if then is not None:
             then()
 
-        def failed(msg):
-            self._video_dl_thread.quit()
-            self._video_dl_thread.wait()
-            self._video_dl_thread = None
-            self._video_dl_worker = None
-            page.bar.setVisible(False)
-            page.pick_video.setEnabled(True)
-            page.info_label.setText("")
-            QMessageBox.warning(self, "Could not add video support", msg)
-        self._video_dl_worker.finished.connect(done)
-        self._video_dl_worker.failed.connect(failed)
-        self._video_dl_thread.start()
+    def _video_dl_failed(self, message: str) -> None:
+        self._end_video_download()
+        self._video_after_download = None
+        self.video_page.info_label.setText("")
+        QMessageBox.warning(self, "Could not add video support", message)
 
     def _wire_sequence_page(self) -> None:
 

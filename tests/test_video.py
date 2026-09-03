@@ -228,3 +228,46 @@ def test_a_tiny_frame_falls_back_to_software(tmp_path):
         writer.write(np.zeros((72, 128, 3), np.float32))
     writer.close()
     assert video.probe(out).frames == 4
+
+
+def test_download_progress_runs_on_the_gui_thread(qt_app, monkeypatch):
+    """The exact crash from v0.1.20: a worker signal wired to a closure ran the
+    progress slot on the worker thread, which then touched a QWidget - an access
+    violation on the reporting machine. The slot must run on the GUI thread.
+
+    Observed via a subclass overriding the real slot in a class body, so it keeps
+    the QObject thread affinity the fix depends on. Recording through a plain
+    instance attribute would itself force a direct connection and hide the bug.
+    """
+    import threading
+
+    from PySide6.QtCore import QThread, QCoreApplication
+    from dlss5_converter.app import MainWindow
+    from dlss5_converter import app as gui
+
+    seen = {}
+
+    class SpyWindow(MainWindow):
+        def _video_dl_bytes(self, done, total):
+            seen["thread"] = threading.current_thread()
+            super()._video_dl_bytes(done, total)
+
+    def fake_install_av(on_bytes=None, on_text=None):
+        if on_bytes:
+            on_bytes(1, 2)
+    monkeypatch.setattr(gui.bootstrap, "install_av", fake_install_av)
+
+    w = SpyWindow()
+    main_thread = threading.current_thread()
+    ran = {"done": False}
+    w._download_video_support(then=lambda: ran.__setitem__("done", True))
+
+    for _ in range(200):
+        QCoreApplication.processEvents()
+        if ran["done"]:
+            break
+        QThread.msleep(5)
+
+    assert "thread" in seen, "progress never fired"
+    assert seen["thread"] is main_thread, "progress slot ran off the GUI thread"
+    w.deleteLater()
