@@ -329,3 +329,45 @@ def test_a_different_size_result_refits(window):
     window.wipe._zoom = 3.0
     window._succeeded(big_result(1280, 720))  # a genuinely different image
     assert window.wipe._zoom == 1.0, "a different size starts fitted"
+
+
+def test_video_effort_does_not_touch_the_sidebar_passes(window, monkeypatch):
+    """A video export used to write its pass count to the shared setting, so
+    afterwards single-image conversions ran at 1 pass. The video path must use
+    its own copy and leave settings.evaluation.frames alone."""
+    from PySide6.QtWidgets import QFileDialog
+    from PySide6.QtCore import QThread
+
+    window.settings.evaluation.frames = 8   # what the user set in the sidebar
+
+    page = window.video_page
+    # Pretend a clip is loaded and PyAV is available.
+    class _Info:
+        frames, fps, duration = 100, 30.0, 3.3
+    page.source = gui.Path("clip.mp4")
+    page.info = _Info()
+    page.output_path = gui.Path("out.mp4")
+    page.mode_box.setCurrentIndex(0)  # Quick (1 pass)
+
+    monkeypatch.setattr(gui.video, "is_available", lambda: True)
+    started = {}
+    real_worker = gui.VideoWorker
+    def capture(*a, **k):
+        started["settings"] = a[2]  # settings is the 3rd positional arg
+        w = real_worker(*a, **k)
+        return w
+    monkeypatch.setattr(gui, "VideoWorker", capture)
+    monkeypatch.setattr(QThread, "start", lambda self, *a, **k: None)
+
+    window._start_video()
+
+    assert window.settings.evaluation.frames == 8, "sidebar passes must be untouched"
+    assert started["settings"].evaluation.frames == 1, "the video run used its own 1 pass"
+    window._video_teardown()
+
+
+def test_changing_video_effort_does_not_touch_the_sidebar(window):
+    window.settings.evaluation.frames = 8
+    window.video_page.mode_box.setCurrentIndex(1)  # Quality
+    window._video_mode_changed()
+    assert window.settings.evaluation.frames == 8

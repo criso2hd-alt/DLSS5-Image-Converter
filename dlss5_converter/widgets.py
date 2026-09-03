@@ -168,6 +168,42 @@ def paint_sweep(
         painter.drawLine(QPointF(rect.left(), line), QPointF(rect.right(), line))
 
 
+def _corner_label(
+    painter: QPainter, text: str, image: QRectF, widget: QWidget, align_left: bool
+) -> None:
+    """Draw `text` at a top corner of `image`, clamped inside `widget`.
+
+    The anchor is the image's own corner, so at fit the labels sit on the
+    picture - top-left and top-right - wherever it is letterboxed. Clamping to
+    the widget is what makes them sticky: zoom in and the image corners leave
+    the screen, but the label holds at the visible edge rather than scrolling
+    away with the pixels it is describing.
+
+    A soft shadow underneath keeps it legible over a blown-out sky or a white
+    wall, which a plain light label would disappear into.
+    """
+    if not text:
+        return
+    margin = 10.0
+    metrics = painter.fontMetrics()
+    text_w = metrics.horizontalAdvance(text)
+    text_h = metrics.height()
+
+    top = min(max(image.top() + margin, margin), widget.height() - text_h - margin)
+    if align_left:
+        x = min(max(image.left() + margin, margin), widget.width() - text_w - margin)
+    else:
+        x = max(min(image.right() - margin - text_w, widget.width() - text_w - margin), margin)
+
+    baseline = top + metrics.ascent()
+    shadow = QColor(0, 0, 0, 200)
+    for dx, dy in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)):
+        painter.setPen(shadow)
+        painter.drawText(QPointF(x + dx, baseline + dy), text)
+    painter.setPen(QColor(245, 245, 245))
+    painter.drawText(QPointF(x, baseline), text)
+
+
 class CanvasView(QWidget):
     """Shared zoom and pan for the image views.
 
@@ -537,19 +573,19 @@ class WipeView(CanvasView):
 
         if self._labels is not None:
             left, right = self._labels
-            painter.setPen(self.palette().text().color())
-            # Positioned against the widget, not the image. Zoomed in, the
-            # image rect runs off every edge and image-relative labels go with
-            # it - which is precisely when someone is comparing detail and most
-            # needs to know which half they are looking at.
-            band = QRectF(10, 6, self.width() - 20, 20)
-            # Each label is clipped to its own half, so it stays correct
-            # wherever the divider has been dragged to.
+            # Pinned to the image's own top corners, then clamped to the
+            # widget: zoomed out they sit at the picture's corners, and zoomed
+            # in - when those corners have slid off screen - they hold at the
+            # visible edge instead of vanishing, so the label is always over
+            # the half it names. Each is clipped to its side of the divider.
+            painter.save()
             painter.setClipRect(QRectF(0, 0, split_x, self.height()))
-            painter.drawText(band, Qt.AlignmentFlag.AlignLeft, left)
+            _corner_label(painter, left, rect, self, align_left=True)
+            painter.restore()
+            painter.save()
             painter.setClipRect(QRectF(split_x, 0, self.width() - split_x, self.height()))
-            painter.drawText(band, Qt.AlignmentFlag.AlignRight, right)
-            painter.setClipping(False)
+            _corner_label(painter, right, rect, self, align_left=False)
+            painter.restore()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
         if event.button() == Qt.MouseButton.LeftButton:

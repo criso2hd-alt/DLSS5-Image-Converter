@@ -2693,7 +2693,11 @@ class MainWindow(QMainWindow):
         page.output_label.setText(f"Output: {page.output_path}")
 
     def _video_mode_changed(self) -> None:
-        self.settings.evaluation.frames = int(self.video_page.mode_box.currentData() or 1)
+        # Deliberately does not touch settings. The video Effort is read at
+        # convert time onto a copy - writing it to the shared settings here is
+        # what let a video export silently drop the single-image sidebar to
+        # 1 pass, since both read the same settings.evaluation.frames.
+        pass
 
     def _start_video(self) -> None:
         page = self.video_page
@@ -2713,7 +2717,11 @@ class MainWindow(QMainWindow):
         page.player.stop()
         page.show_preview()
 
-        self.settings.evaluation.frames = int(page.mode_box.currentData() or 1)
+        # A copy, with the video's own pass count, so the shared sidebar setting
+        # the single-image path reads is left exactly as the user set it. The
+        # neural strengths, style and colour still come from the live settings.
+        settings = copy.deepcopy(self.settings)
+        settings.evaluation.frames = int(page.mode_box.currentData() or 1)
 
         # The range comes from the timeline's In/Out when ranging, else the
         # whole clip. Frames, inclusive of Out, which is why limit is +1.
@@ -2735,7 +2743,7 @@ class MainWindow(QMainWindow):
 
         self._video_thread = QThread(self)
         self._video_worker = VideoWorker(
-            page.source, output, self.settings, self.engine,
+            page.source, output, settings, self.engine,
             page.codec_box.currentData(), start, limit,
             page.estimate_depth.isChecked(),
         )
@@ -2772,8 +2780,27 @@ class MainWindow(QMainWindow):
 
     def _video_finished(self, output: Path) -> None:
         self._video_teardown()
-        self.video_page.info_label.setText(f"Saved {Path(output).name}")
+        output = Path(output)
+        self.video_page.info_label.setText(f"Saved {output.name}")
         self.statusBar().showMessage(f"Video saved: {output}")
+
+        # A clear, explicit "done" - a video is a long operation and the user
+        # is often not watching by the time it finishes. Offer the folder,
+        # since the next thing they want is the file.
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            "Video conversion complete",
+            f"Saved to:\n{output}",
+            parent=self,
+        )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        reveal = box.addButton("Open folder", QMessageBox.ButtonRole.ActionRole)
+        box.exec()
+        if box.clickedButton() is reveal:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
 
     def _video_failed(self, message: str) -> None:
         self._video_teardown()
