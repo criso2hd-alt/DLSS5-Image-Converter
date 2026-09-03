@@ -267,3 +267,65 @@ def test_a_settings_change_re_runs_the_comparison_in_place(window):
     assert window._thread is not None, "and it should be redoing both styles"
     window._style_teardown()
     assert window.view_styles.isEnabled()
+
+
+# -- full-resolution inspection (paraDiXson's report) ------------------------
+
+
+def big_result(w=1600, h=900):
+    import numpy as np
+    return pipeline.Result(
+        original=np.zeros((h, w, 3), np.float32),
+        enhanced=np.full((h, w, 3), 0.6, np.float32),
+        depth_preview=np.zeros((h, w, 3), np.uint8),
+        notes="big",
+    )
+
+
+def test_result_view_shows_full_resolution_not_a_preview(window):
+    """The report: the preview was capped at 1200 px, so detail could not be
+    checked even by zooming. The idle view must hold the real pixels."""
+    window.image_path = gui.Path("photo.png")
+    window._succeeded(big_result(1600, 900))
+    assert window.wipe._after.width() == 1600, "full res, not the 1200 preview"
+
+
+def test_a_grade_drag_drops_to_preview_then_sharpens(window):
+    window.image_path = gui.Path("photo.png")
+    window._succeeded(big_result(1600, 900))
+    window.settings.grade.exposure = 0.4
+    window._render_result(fast=True)
+    assert window.wipe._after.width() <= 1200, "fast during a drag"
+    window._render_result(fast=False)
+    assert window.wipe._after.width() == 1600, "sharp once settled"
+
+
+def test_swapping_resolution_keeps_the_zoom(window):
+    """Zoom set to inspect something must survive a grade tweak."""
+    from PySide6.QtCore import QPointF
+    window.image_path = gui.Path("photo.png")
+    window._succeeded(big_result(1600, 900))
+    window.wipe._zoom = 4.0
+    window.wipe._pan = QPointF(20.0, 10.0)
+    window._render_result(fast=True)   # preview swap
+    assert window.wipe._zoom == 4.0, "a grade drag must not reset the zoom"
+    window._render_result(fast=False)  # full swap
+    assert window.wipe._zoom == 4.0
+
+
+def test_re_converting_the_same_size_keeps_the_zoom(window):
+    """Live preview re-converts on a neural-slider tweak; staying zoomed to
+    compare the same spot is the point, so same-size results keep the view."""
+    window.image_path = gui.Path("photo.png")
+    window._succeeded(big_result(1600, 900))
+    window.wipe._zoom = 3.0
+    window._succeeded(big_result(1600, 900))  # a re-convert at the same size
+    assert window.wipe._zoom == 3.0, "a same-size re-convert holds the zoom"
+
+
+def test_a_different_size_result_refits(window):
+    window.image_path = gui.Path("photo.png")
+    window._succeeded(big_result(1600, 900))
+    window.wipe._zoom = 3.0
+    window._succeeded(big_result(1280, 720))  # a genuinely different image
+    assert window.wipe._zoom == 1.0, "a different size starts fitted"

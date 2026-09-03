@@ -478,14 +478,24 @@ class WipeView(CanvasView):
             self.reset_view()
         self.update()
 
-    def set_images_u8(self, before: np.ndarray, after: np.ndarray) -> None:
-        """Same as set_images but for 8-bit arrays, which the grade produces."""
+    def set_images_u8(
+        self, before: np.ndarray, after: np.ndarray, keep_view: bool = False
+    ) -> None:
+        """Same as set_images but for 8-bit arrays, which the grade produces.
+
+        ``keep_view`` holds the current zoom and pan even though the pixmap size
+        changed. That is what lets the same result be swapped between a fast
+        low-res preview (while a colour slider is moving) and the full-resolution
+        image (once it settles) without the view snapping back to fit - the two
+        fit to the same rect, so the zoom multiplier still frames the same place,
+        just sharper.
+        """
         pixmap = QPixmap.fromImage(to_qimage_u8(before))
         changed = self._before is None or self._before.size() != pixmap.size()
         self._before = pixmap
         self._after = QPixmap.fromImage(to_qimage_u8(after))
         self._grey = None
-        if changed:
+        if changed and not keep_view:
             self.reset_view()
         self.update()
 

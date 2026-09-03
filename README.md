@@ -152,8 +152,13 @@ All of it happens in linear light. Vibrance scales its boost by how colourful a
 pixel already is, so skies and materials lift while skin mostly does not — reach
 for that before saturation on anything with a face in it.
 
-The preview is graded at 1200 px so the sliders stay responsive on an 8K image;
-the saved file is graded at full resolution through the exact transfer curve.
+The result view shows the image at **full resolution**, so zooming in reveals
+the real output — pore, weave and reflection detail — not a magnified preview.
+While a colour slider is actually moving it drops to a fast 1200 px stand-in to
+stay responsive (grading a 4K frame live is ~1.5 s), then sharpens back to full
+resolution the moment the slider settles. The zoom you set to inspect something
+is held across that swap, and across a live-preview re-convert, so you stay on
+the same spot.
 
 **Wheel zooms** about the cursor, **right-drag pans**, double-click fits again.
 Left-drag still moves the comparison divider. Worth using — at 6K the things

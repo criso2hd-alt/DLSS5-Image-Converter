@@ -1453,6 +1453,16 @@ class MainWindow(QMainWindow):
         self._grade_timer.setInterval(30)
         self._grade_timer.timeout.connect(self._render_current)
 
+        # A second, slower beat. The 30 ms one keeps a slider responsive by
+        # grading a small preview; this one fires once the slider settles and
+        # regrades at full resolution, so what you inspect is the real output,
+        # not a 1200 px stand-in. Two timers rather than one because the two
+        # jobs want opposite intervals - one fast and rough, one late and sharp.
+        self._grade_full_timer = QTimer(self)
+        self._grade_full_timer.setSingleShot(True)
+        self._grade_full_timer.setInterval(250)
+        self._grade_full_timer.timeout.connect(self._render_full)
+
         # Dropping anywhere on the window, not just on the drop zone. The zone
         # is swapped out for the comparison view after a conversion, and when it
         # was the only drop target there was no way at all to open a second
@@ -2012,13 +2022,15 @@ class MainWindow(QMainWindow):
         def apply_value(value: float) -> None:
             setattr(self.settings.grade, field, value)
             # Coalesced: a drag emits a change per pixel of travel and each
-            # redraw is tens of milliseconds of numpy over the preview.
+            # redraw is tens of milliseconds of numpy over the preview. The fast
+            # timer keeps the drag live; the full timer sharpens once it stops.
             self._grade_timer.start()
+            self._grade_full_timer.start()
 
         return apply_value
 
     def _render_current(self) -> None:
-        """Re-draw whichever comparison is on screen after a grade change.
+        """Fast redraw during a grade drag: small preview, stays responsive.
 
         The style comparison is graded too, and identically on both halves -
         the point is to isolate the style, so a grade that landed on only one
@@ -2027,7 +2039,12 @@ class MainWindow(QMainWindow):
         if self._view == "styles":
             self._render_styles()
         else:
-            self._render_result()
+            self._render_result(fast=True)
+
+    def _render_full(self) -> None:
+        """Sharp redraw once the grade settles: the real output, full size."""
+        if self._view == "result":
+            self._render_result(fast=False)
 
     def _grade_toggled(self, shown: bool) -> None:
         self.grade_panel.setVisible(shown)
@@ -2042,7 +2059,7 @@ class MainWindow(QMainWindow):
         self.settings.grade = GradeSettings()
         for field, row in self._grade_rows.items():
             row.set_value(getattr(self.settings.grade, field))
-        self._render_result()
+        self._render_result(fast=False)
 
     def _render_difference(self) -> None:
         """Show what the neural pass changed, amplified to fill the range.
@@ -2071,29 +2088,48 @@ class MainWindow(QMainWindow):
             + ("   (nothing changed)" if peak < 1e-4 else ""),
         )
 
-    def _render_result(self) -> None:
-        """Redraw the comparison with the current grade applied.
+    def _render_result(self, fast: bool = False, new: bool = False) -> None:
+        """Redraw the before/after comparison with the current grade.
 
-        Grades a preview-sized copy rather than the full image: at 8K the full
-        array is 33 megapixels and a slider drag would stutter. The saved file
-        is graded at full resolution, so the preview is a fast stand-in and
-        never the thing that gets written.
+        Two resolutions for one reason: people need to *check* the result, and a
+        1200 px preview cannot show the pore- and weave-level detail this tool
+        exists to add - zooming it only magnifies blur. So the view holds the
+        full-resolution image whenever it is idle, and drops to the fast preview
+        only while a colour slider is actually moving, because grading a 4K frame
+        is ~1.5 s and an 8K one ~6 s - far too slow per drag tick, fine once.
+
+        ``new`` marks a freshly converted image, which resets the zoom; a grade
+        redraw keeps it, so swapping preview<->full does not fight the zoom the
+        user set to inspect something.
         """
         if self.result is None or self._preview_after_linear is None:
             return
-        if self.result.hdr:
-            # Grade the scene-referred data and tone map afterwards, which is
-            # the order the export uses. Grading the tone mapped copy instead
-            # would preview an exposure change behaving quite differently from
-            # the one that ends up in the file.
-            graded = hdr_mod.tonemap(
-                grade.apply_linear(self._preview_after_linear, self.settings.grade),
-                self.result.white,
-            )
-            graded = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        if fast:
+            before_u8 = self._preview_before_u8
+            if self.result.hdr:
+                graded = hdr_mod.tonemap(
+                    grade.apply_linear(self._preview_after_linear, self.settings.grade),
+                    self.result.white,
+                )
+                after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                after_u8 = grade.apply_preview(self._preview_after_linear, self.settings.grade)
         else:
-            graded = grade.apply_preview(self._preview_after_linear, self.settings.grade)
-        self.wipe.set_images_u8(self._preview_before_u8, graded)
+            before_u8 = self._full_before_u8
+            if self.result.hdr and self.result.enhanced_linear is not None:
+                graded = hdr_mod.tonemap(
+                    grade.apply_linear(self.result.enhanced_linear, self.settings.grade),
+                    self.result.white,
+                )
+                after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+            else:
+                # Reuses the exact full-resolution grade the export uses, so what
+                # is inspected is what gets saved.
+                graded = grade.apply(self.result.enhanced, self.settings.grade)
+                after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        self.wipe.set_images_u8(before_u8, after_u8, keep_view=not new)
 
     def show_view(self, which: str) -> None:
         """Switch the canvas, falling back when the requested view has no data."""
@@ -2124,7 +2160,7 @@ class MainWindow(QMainWindow):
             self._render_difference()
             self.stack.setCurrentWidget(self.diff_view)
         elif which == "result":
-            self._render_result()
+            self._render_result(fast=False)
             self.stack.setCurrentWidget(self.wipe)
         elif which == "depth":
             self.stack.setCurrentWidget(self.depth_view)
@@ -3043,6 +3079,7 @@ class MainWindow(QMainWindow):
         self.view_depth.setEnabled(False)
         self.view_result.setEnabled(False)
         self._preview_before = self._preview_after = None
+        self._full_before_u8 = None
         self._preview_after_linear = None
         self.wipe.clear()
         self.depth_view.clear()
@@ -3283,6 +3320,10 @@ class MainWindow(QMainWindow):
         self._preview_before_u8 = np.clip(self._preview_before, 0.0, 1.0).astype(np.float32)
         self._preview_before_u8 = (self._preview_before_u8 * 255.0).astype(np.uint8)
         self._preview_after = _downscale_for_preview(result.enhanced)
+        # Full-resolution before image, for the sharp idle view. The after side
+        # is graded on demand from result.enhanced(_linear), which are already
+        # held, so no second full-size copy is stored.
+        self._full_before_u8 = (np.clip(result.original, 0.0, 1.0) * 255.0).astype(np.uint8)
         if result.hdr:
             # Keep the preview scene-referred for an HDR result, so the grade
             # sliders act on the same numbers the export will.
@@ -3292,7 +3333,7 @@ class MainWindow(QMainWindow):
             self._preview_after_linear = contract.srgb_to_linear(
                 np.clip(self._preview_after, 0.0, 1.0).astype(np.float32)
             )
-        self._render_result()
+        self._render_result(fast=False, new=True)
         self.save_button.setEnabled(True)
         self.feedback_button.setEnabled(True)
         self.show_view("result")
