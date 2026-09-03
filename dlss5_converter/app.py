@@ -1427,7 +1427,7 @@ class ExportDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("DLSS 5 Image Converter")
+        self.setWindowTitle("DLSS 5 Image & Video Converter")
         # Sized to the screen rather than fixed: 1280x820 does not fit on a
         # 1920x1080 display at 150% scaling, which reports 1280x720 of usable
         # space, and the window came up taller than the desktop.
@@ -3653,7 +3653,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("DLSS 5 Image Converter")
+    app.setApplicationName("DLSS 5 Image & Video Converter")
     # Before the window: nothing in it works without a depth model, and the
     # model needs torch. A release ships neither.
     if not ensure_runtime_ready():

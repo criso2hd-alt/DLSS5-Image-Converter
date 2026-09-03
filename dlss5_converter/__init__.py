@@ -1,4 +1,4 @@
-"""DLSS 5 Image Converter."""
+"""DLSS 5 Image & Video Converter."""
 
 from __future__ import annotations
 

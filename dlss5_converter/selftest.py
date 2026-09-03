@@ -24,7 +24,7 @@ def run_selftest() -> int:
     """Return 0 if the app can do its job, 1 otherwise."""
     failures = 0
 
-    _line("DLSS 5 Image Converter - self test")
+    _line("DLSS 5 Image & Video Converter - self test")
     _line("=" * 46)
 
     from . import bootstrap, paths
