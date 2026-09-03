@@ -52,16 +52,21 @@ class NeuralSettings:
     #: portrait, Cinematic moves the image about 50% further from the source
     #: than Natural does at the same strengths.
     style: int = 0
+    # Defaults are 1.0 - the midpoint of the 0..2 range - rather than the
+    # gentler values these once held. The old defaults were low enough that on
+    # already-photographic content the change was invisible side by side, and
+    # the commonest first report was "it does nothing". 1.0 is clearly visible
+    # while leaving obvious headroom to push or pull back.
     #: Overall strength of the neural pass. 0 is a plain DLAA resolve.
-    intensity: float = 0.65
+    intensity: float = 1.0
     #: Subsurface-scattering and pore-level work on faces. The reason most
     #: people want this tool, and the first thing to lower when output looks
     #: waxy or "yassified".
-    skin: float = 0.45
+    skin: float = 1.0
     #: Local tone response — how much the model is allowed to relight.
-    local_tone: float = 0.40
+    local_tone: float = 1.0
     #: Micro-contrast and material structure (fabric weave, hair strands).
-    structure: float = 0.50
+    structure: float = 1.0
 
     # --- HDR group ---------------------------------------------------------
     #

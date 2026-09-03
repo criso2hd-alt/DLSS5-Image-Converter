@@ -22,10 +22,9 @@ produce the same symptom.
 the cause on an RTX 5070 — every indicator green, no error, image unchanged.
 Updating it fixed it. `--selftest` prints the version it loaded.
 
-**Second, it may have worked and you cannot see it.** The defaults are gentle:
-Intensity 0.65 out of a possible 2.00. On a render that already looks
-photographic, a real change of a few percent is genuinely invisible side by
-side.
+**Second, it may have worked and you cannot see it.** The defaults sit at 1.0
+of a possible 2.00 — visible on most content, but on a render that is already
+photographic even a real change can be hard to spot side by side.
 
 Click **Difference**. It shows what the neural pass changed, amplified, with
 numbers:
