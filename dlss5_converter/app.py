@@ -528,36 +528,7 @@ class FindFilesDialog(QDialog):
             self._worker.stop()
             self.status.setText("Stopping…")
 
-    def _begin_progress(self) -> None:
-        """Show the source image, drained of colour, ready to refill."""
-        if self.prepared is None:
-            return
-        self.show_view("photo")
-        self.depth_view.set_progress(0.0)
-
-    def _end_progress(self) -> None:
-        self.depth_view.set_progress(None)
-
-    def _report_progress(self, message: str) -> None:
-        """Status text, and the colour sweep if this message carries a count.
-
-        Parsed out of the message rather than plumbed through as a number: the
-        progress callback is a string all the way down from the pipeline, and
-        threading a second numeric channel through three call sites to drive a
-        visual flourish is not worth it. If the wording ever changes the sweep
-        simply stops advancing, which is a harmless way to fail.
-        """
-        self.statusBar().showMessage(message)
-        if self.depth_view._progress is None:
-            return
-        match = _PASS_COUNT.search(message)
-        if match:
-            done, total = int(match.group(1)), int(match.group(2))
-            if total > 0:
-                self.depth_view.set_progress(done / total)
-
     def _teardown(self) -> None:
-        self._end_progress()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(10000)
@@ -2735,7 +2706,36 @@ class MainWindow(QMainWindow):
         self._worker.failed.connect(self._failed)
         self._thread.start()
 
+    def _begin_progress(self) -> None:
+        """Show the source image, drained of colour, ready to refill."""
+        if self.prepared is None:
+            return
+        self.show_view("photo")
+        self.depth_view.set_progress(0.0)
+
+    def _end_progress(self) -> None:
+        self.depth_view.set_progress(None)
+
+    def _report_progress(self, message: str) -> None:
+        """Status text, and the colour sweep if this message carries a count.
+
+        Parsed out of the message rather than plumbed through as a number: the
+        progress callback is a string all the way down from the pipeline, and
+        threading a second numeric channel through three call sites to drive a
+        visual flourish is not worth it. If the wording ever changes the sweep
+        simply stops advancing, which is a harmless way to fail.
+        """
+        self.statusBar().showMessage(message)
+        if self.depth_view._progress is None:
+            return
+        match = _PASS_COUNT.search(message)
+        if match:
+            done, total = int(match.group(1)), int(match.group(2))
+            if total > 0:
+                self.depth_view.set_progress(done / total)
+
     def _teardown(self) -> None:
+        self._end_progress()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
