@@ -576,8 +576,17 @@ def convert_video(
             raise RuntimeError("No frames were converted.")
 
         say("Adding audio…")
+        # The audio window must match the frames actually converted, or a
+        # trimmed clip plays its picture and then sits on black over the rest of
+        # the full soundtrack. `start` and `done` are in frames; the source fps
+        # turns them into the seconds mux_audio wants.
+        audio_start = start / info.fps if info.fps else 0.0
+        audio_duration = None if (start == 0 and limit is None) else done / (info.fps or 1.0)
         yield VideoProgress(done, total, np.zeros((1, 1, 3), np.float32), "muxing")
-        had_audio = video.mux_audio(Path(source), video_only, destination)
+        had_audio = video.mux_audio(
+            Path(source), video_only, destination,
+            start=audio_start, duration=audio_duration,
+        )
         yield VideoProgress(done, total, np.zeros((1, 1, 3), np.float32),
                             "done" if had_audio else "done-no-audio")
     finally:

@@ -271,3 +271,48 @@ def test_download_progress_runs_on_the_gui_thread(qt_app, monkeypatch):
     assert "thread" in seen, "progress never fired"
     assert seen["thread"] is main_thread, "progress slot ran off the GUI thread"
     w.deleteLater()
+
+
+@pyav
+def test_a_trimmed_export_trims_the_audio_to_match(tmp_path):
+    """The reported bug: a 1.5 s In/Out export kept the whole audio track, so
+    the picture ended and the sound played on over black. Audio must match the
+    converted window, not the source length."""
+    import av
+
+    # A 6-second source; we will keep a 1-second window from t=2s.
+    src = make_clip(tmp_path / "long.mp4", frames=144, size=(160, 90), fps=24, audio=True)
+
+    # Stand in for the converted 1 s (24 frames) of video.
+    vonly = tmp_path / "vonly.mp4"
+    w = video.VideoWriter(vonly, video.CODECS_BY_KEY["h264"], 24, (160, 90))
+    for _ in range(24):
+        w.write(np.zeros((90, 160, 3), np.float32))
+    w.close()
+
+    out = tmp_path / "trimmed.mp4"
+    assert video.mux_audio(src, vonly, out, start=2.0, duration=1.0) is True
+
+    with av.open(str(out)) as c:
+        a = c.streams.audio[0]
+        audio_seconds = float(a.duration * a.time_base)
+    assert audio_seconds == pytest.approx(1.0, abs=0.15), (
+        f"audio should be ~1 s to match the window, got {audio_seconds:.2f}s"
+    )
+
+
+@pyav
+def test_the_whole_clip_still_keeps_full_audio(tmp_path):
+    import av
+
+    src = make_clip(tmp_path / "src.mp4", frames=48, size=(160, 90), fps=24, audio=True)
+    vonly = tmp_path / "vonly.mp4"
+    w = video.VideoWriter(vonly, video.CODECS_BY_KEY["h264"], 24, (160, 90))
+    for _ in range(48):
+        w.write(np.zeros((90, 160, 3), np.float32))
+    w.close()
+    out = tmp_path / "whole.mp4"
+    assert video.mux_audio(src, vonly, out) is True  # no window
+    with av.open(str(out)) as c:
+        assert c.streams.audio
+        assert float(c.streams.audio[0].duration * c.streams.audio[0].time_base) > 1.5

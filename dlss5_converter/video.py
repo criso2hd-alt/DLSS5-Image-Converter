@@ -205,12 +205,23 @@ def frames(
             emitted += 1
 
 
-def mux_audio(source: Path, video_only: Path, destination: Path) -> bool:
-    """Copy the source's audio stream onto the converted video.
+def mux_audio(
+    source: Path,
+    video_only: Path,
+    destination: Path,
+    start: float = 0.0,
+    duration: float | None = None,
+) -> bool:
+    """Put the source's audio onto the converted video, trimmed to match.
 
     Returns True if audio was carried across, False if the source had none.
-    Both files are read and a third written, rather than editing in place,
-    because a container cannot be safely appended to while it is being read.
+
+    ``start`` and ``duration`` (seconds) are the window the video covers. This
+    is the fix for a real bug: a converted In/Out range got the *whole* audio
+    track, so a 1.5 s clip played its picture and then sat on black for the rest
+    of a two-minute soundtrack. When a window is given the audio is trimmed to
+    it and re-timestamped to zero; the whole-clip case (no window) still remuxes
+    the stream untouched, which is faster and lossless.
     """
     import av
 
@@ -219,18 +230,27 @@ def mux_audio(source: Path, video_only: Path, destination: Path) -> bool:
             shutil.copy2(video_only, destination)
             return False
         audio_in = src.streams.audio[0]
+        trimming = start > 0 or duration is not None
 
         with av.open(str(video_only)) as vid, av.open(str(destination), mode="w") as out:
             video_in = vid.streams.video[0]
             video_out = out.add_stream_from_template(video_in)
-            # Remux the audio without re-encoding when the container can hold it
-            # as-is (MP4 takes AAC directly); re-encode to AAC only if not.
-            try:
-                audio_out = out.add_stream_from_template(audio_in)
-                reencode = False
-            except Exception:  # noqa: BLE001 - container will not take it raw
+
+            # Every output stream must be added before the first mux writes the
+            # container header - add one afterwards and the mux dies with
+            # "cannot rebase to zero time". So the audio stream is decided and
+            # created here, up front, and only fed later.
+            remux = False
+            if not trimming:
+                try:
+                    audio_out = out.add_stream_from_template(audio_in)
+                    remux = True
+                except Exception:  # noqa: BLE001 - container will not take it raw
+                    audio_out = out.add_stream("aac", rate=audio_in.rate)
+                    audio_out.codec_context.time_base = Fraction(1, audio_in.rate)
+            else:
                 audio_out = out.add_stream("aac", rate=audio_in.rate)
-                reencode = False if audio_out is None else True
+                audio_out.codec_context.time_base = Fraction(1, audio_in.rate)
 
             for packet in vid.demux(video_in):
                 if packet.dts is None:
@@ -238,26 +258,79 @@ def mux_audio(source: Path, video_only: Path, destination: Path) -> bool:
                 packet.stream = video_out
                 out.mux(packet)
 
-            if reencode:
-                resampler = None
-                for frame in src.decode(audio_in):
-                    for out_frame in _resample(frame, audio_out, resampler):
-                        for packet in audio_out.encode(out_frame):
-                            out.mux(packet)
-                for packet in audio_out.encode():
-                    out.mux(packet)
-            else:
+            if remux:
+                # Whole clip, container-compatible: copy the stream untouched.
                 for packet in src.demux(audio_in):
                     if packet.dts is None:
                         continue
                     packet.stream = audio_out
                     out.mux(packet)
+            else:
+                # Trimmed, or a container that needs a re-encode: encode the
+                # window (whole clip when not trimming), retimed to zero.
+                end = None if duration is None else start + duration
+                _reencode_audio_window(
+                    src, out, audio_in, audio_out, start if trimming else 0.0, end
+                )
     return True
 
 
-def _resample(frame, stream, resampler):
-    frame.pts = None
-    yield frame
+def _reencode_audio_window(src, out, audio_in, audio_out, start: float, end: float | None) -> None:
+    """Encode a time window of audio into an already-created AAC stream.
+
+    ``audio_out`` is created by the caller before any muxing, because a stream
+    cannot be added after the header is written. Two more things are
+    load-bearing, each learned from a failure: each frame needs ``sample_rate``
+    as well as ``pts``/``time_base``, and a FIFO repacketises to the encoder's
+    fixed frame size, since decoded frames do not arrive that size and AAC will
+    not take an odd one.
+    """
+    import av
+    from fractions import Fraction
+
+    rate = audio_in.rate
+    time_base = Fraction(1, rate)
+    resampler = av.AudioResampler(format="fltp", layout=audio_in.layout, rate=rate)
+    fifo = av.AudioFifo()
+    frame_size = audio_out.codec_context.frame_size or 1024
+    counter = 0
+
+    if start > 0:
+        try:
+            src.seek(int(start / audio_in.time_base), stream=audio_in, backward=True)
+        except Exception:  # noqa: BLE001 - decode from the top if seek is refused
+            pass
+
+    def emit(flush: bool) -> None:
+        nonlocal counter
+        while True:
+            frame = fifo.read() if flush else fifo.read(frame_size)
+            if frame is None:
+                return
+            frame.pts = counter
+            frame.time_base = time_base
+            frame.sample_rate = rate
+            counter += frame.samples
+            for packet in audio_out.encode(frame):
+                out.mux(packet)
+            if flush:
+                return
+
+    for frame in src.decode(audio_in):
+        if frame.pts is None:
+            continue
+        t = float(frame.pts * audio_in.time_base)
+        if t < start:
+            continue
+        if end is not None and t >= end:
+            break
+        for resampled in resampler.resample(frame):
+            resampled.pts = None
+            fifo.write(resampled)
+        emit(flush=False)
+    emit(flush=True)
+    for packet in audio_out.encode():
+        out.mux(packet)
 
 
 class VideoWriter:
