@@ -1272,12 +1272,20 @@ class MainWindow(QMainWindow):
         # display scaling, where every widget is taller - the bottom of it was
         # being clipped away silently. A user reported the neural sliders
         # missing entirely and the HDR labels cut in half.
-        sidebar = QScrollArea()
-        sidebar.setWidget(self._sidebar())
-        sidebar.setWidgetResizable(True)
-        sidebar.setFrameShape(QFrame.Shape.NoFrame)
-        sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sidebar.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroller = QScrollArea()
+        scroller.setWidget(self._sidebar())
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # Only the settings scroll. The actions sit under them and stay put.
+        sidebar = QWidget()
+        column = QVBoxLayout(sidebar)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(scroller, 1)
+        column.addWidget(self._actions())
         # Room for the scrollbar so it never overlaps the slider readouts.
         sidebar.setFixedWidth(SIDEBAR_WIDTH + 18)
         layout.addWidget(sidebar)
@@ -1748,6 +1756,118 @@ class MainWindow(QMainWindow):
         if self.image_path is not None:
             self._start_depth()
 
+    def _actions(self) -> QWidget:
+        """The buttons, pinned below the sidebar rather than inside it.
+
+        These used to scroll with the settings, which meant Convert - the
+        one control used on every single image - could be off screen. That
+        is the same root cause as the sliders being clipped at 150%
+        scaling: 1012 px of sidebar in a 667 px viewport. Pinning the
+        actions leaves only settings to scroll and removes the case
+        entirely rather than making it less likely."""
+        panel = QWidget()
+        panel.setFixedWidth(SIDEBAR_WIDTH)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(6)
+
+        # A rule, so the block reads as pinned rather than as the end of a list
+        # that happens to have stopped scrolling.
+        rule = QFrame()
+        rule.setFrameShape(QFrame.Shape.HLine)
+        rule.setFrameShadow(QFrame.Shadow.Plain)
+        rule.setFixedHeight(1)
+        rule.setStyleSheet("background: #2a2e37; border: none;")
+        layout.addWidget(rule)
+        layout.addSpacing(2)
+
+        self.open_button = QPushButton("Open image…")
+        self.open_button.setObjectName("secondary")
+        self.open_button.clicked.connect(self.browse)
+
+        self.convert_button = QPushButton("Convert")
+        self.convert_button.setEnabled(False)
+        self.convert_button.clicked.connect(self.convert)
+
+        self.save_button = QPushButton("Save result…")
+        self.save_button.setObjectName("secondary")
+        self.save_button.setToolTip("Asks for an export size first. Defaults to native.")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.save)
+
+        self.batch_button = QPushButton("Apply to folder…")
+        self.batch_button.setObjectName("secondary")
+        self.batch_button.setToolTip(
+            "Run a whole folder with the settings above.\n\n"
+            "Tune them on one image first - whatever is in this sidebar is what "
+            "every image in the folder gets, colour grade included.\n\n"
+            "For an animation use the Image sequence tab instead: that keeps "
+            "frames consistent with each other and can take your renderer's "
+            "depth pass."
+        )
+        self.batch_button.clicked.connect(self.open_batch)
+
+        self.feedback_button = QPushButton("Use result as input")
+        self.feedback_button.setObjectName("secondary")
+        self.feedback_button.setEnabled(False)
+        self.feedback_button.setToolTip(
+            "Feed the result back in for another pass.\n\n"
+            "The colour grade is baked in, and depth is re-estimated from the "
+            "new image.\n\n"
+            "Worth knowing: the pass amplifies what it already did, so a second "
+            "run compounds artefacts as readily as detail. It is genuinely "
+            "useful on renders that started out flat, and it is the quickest "
+            "way to make a portrait look plastic. Lower the strengths for the "
+            "second pass rather than repeating the first."
+        )
+        self.feedback_button.clicked.connect(self.use_result_as_input)
+
+        self.find_button = QPushButton("Find my DLSS files…")
+        self.find_button.setObjectName("secondary")
+        self.find_button.setToolTip(
+            "Search your Steam libraries, Downloads and Documents for the four "
+            "files, and copy them in.\n\n"
+            "Nothing is downloaded - this only looks at files already on your "
+            "machine. If DLSS 5 works in a game for you, that game's folder is "
+            "what it is looking for."
+        )
+        self.find_button.clicked.connect(self.open_find_files)
+
+        diagnose = QPushButton("Check runtime")
+        diagnose.setObjectName("secondary")
+        diagnose.clicked.connect(self.diagnose)
+
+        help_button = QPushButton("Help")
+        help_button.setObjectName("secondary")
+        help_button.setToolTip(
+            f"Opens the guide in your browser:\n{WIKI_URL}\n\n"
+            "Every issue anyone has reported, with what actually caused it."
+        )
+        help_button.clicked.connect(lambda: open_help())
+
+        # One column, not two. Two-across was tried and measured: at a 320 px
+        # sidebar a half cell is 156 px, and "Check runtime" needs 188, "Apply
+        # to folder..." 224, "Find my DLSS files..." 260. Fitting them means
+        # cutting to "Runtime", "To folder...", "Find files..." - and that last
+        # one exists to say DLSS files, which is the whole reason someone
+        # stuck on missing files spots it. Costing that to reclaim 72 px is a
+        # bad trade, and pinning the block already took 252 px out of the
+        # scrolling region, which was the actual crowding.
+        layout.addWidget(self.open_button)
+        layout.addWidget(self.convert_button)
+        layout.addWidget(self.save_button)
+        layout.addWidget(self.feedback_button)
+        layout.addWidget(self.batch_button)
+        layout.addWidget(self.find_button)
+
+        # The one pair that fits: Help is a single short word.
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+        tools.addWidget(diagnose, 1)
+        tools.addWidget(help_button)
+        layout.addLayout(tools)
+        return panel
+
     def _sidebar(self) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(SIDEBAR_WIDTH)
@@ -1948,84 +2068,9 @@ class MainWindow(QMainWindow):
         self.jitter.toggled.connect(lambda v: setattr(self.settings.evaluation, "jitter", v))
         eval_layout.addWidget(self.jitter)
         layout.addWidget(evaluation)
-
         layout.addStretch(1)
-
-        self.open_button = QPushButton("Open image…")
-        self.open_button.setObjectName("secondary")
-        self.open_button.clicked.connect(self.browse)
-        layout.addWidget(self.open_button)
-
-        self.convert_button = QPushButton("Convert")
-        self.convert_button.setEnabled(False)
-        self.convert_button.clicked.connect(self.convert)
-        layout.addWidget(self.convert_button)
-
-        self.save_button = QPushButton("Save result…")
-        self.save_button.setObjectName("secondary")
-        self.save_button.setToolTip("Asks for an export size first. Defaults to native.")
-        self.save_button.setEnabled(False)
-        self.save_button.clicked.connect(self.save)
-        layout.addWidget(self.save_button)
-
-        self.batch_button = QPushButton("Apply to folder…")
-        self.batch_button.setObjectName("secondary")
-        self.batch_button.setToolTip(
-            "Run a whole folder with the settings above.\n\n"
-            "Tune them on one image first - whatever is in this sidebar is what "
-            "every image in the folder gets, colour grade included.\n\n"
-            "For an animation use the Image sequence tab instead: that keeps "
-            "frames consistent with each other and can take your renderer's "
-            "depth pass."
-        )
-        self.batch_button.clicked.connect(self.open_batch)
-        layout.addWidget(self.batch_button)
-
-        self.feedback_button = QPushButton("Use result as input")
-        self.feedback_button.setObjectName("secondary")
-        self.feedback_button.setEnabled(False)
-        self.feedback_button.setToolTip(
-            "Feed the result back in for another pass.\n\n"
-            "The colour grade is baked in, and depth is re-estimated from the "
-            "new image.\n\n"
-            "Worth knowing: the pass amplifies what it already did, so a second "
-            "run compounds artefacts as readily as detail. It is genuinely "
-            "useful on renders that started out flat, and it is the quickest "
-            "way to make a portrait look plastic. Lower the strengths for the "
-            "second pass rather than repeating the first."
-        )
-        self.feedback_button.clicked.connect(self.use_result_as_input)
-        layout.addWidget(self.feedback_button)
-
-        self.find_button = QPushButton("Find my DLSS files…")
-        self.find_button.setObjectName("secondary")
-        self.find_button.setToolTip(
-            "Search your Steam libraries, Downloads and Documents for the four "
-            "files, and copy them in.\n\n"
-            "Nothing is downloaded - this only looks at files already on your "
-            "machine. If DLSS 5 works in a game for you, that game's folder is "
-            "what it is looking for."
-        )
-        self.find_button.clicked.connect(self.open_find_files)
-        layout.addWidget(self.find_button)
-
-        tools = QHBoxLayout()
-        tools.setSpacing(8)
-        diagnose = QPushButton("Check runtime")
-        diagnose.setObjectName("secondary")
-        diagnose.clicked.connect(self.diagnose)
-        tools.addWidget(diagnose, 1)
-
-        help_button = QPushButton("Help")
-        help_button.setObjectName("secondary")
-        help_button.setToolTip(
-            f"Opens the guide in your browser:\n{WIKI_URL}\n\n"
-            "Every issue anyone has reported, with what actually caused it."
-        )
-        help_button.clicked.connect(lambda: open_help())
-        tools.addWidget(help_button)
-        layout.addLayout(tools)
         return panel
+
 
     # -- sequence page -------------------------------------------------------
 
