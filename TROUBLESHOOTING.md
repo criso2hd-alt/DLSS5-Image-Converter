@@ -319,6 +319,37 @@ bright sky into a flat white shape. If you want the range, save `.jxr` or `.exr`
 
 ---
 
+## Windows Security flags it as Trojan:Win32/Wacatac.C!ml
+
+A false positive. The `!ml` on the end means it is Microsoft Defender's
+*machine-learning guess*, not a signature match of known malware — and Wacatac
+is the single most common false positive for apps built with PyInstaller, which
+this is. A scan on VirusTotal shows the file clean across the other engines; if
+it were really malware they would not stay quiet.
+
+Why this app in particular trips it:
+
+- it is an **unsigned** PyInstaller executable, and unsigned binaries built with
+  a shared bootloader are exactly what the heuristic is nervous about;
+- it **downloads** components on first run (PyTorch, the video codec) and
+  **launches a second process** (the DLSS harness) — all legitimate, but it
+  pattern-matches "downloader that starts things".
+
+**If you downloaded it from the Releases page here, it is safe to choose "Allow
+on device".** Confirm you have the genuine file first by checking its hash
+against the one on the release, which no tampered copy could match:
+
+```powershell
+Get-FileHash .\DLSS5Converter.exe        # compare to the SHA-256 on the release
+```
+
+**Reporting it helps everyone.** If you would rather it just stop happening,
+the fix is on the developer's side: submitting the file to Microsoft as an
+incorrect detection at <https://www.microsoft.com/en-us/wdsi/filesubmission>
+gets the model corrected, usually within a day or two, for all users at once.
+
+---
+
 ## Still stuck
 
 Open an issue with `report.txt` from `--selftest` attached, plus your GPU, driver
