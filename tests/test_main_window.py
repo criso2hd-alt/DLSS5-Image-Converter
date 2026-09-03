@@ -203,19 +203,35 @@ def test_compare_styles_shows_its_panes_before_converting(window):
     assert not window.view_styles.isEnabled(), "disabled while it runs"
 
 
-def test_each_pane_sweeps_only_while_its_own_style_converts(window):
-    """The styles run one after another, so they cannot all sweep at once."""
+def test_both_style_panes_grey_the_instant_a_run_starts(window):
+    """A stale pane must not read as finished while its restatement is queued.
+
+    Reported from the live app: changing a setting greyed the panes one at a
+    time, as each conversion reached them, so the pane still waiting showed its
+    previous colour result - which no longer represented what was coming.
+    """
+    prepare(window)
+    window.style_count_box.setCurrentIndex(1)  # Original / Natural / Cinematic
+    window.show_view("styles")
+
+    # Original stays colour (never converts); both style panes are grey at 0.0.
+    assert window.side_by_side._progress == [None, 0.0, 0.0]
+
+
+def test_each_pane_returns_to_colour_only_when_its_own_style_lands(window):
+    """The styles convert one after another, so colour returns one at a time."""
     prepare(window)
     window.style_count_box.setCurrentIndex(1)
     window.show_view("styles")
 
     window._style_started(0)
     window._report_progress("DLSS 5 pass 4 of 8")
-    assert window.side_by_side._progress == [None, pytest.approx(0.5), None]
+    # Natural sweeping; Cinematic still fully grey, not blank.
+    assert window.side_by_side._progress == [None, pytest.approx(0.5), 0.0]
 
     window._style_one_done(0, result())
-    assert window.side_by_side._progress[1] is None, "a finished pane stops sweeping"
-    assert window.side_by_side._progress[2] == 0.0, "the next one is still waiting"
+    assert window.side_by_side._progress[1] is None, "Natural is done, full colour"
+    assert window.side_by_side._progress[2] == 0.0, "Cinematic still waiting, grey"
 
     window._style_started(1)
     window._report_progress("DLSS 5 pass 2 of 8")

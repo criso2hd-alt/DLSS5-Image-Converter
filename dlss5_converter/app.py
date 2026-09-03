@@ -1251,6 +1251,11 @@ class MainWindow(QMainWindow):
         self._style_worker: StyleWorker | None = None
         #: The style being converted right now, so its pane knows to sweep.
         self._style_running: int | None = None
+        #: Styles queued for (re)conversion. A pane is greyed while its style is
+        #: in here, whether or not a previous result is still on screen - so a
+        #: settings change greys every style pane at once, rather than one at a
+        #: time as each conversion reaches it.
+        self._styles_pending: set[int] = set()
         #: How far that style has got, kept here because redrawing the panes
         #: resets their sweep state and it has to be put back.
         self._style_fraction = 0.0
@@ -1571,16 +1576,21 @@ class MainWindow(QMainWindow):
     def _start_style_comparison(self) -> None:
         if self.image_path is None or self._thread is not None:
             return
-        self.style_results = {}
         self._style_signature_used = self._style_signature()
         self.convert_button.setEnabled(False)
         self._style_running = None
         self._style_fraction = 0.0
+        # Every style is about to be (re)computed. Marking them all pending now
+        # is what greys both panes immediately: their current pixels - stale
+        # results from the last run, or the source - do not represent what is
+        # coming, so none of them should read as finished. style_results is
+        # kept, not cleared, so a re-run shows the previous result greyed under
+        # the sweep rather than flashing to the source and back.
+        self._styles_pending = set(range(len(NR_STYLES)))
 
-        # Straight to the layout it is going to end up in, filled with the
-        # source and swept per pane. Showing a full-screen "working" view first
-        # and snapping to panels at the end makes the wait feel like a
-        # different operation from the thing it produces.
+        # Straight to the layout it is going to end up in. Showing a full-screen
+        # "working" view first and snapping to panels at the end makes the wait
+        # feel like a different operation from the thing it produces.
         self._show_style_placeholders()
         # After the placeholders: showing them calls _set_view_state, which
         # would otherwise switch this straight back on.
@@ -1601,25 +1611,16 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _show_style_placeholders(self) -> None:
-        """The comparison layout, before there is anything to compare.
+        """Switch to the comparison layout and draw its starting state.
 
-        Every pane starts as the source image. The ones waiting on a style are
-        swept; an Original pane is not, because nothing is being computed for
-        it - it is already what it will be.
+        _render_styles greys every pending style pane, so with all styles
+        pending this is what makes both panes go grey at once.
         """
         if self.prepared is None:
             return
-        count = self._pane_count()
-        source = self._graded_source()
-        view = self._style_view()
-        if view is self.side_by_side:
-            view.set_panes_u8([source] * count)
-        else:
-            view.set_images_u8(source, source)
-        view.set_labels(*[self._pane_source(i)[0] for i in range(count)])
-        self.stack.setCurrentWidget(view)
+        self._render_styles()
+        self.stack.setCurrentWidget(self._style_view())
         self._set_view_state("styles")
-        self.style_caption.setText("Converting each style…")
 
     def _graded_source(self) -> np.ndarray:
         """The source at preview size, graded like the results will be."""
@@ -1640,12 +1641,14 @@ class MainWindow(QMainWindow):
     def _style_one_done(self, style: int, result: object) -> None:
         """Drop one finished style into its pane without waiting for the rest."""
         self.style_results[style] = result
+        self._styles_pending.discard(style)
         self._style_running = None
         if self._view == "styles":
             self._render_styles()
 
     def _styles_ready(self, results: dict) -> None:
         self.style_results = results
+        self._styles_pending = set()
         self._style_teardown()
         # Adopt nothing yet. Which one wins is the user's call, and silently
         # keeping the last one converted would answer it for them.
@@ -1657,6 +1660,7 @@ class MainWindow(QMainWindow):
 
     def _styles_failed(self, message: str) -> None:
         self.style_results = {}
+        self._styles_pending = set()
         self._style_signature_used = None
         self._style_teardown()
         QMessageBox.warning(self, "Could not compare styles", message)
@@ -1726,11 +1730,14 @@ class MainWindow(QMainWindow):
         return NR_STYLES[style], self.style_results.get(style)
 
     def _render_styles(self) -> None:
-        """Draw the chosen panes, graded identically, into the chosen layout.
+        """Draw the panes, graded identically, into the chosen layout.
 
-        Tolerates a half-finished comparison: a pane whose style has not been
-        converted yet shows the source, swept, rather than blocking the whole
-        view until everything is ready.
+        A pane is greyed while its style is in ``_styles_pending`` - even if a
+        previous result is still stored for it. That is the whole point: a
+        stale result must not read as the finished one, so both panes go grey
+        the instant a re-run starts and each returns to colour only when its own
+        conversion lands. The stale result stays visible under the grey, so the
+        view does not flash to the source and back.
         """
         if self.prepared is None:
             return
@@ -1742,16 +1749,23 @@ class MainWindow(QMainWindow):
         labels: list[str] = []
         pending: list[int] = []
         for index in range(count):
-            label, result = self._pane_source(index)
-            if result is None:
-                # Either the Original pane, or a style still being converted.
-                # Both show the source; only the second one sweeps.
+            style = self.style_choices[index].currentData()
+            if style is None or style < 0:
+                # Original never converts, so it is never pending or swept.
                 images.append(self._graded_source())
-                if self.style_choices[index].currentData() != -1:
-                    pending.append(index)
+                labels.append("Original")
+                continue
+            result = self.style_results.get(style)
+            if style in self._styles_pending:
+                # Being (re)computed: show whatever we have, greyed.
+                images.append(
+                    self._graded_preview(result) if result is not None
+                    else self._graded_source()
+                )
+                pending.append(index)
             else:
                 images.append(self._graded_preview(result))
-            labels.append(label)
+            labels.append(NR_STYLES[style])
 
         view = self._style_view()
         if view is self.side_by_side:
@@ -1759,8 +1773,9 @@ class MainWindow(QMainWindow):
         else:
             view.set_images_u8(images[0], images[1])
         view.set_labels(*labels)
-        # set_panes_u8 clears the sweep state, so re-arm whatever is still
-        # outstanding after the redraw rather than before it.
+        # set_panes_u8 clears the sweep state, so re-arm every pending pane
+        # after the redraw. The one being converted now sits at its real
+        # progress; the rest sit fully grey at 0.0, waiting their turn.
         if view is self.side_by_side:
             for index in pending:
                 running = self.style_choices[index].currentData() == self._style_running
@@ -1768,12 +1783,15 @@ class MainWindow(QMainWindow):
                     index, self._style_fraction if running else 0.0
                 )
 
-        how = (
-            "Scroll to zoom, right-drag to pan - every pane moves together."
-            if view is self.side_by_side
-            else "Drag the divider; scroll to zoom, right-drag to pan."
-        )
-        self.style_caption.setText(f"Same image, same settings, same grade. {how}")
+        if self._styles_pending:
+            self.style_caption.setText("Converting each style…")
+        else:
+            how = (
+                "Scroll to zoom, right-drag to pan - every pane moves together."
+                if view is self.side_by_side
+                else "Drag the divider; scroll to zoom, right-drag to pan."
+            )
+            self.style_caption.setText(f"Same image, same settings, same grade. {how}")
 
     def _graded_preview(
         self, result: pipeline.Result, original: bool = False
