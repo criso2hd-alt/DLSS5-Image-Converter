@@ -146,6 +146,13 @@ def configure_render() -> None:
     scene.render.resolution_percentage = 100
     scene.render.film_transparent = False
 
+    # The File Output nodes below write the beauty and depth we actually want.
+    # --render-anim ALSO writes the combined render to scene.render.filepath,
+    # which defaults to the OS temp dir (C:\tmp on Windows) and quietly litters
+    # it with a second copy of every frame. Redirect it under the chosen output
+    # folder so nothing lands outside where the user pointed us.
+    scene.render.filepath = str(OUTPUT / "_combined_" / "frame_")
+
     # EEVEE for speed; the renamed identifier in 4.2+ is handled either way.
     for engine in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"):
         try:
