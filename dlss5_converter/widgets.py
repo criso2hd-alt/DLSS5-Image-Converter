@@ -19,6 +19,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QPolygonF,
 )
 from PySide6.QtWidgets import (
     QDialog,
@@ -931,3 +932,236 @@ class SliderRow(QWidget):
 
     def set_value(self, value: float) -> None:
         self._slider.setValue(self._to_raw(value))
+
+
+class TimelineWidget(QWidget):
+    """A scrub bar with Premiere-style In/Out brackets and scroll-to-zoom.
+
+    Frames are the unit throughout - the playhead, the In and Out points, and
+    the visible window are all frame indices - because the conversion works in
+    frames and a range that does not land on exact frames would convert a
+    slightly different span than the one shown. Time is only ever a label.
+
+    Zoom is a visible window ``[_view_lo, _view_hi)`` of the whole ``0..total``
+    range; the wheel narrows or widens it about the cursor, so you can place an
+    In point on frame 4137 of a five-thousand-frame clip without fighting a bar
+    where every frame is a third of a pixel.
+    """
+
+    seeked = Signal(int)       # playhead moved by the user
+    in_changed = Signal(int)
+    out_changed = Signal(int)
+
+    _HANDLE = 8.0              # half-width of a draggable bracket, in pixels
+    _MIN_SPAN = 2             # never zoom tighter than this many frames
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(56)
+        self.setMouseTracking(True)
+        self._total = 0
+        self._fps = 24.0
+        self._playhead = 0
+        self._in = 0
+        self._out = 0
+        self._range_mode = False
+        self._view_lo = 0
+        self._view_hi = 0          # exclusive; == total when fully zoomed out
+        self._drag: str | None = None   # "playhead" | "in" | "out" | "pan"
+        self._pan_anchor = 0.0
+
+    # -- state ---------------------------------------------------------------
+
+    def set_duration(self, total_frames: int, fps: float) -> None:
+        self._total = max(0, int(total_frames))
+        self._fps = fps or 24.0
+        self._playhead = 0
+        self._in = 0
+        self._out = max(0, self._total - 1)
+        self._view_lo = 0
+        self._view_hi = self._total
+        self.update()
+
+    def set_playhead(self, frame: int) -> None:
+        """Called from the player as it advances; does not emit seeked."""
+        self._playhead = int(np.clip(frame, 0, max(0, self._total - 1)))
+        self.update()
+
+    def set_range_mode(self, on: bool) -> None:
+        self._range_mode = bool(on)
+        self.update()
+
+    def set_in_out(self, in_frame: int, out_frame: int) -> None:
+        last = max(0, self._total - 1)
+        self._in = int(np.clip(in_frame, 0, last))
+        self._out = int(np.clip(out_frame, self._in, last))
+        self.update()
+
+    def in_out(self) -> tuple[int, int]:
+        return self._in, self._out
+
+    def range_seconds(self) -> float:
+        return (self._out - self._in + 1) / self._fps if self._total else 0.0
+
+    # -- geometry ------------------------------------------------------------
+
+    def _track(self) -> QRectF:
+        return QRectF(self._HANDLE, 6.0, max(1.0, self.width() - 2 * self._HANDLE), 26.0)
+
+    def _span(self) -> int:
+        return max(1, self._view_hi - self._view_lo)
+
+    def _frame_to_x(self, frame: float) -> float:
+        track = self._track()
+        return track.left() + (frame - self._view_lo) / self._span() * track.width()
+
+    def _x_to_frame(self, x: float) -> int:
+        track = self._track()
+        if track.width() <= 0:
+            return self._view_lo
+        frac = (x - track.left()) / track.width()
+        return int(round(self._view_lo + frac * self._span()))
+
+    # -- interaction ---------------------------------------------------------
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._total <= 0:
+            return
+        steps = event.angleDelta().y() / 120.0
+        if not steps:
+            return
+        pivot = self._x_to_frame(event.position().x())
+        factor = 0.8 ** steps   # scroll up zooms in
+        new_span = int(np.clip(round(self._span() * factor), self._MIN_SPAN, self._total))
+        # Keep the frame under the cursor under the cursor.
+        frac = (pivot - self._view_lo) / self._span()
+        lo = int(round(pivot - frac * new_span))
+        lo = int(np.clip(lo, 0, max(0, self._total - new_span)))
+        self._view_lo = lo
+        self._view_hi = min(self._total, lo + new_span)
+        self.update()
+
+    def _nearest_handle(self, x: float) -> str:
+        candidates = [("playhead", self._playhead)]
+        if self._range_mode:
+            candidates += [("in", self._in), ("out", self._out)]
+        best, best_dist = "playhead", 1e9
+        for name, frame in candidates:
+            dist = abs(self._frame_to_x(frame) - x)
+            if dist < best_dist:
+                best, best_dist = name, dist
+        # Grab a bracket only when genuinely near it; otherwise treat a click as
+        # a seek, which is what a click on empty track should do.
+        return best if best_dist <= self._HANDLE * 2 else "seek"
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        if self._total <= 0:
+            return
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._drag = "pan"
+            self._pan_anchor = event.position().x()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        target = self._nearest_handle(event.position().x())
+        if target == "seek":
+            self._drag = "playhead"
+            self._apply_drag(event.position().x())
+        else:
+            self._drag = target
+            self._apply_drag(event.position().x())
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        if self._drag == "pan":
+            track = self._track()
+            dx = event.position().x() - self._pan_anchor
+            self._pan_anchor = event.position().x()
+            shift = int(round(-dx / track.width() * self._span()))
+            lo = int(np.clip(self._view_lo + shift, 0, max(0, self._total - self._span())))
+            self._view_lo, self._view_hi = lo, lo + self._span()
+            self.update()
+        elif self._drag:
+            self._apply_drag(event.position().x())
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
+        self._drag = None
+
+    def _apply_drag(self, x: float) -> None:
+        frame = int(np.clip(self._x_to_frame(x), 0, max(0, self._total - 1)))
+        if self._drag == "playhead":
+            self._playhead = frame
+            self.seeked.emit(frame)
+        elif self._drag == "in":
+            self._in = min(frame, self._out)
+            self.in_changed.emit(self._in)
+        elif self._drag == "out":
+            self._out = max(frame, self._in)
+            self.out_changed.emit(self._out)
+        self.update()
+
+    # -- painting ------------------------------------------------------------
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), self.palette().window())
+        if self._total <= 0:
+            return
+        track = self._track()
+        painter.fillRect(track, QColor(38, 42, 51))
+
+        highlight = self.palette().highlight().color()
+        if self._range_mode:
+            x_in = self._frame_to_x(self._in)
+            x_out = self._frame_to_x(self._out)
+            sel = QRectF(x_in, track.top(), max(1.0, x_out - x_in), track.height())
+            fill = QColor(highlight)
+            fill.setAlpha(70)
+            painter.fillRect(sel, fill)
+            painter.setPen(QPen(highlight, 2))
+            for x in (x_in, x_out):
+                painter.drawLine(QPointF(x, track.top() - 3), QPointF(x, track.bottom() + 3))
+                # A little bracket foot so it reads as a handle.
+                foot = 6.0 if x == x_in else -6.0
+                painter.drawLine(QPointF(x, track.top() - 3), QPointF(x + foot, track.top() - 3))
+                painter.drawLine(QPointF(x, track.bottom() + 3), QPointF(x + foot, track.bottom() + 3))
+
+        # Playhead.
+        px = self._frame_to_x(self._playhead)
+        painter.setPen(QPen(QColor(240, 240, 240), 1))
+        painter.drawLine(QPointF(px, track.top() - 4), QPointF(px, track.bottom() + 4))
+        painter.setBrush(QColor(240, 240, 240))
+        painter.drawPolygon(
+            QPolygonF([
+                QPointF(px - 5, track.top() - 4),
+                QPointF(px + 5, track.top() - 4),
+                QPointF(px, track.top() + 2),
+            ])
+        )
+
+        # Labels: current time, and the selection length when ranging.
+        painter.setPen(self.palette().text().color())
+        painter.drawText(
+            QRectF(0, track.bottom() + 6, self.width(), 16),
+            Qt.AlignmentFlag.AlignLeft,
+            f"  {_fmt_tc(self._playhead, self._fps)}",
+        )
+        right = (
+            f"In {_fmt_tc(self._in, self._fps)}  Out {_fmt_tc(self._out, self._fps)}  "
+            f"({self.range_seconds():.1f}s)  "
+            if self._range_mode
+            else f"{_fmt_tc(max(0, self._total - 1), self._fps)}  "
+        )
+        painter.drawText(
+            QRectF(0, track.bottom() + 6, self.width(), 16),
+            Qt.AlignmentFlag.AlignRight,
+            right,
+        )
+
+
+def _fmt_tc(frame: int, fps: float) -> str:
+    total_seconds = frame / (fps or 24.0)
+    minutes = int(total_seconds // 60)
+    seconds = int(total_seconds % 60)
+    frames = int(round(frame % (fps or 24.0)))
+    return f"{minutes:02d}:{seconds:02d}.{frames:02d}"

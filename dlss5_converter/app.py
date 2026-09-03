@@ -64,6 +64,7 @@ from .settings import (
 )
 from .widgets import (
     DownloadDialog,
+    TimelineWidget,
     DropZone,
     ImageView,
     SideBySideView,
@@ -978,12 +979,14 @@ class VideoWorker(QObject):
 
 
 class VideoPage(QWidget):
-    """The Video tab: a clip in, a converted clip out, audio carried across.
+    """The Video tab: inspect a clip, mark a range, convert it, keep the audio.
 
     Shares the sidebar with the photo tab - the neural strengths, style, depth
-    and colour all mean the same thing on a frame of video - and adds only what
-    video needs: which codec, how hard to work each frame, and how much of the
-    clip to do.
+    and colour all mean the same thing on a frame of video - and adds a small
+    player so the clip can be scrubbed and watched before committing to a
+    conversion. The player uses QMediaPlayer (Windows Media Foundation / the
+    bundled FFmpeg backend), which handles decode, audio and sync; the app's own
+    PyAV path is for the conversion, not for playback.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -993,10 +996,37 @@ class VideoPage(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
-        self.preview = ImageView()
-        layout.addWidget(self.preview, 1)
+        # Two faces of the same area: the source video while inspecting, the
+        # converted frames while converting. A stack rather than swapping
+        # widgets in and out, so the layout never jumps.
+        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(320)
+        self.preview = ImageView()  # kept: conversion progress draws here
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.video_widget)
+        self.stack.addWidget(self.preview)
+        layout.addWidget(self.stack, 1)
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video_widget)
+
+        # Transport: play/pause and the scrub timeline together.
+        transport = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.play_button.setObjectName("secondary")
+        self.play_button.setFixedWidth(80)
+        self.play_button.setEnabled(False)
+        transport.addWidget(self.play_button)
+        self.timeline = TimelineWidget()
+        transport.addWidget(self.timeline, 1)
+        layout.addLayout(transport)
 
         pick_row = QHBoxLayout()
         self.pick_video = QPushButton("Choose video…")
@@ -1005,6 +1035,15 @@ class VideoPage(QWidget):
         pick_row.addWidget(self.pick_video)
         pick_row.addWidget(self.source_label, 1)
         layout.addLayout(pick_row)
+
+        out_row = QHBoxLayout()
+        self.pick_output = QPushButton("Output…")
+        self.pick_output.setObjectName("secondary")
+        self.output_label = QLabel("Output: choose a video first")
+        self.output_label.setObjectName("hint")
+        out_row.addWidget(self.pick_output)
+        out_row.addWidget(self.output_label, 1)
+        layout.addLayout(out_row)
 
         opts = QHBoxLayout()
         opts.addWidget(QLabel("Output"))
@@ -1031,23 +1070,21 @@ class VideoPage(QWidget):
             "passes, not the codec."
         )
         opts.addWidget(self.mode_box)
+
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Range"))
+        self.range_box = QComboBox()
+        self.range_box.addItem("Whole clip", "whole")
+        self.range_box.addItem("Select In/Out", "range")
+        self.range_box.setToolTip(
+            "Whole clip converts everything. Select In/Out shows brackets on the "
+            "timeline - drag them to the part you want, scroll to zoom in for a "
+            "precise edit. A short range is the way to test the look before "
+            "committing to a long clip."
+        )
+        opts.addWidget(self.range_box)
         opts.addStretch(1)
         layout.addLayout(opts)
-
-        range_row = QHBoxLayout()
-        self.whole = QCheckBox("Whole clip")
-        self.whole.setChecked(True)
-        range_row.addWidget(self.whole)
-        range_row.addWidget(QLabel("or first"))
-        self.seconds = QSpinBox()
-        self.seconds.setRange(1, 3600)
-        self.seconds.setValue(5)
-        self.seconds.setSuffix(" s")
-        self.seconds.setEnabled(False)
-        self.seconds.setToolTip("Convert a few seconds first to check the look before the whole thing.")
-        self.whole.toggled.connect(lambda on: self.seconds.setEnabled(not on))
-        range_row.addWidget(self.seconds)
-        range_row.addStretch(1)
 
         self.estimate_depth = QCheckBox("Estimate depth per frame")
         self.estimate_depth.setToolTip(
@@ -1056,8 +1093,7 @@ class VideoPage(QWidget):
             "so this changes nothing in the output and is by far the slowest "
             "step. Here only for parity with the photo path."
         )
-        range_row.addWidget(self.estimate_depth)
-        layout.addLayout(range_row)
+        layout.addWidget(self.estimate_depth)
 
         self.info_label = QLabel("")
         self.info_label.setObjectName("hint")
@@ -1078,6 +1114,12 @@ class VideoPage(QWidget):
         run_row.addWidget(self.stop)
         run_row.addWidget(self.start)
         layout.addLayout(run_row)
+
+    def show_video(self) -> None:
+        self.stack.setCurrentWidget(self.video_widget)
+
+    def show_preview(self) -> None:
+        self.stack.setCurrentWidget(self.preview)
 
 
 class SequenceWorker(QObject):
@@ -2540,9 +2582,70 @@ class MainWindow(QMainWindow):
     def _wire_video_page(self) -> None:
         page = self.video_page
         page.pick_video.clicked.connect(self._pick_video)
+        page.pick_output.clicked.connect(self._pick_video_output)
         page.start.clicked.connect(self._start_video)
         page.stop.clicked.connect(self._stop_video)
         page.mode_box.currentIndexChanged.connect(self._video_mode_changed)
+        page.range_box.currentIndexChanged.connect(self._video_range_changed)
+        page.play_button.clicked.connect(self._toggle_video_play)
+        # Player <-> timeline. The player drives the playhead as it advances;
+        # the timeline drives the player when the user scrubs. Both talk in
+        # milliseconds to the player and frames to the timeline.
+        page.player.positionChanged.connect(self._video_position_changed)
+        page.player.playbackStateChanged.connect(self._video_playback_state)
+        page.timeline.seeked.connect(self._video_scrub)
+        page.output_path: Path | None = None
+
+    def _video_fps(self) -> float:
+        info = self.video_page.info
+        return info.fps if info and info.fps else 24.0
+
+    def _frame_to_ms(self, frame: int) -> int:
+        return int(round(frame / self._video_fps() * 1000))
+
+    def _ms_to_frame(self, ms: int) -> int:
+        return int(round(ms / 1000 * self._video_fps()))
+
+    def _toggle_video_play(self) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        player = self.video_page.player
+        if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            player.pause()
+        else:
+            self.video_page.show_video()
+            player.play()
+
+    def _video_playback_state(self, state) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.video_page.play_button.setText("Pause" if playing else "Play")
+
+    def _video_position_changed(self, ms: int) -> None:
+        # Do not fight the user while they are dragging the playhead.
+        if not self.video_page.timeline._drag:
+            self.video_page.timeline.set_playhead(self._ms_to_frame(ms))
+
+    def _video_scrub(self, frame: int) -> None:
+        self.video_page.show_video()
+        self.video_page.player.setPosition(self._frame_to_ms(frame))
+
+    def _video_range_changed(self) -> None:
+        page = self.video_page
+        page.timeline.set_range_mode(page.range_box.currentData() == "range")
+
+    def _pick_video_output(self) -> None:
+        page = self.video_page
+        codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
+        stem = page.source.stem if page.source else "video"
+        start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5{codec.suffix}"))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Output video", start_dir, f"{codec.label} (*{codec.suffix})"
+        )
+        if chosen:
+            page.output_path = Path(chosen)
+            page.output_label.setText(f"Output: {chosen}")
 
     def _pick_video(self) -> None:
         exts = " ".join(f"*{s}" for s in sorted(video.INPUT_SUFFIXES))
@@ -2565,17 +2668,29 @@ class MainWindow(QMainWindow):
         except Exception as error:  # noqa: BLE001
             QMessageBox.warning(self, "Could not open video", str(error))
             return
-        self.video_page.source = path
-        self.video_page.info = info
-        self.video_page.source_label.setText(path.name)
-        self.video_page.info_label.setText(info.describe())
-        self.video_page.start.setEnabled(True)
-        # Show frame one so the tab is not blank before a run.
-        try:
-            first = next(video.frames(path, limit=1))
-            self.video_page.preview.set_image(_downscale_for_preview(first), path.name)
-        except Exception:  # noqa: BLE001 - a preview is a nicety, not required
-            pass
+        from PySide6.QtCore import QUrl
+
+        page = self.video_page
+        page.source = path
+        page.info = info
+        page.source_label.setText(path.name)
+        page.info_label.setText(info.describe())
+        page.start.setEnabled(True)
+        page.play_button.setEnabled(True)
+
+        # Load it into the player and lay out the timeline. A frame count of 0
+        # (some containers do not report one) still gives a usable scrubber via
+        # the duration the player reports.
+        page.timeline.set_duration(info.frames or max(1, round(info.duration * info.fps)), info.fps)
+        page.timeline.set_range_mode(page.range_box.currentData() == "range")
+        page.player.setSource(QUrl.fromLocalFile(str(path)))
+        page.show_video()
+
+        # A default output beside the app, so Convert works without a detour
+        # through the Output picker - but the picker can override it.
+        codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
+        page.output_path = paths.output_dir() / f"{path.stem}_dlss5{codec.suffix}"
+        page.output_label.setText(f"Output: {page.output_path}")
 
     def _video_mode_changed(self) -> None:
         self.settings.evaluation.frames = int(self.video_page.mode_box.currentData() or 1)
@@ -2587,22 +2702,31 @@ class MainWindow(QMainWindow):
         if not video.is_available():
             self._download_video_support(then=self._start_video)
             return
+        if page.output_path is None:
+            self._pick_video_output()
+            if page.output_path is None:
+                return
+        output = page.output_path
 
-        codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
-        default = paths.output_dir() / f"{page.source.stem}_dlss5{codec.suffix}"
-        chosen, _ = QFileDialog.getSaveFileName(
-            self, "Save video", str(default), f"{codec.label} (*{codec.suffix})"
-        )
-        if not chosen:
-            return
+        # Playback holds a read handle on the source; stop it before a run so
+        # nothing contends, and free the preview area to show converted frames.
+        page.player.stop()
+        page.show_preview()
 
         self.settings.evaluation.frames = int(page.mode_box.currentData() or 1)
+
+        # The range comes from the timeline's In/Out when ranging, else the
+        # whole clip. Frames, inclusive of Out, which is why limit is +1.
+        start = 0
         limit = None
-        if not page.whole.isChecked() and page.info is not None:
-            limit = max(1, round(page.seconds.value() * page.info.fps))
+        if page.range_box.currentData() == "range":
+            in_frame, out_frame = page.timeline.in_out()
+            start = in_frame
+            limit = max(1, out_frame - in_frame + 1)
 
         page.start.setEnabled(False)
         page.pick_video.setEnabled(False)
+        page.play_button.setEnabled(False)
         page.stop.setVisible(True)
         page.bar.setVisible(True)
         page.bar.setValue(0)
@@ -2611,8 +2735,8 @@ class MainWindow(QMainWindow):
 
         self._video_thread = QThread(self)
         self._video_worker = VideoWorker(
-            page.source, Path(chosen), self.settings, self.engine,
-            page.codec_box.currentData(), 0, limit,
+            page.source, output, self.settings, self.engine,
+            page.codec_box.currentData(), start, limit,
             page.estimate_depth.isChecked(),
         )
         self._video_worker.moveToThread(self._video_thread)
@@ -2665,6 +2789,7 @@ class MainWindow(QMainWindow):
         page = self.video_page
         page.start.setEnabled(page.source is not None)
         page.pick_video.setEnabled(True)
+        page.play_button.setEnabled(page.source is not None)
         page.stop.setVisible(False)
 
     def _download_video_support(self, then) -> None:
@@ -3471,6 +3596,11 @@ class MainWindow(QMainWindow):
         # feeding a harness after the window has closed.
         if self._video_worker is not None:
             self._video_worker.stop()
+        # Release the media player's handle on the source file.
+        try:
+            self.video_page.player.stop()
+        except Exception:  # noqa: BLE001 - closing must not fail
+            pass
         for thread in (
             self._thread,
             self._depth_thread,

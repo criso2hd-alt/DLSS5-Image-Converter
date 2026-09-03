@@ -141,6 +141,10 @@ $ErrorActionPreference = "Continue"
     --hidden-import argparse `
     --hidden-import importlib.metadata `
     --hidden-import importlib.machinery `
+    --hidden-import PySide6.QtMultimedia `
+    --hidden-import PySide6.QtMultimediaWidgets `
+    --collect-all PySide6.QtMultimedia `
+    --collect-all PySide6.QtMultimediaWidgets `
     --collect-all transformers `
     --collect-all tokenizers `
     --collect-data safetensors `
