@@ -10,24 +10,37 @@ This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of t
 > this project will not help you obtain them. You point it at the copies you
 > already have.
 
-The same frame, before and after. The blue line is the wipe divider — drag it
-across the image to compare; everything left of it is the original.
+## See it
 
-**Before** — divider at the right, so this is almost entirely the source image:
+The wipe divider — drag it across the image to compare. Everything on one side
+is the source, the other the DLSS 5 neural pass. The Before/After labels stay
+pinned to the frame corners as you zoom.
 
-![Before: the source frame](app_images_examples/001.webp)
+![Before/after wipe, divider near the right](app_images_examples/beforesplit.png)
 
-**After** — divider at the left, so this is the DLSS 5 neural pass, at Intensity,
-Skin, Local Tone and Structure 2.00, Preset #1, Cinematic, 8 passes:
+![Before/after wipe, divider near the left — the neural pass at full strength](app_images_examples/aftersplit.png)
 
-![After: the neural pass at full strength](app_images_examples/002.webp)
+**Compare styles** converts the image as both Natural and Cinematic at once, so
+you choose between them instead of guessing. Two panes, or three with the source
+alongside — every pane shares one zoom and pan.
 
-The controls on the right map straight onto the RenoDX add-on's own.
+![Compare styles, three panes: Original, Natural, Cinematic](app_images_examples/comparestyle3up.png)
 
-![The depth mask](app_images_examples/003.webp)
+**Video**, with audio. Scrub and play the clip, set In/Out on the timeline
+(scroll to zoom it), and export H.264/MP4 hardware-encoded — the format every
+editor takes.
 
-Depth is estimated the moment you open an image, so you can judge the mask — and
-tune its contrast live — before spending a DLSS pass on it. Near is red.
+![The video tab, an In/Out range set on the timeline](app_images_examples/videotrimmed.png)
+
+**Depth mask**, estimated the moment you open an image, so you can judge it —
+and tune its contrast live — before spending a DLSS pass. Near is red.
+
+![The depth mask view](app_images_examples/depthpass.png)
+
+More, in [`app_images_examples/`](app_images_examples/) and the
+[wiki tour](https://github.com/criso2hd-alt/DLSS5-Image-Converter/wiki/Tour):
+colour grading, the difference view, full-resolution zoom, folder batches,
+image sequences, and "Find my DLSS files".
 
 ---
 
