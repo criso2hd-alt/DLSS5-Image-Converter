@@ -245,6 +245,57 @@ def run_selftest() -> int:
             _line(f"conversion       : FAILED - {type(error).__name__}: {error}")
             failures += 1
 
+    # The video path, end to end, in the environment the app actually ships as.
+    # This is the reproduction for "crashes to desktop when I convert a video":
+    # the frozen build downloads PyAV here and loads its FFmpeg alongside the
+    # bundled OpenCV, which is the one combination dev never exercises. If it is
+    # going to crash natively, it crashes here - and crashlog/faulthandler has
+    # the stack. Guarded so a machine offline just skips it.
+    if "--with-video" in sys.argv:
+        try:
+            import numpy as np
+
+            from . import video
+            from .depth_engine import DepthEngine
+            from .pipeline import convert_video
+            from .settings import AppSettings
+
+            if not video.is_available():
+                _line("video component  : downloading PyAV...")
+                from . import bootstrap
+
+                bootstrap.install_av(on_text=lambda m: None)
+            _line(f"video component  : {'ok' if video.is_available() else 'FAILED'}")
+
+            clip = paths.scratch_dir() / "selftest_clip.mp4"
+            import av
+
+            with av.open(str(clip), mode="w") as container:
+                vs = container.add_stream("libx264", rate=24)
+                vs.width, vs.height, vs.pix_fmt = 256, 144, "yuv420p"
+                for i in range(8):
+                    frame = av.VideoFrame.from_ndarray(
+                        np.full((144, 256, 3), i * 20, np.uint8), format="rgb24"
+                    )
+                    for pkt in vs.encode(frame):
+                        container.mux(pkt)
+                for pkt in vs.encode():
+                    container.mux(pkt)
+
+            out = paths.scratch_dir() / "selftest_clip_dlss5.mp4"
+            settings = AppSettings()
+            settings.evaluation.frames = 1
+            settings.evaluation.max_edge = 256
+            done = 0
+            for _update in convert_video(clip, out, settings, DepthEngine(), codec_key="h264"):
+                done += 1
+            info = video.probe(out)
+            _line(f"video conversion : ok {info.width}x{info.height}, {info.frames} frames")
+        except Exception as error:  # noqa: BLE001
+            _line(f"video conversion : FAILED - {type(error).__name__}: {error}")
+            failures += 1
+        _line("")
+
     # --- what the add-on itself said -------------------------------------
     #
     # The probe can only report whether nvngx_dlssnr.dll ended up in the

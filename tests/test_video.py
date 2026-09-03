@@ -202,3 +202,29 @@ def test_the_video_tab_handlers_exist_on_the_window(qt_app):
                  "_video_frame_done", "_video_finished", "_video_teardown",
                  "_download_video_support"):
         assert hasattr(MainWindow, name), name
+
+
+@pyav
+def test_nvenc_is_used_at_a_real_size(tmp_path):
+    """The hardware path the default relies on, at a size NVENC accepts."""
+    from dlss5_converter import video
+    assert video._encoder_opens("h264_nvenc", video.CODECS_BY_KEY["h264"], 24, (320, 180))
+
+
+@pyav
+def test_a_tiny_frame_falls_back_to_software(tmp_path):
+    """NVENC refuses frames below its minimum; the export must still happen.
+
+    This is the bug that shipped: NVENC's add_stream succeeds and it only fails
+    on the first encode, so the fallback never fired and the whole conversion
+    died with avcodec_open2 ... returned 22.
+    """
+    from dlss5_converter import video
+    assert not video._encoder_opens("h264_nvenc", video.CODECS_BY_KEY["h264"], 24, (128, 72))
+    out = tmp_path / "tiny.mp4"
+    writer = video.VideoWriter(out, video.CODECS_BY_KEY["h264"], 24, (128, 72))
+    assert writer.encoder_used == "libx264", "must fall back, not fail"
+    for _ in range(4):
+        writer.write(np.zeros((72, 128, 3), np.float32))
+    writer.close()
+    assert video.probe(out).frames == 4

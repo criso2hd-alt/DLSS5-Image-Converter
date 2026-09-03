@@ -14,6 +14,14 @@ for _name in ("stdout", "stderr"):
     if getattr(sys, _name, None) is None:
         setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
+# Right after the streams are safe and before anything heavy is imported: turn a
+# silent "crashes to desktop" into a written crash.log. A windowed build has no
+# console and the guard above sends stderr to the void, so without this a crash -
+# Python or native - leaves nothing to diagnose.
+from dlss5_converter import crashlog  # noqa: E402
+
+crashlog.install()
+
 from dlss5_converter.app import main  # noqa: E402 - must follow the guard above
 
 if __name__ == "__main__":

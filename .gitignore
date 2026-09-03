@@ -24,3 +24,10 @@ native/bin/
 # and the app needs no sample data to run.
 sample_image/
 *.log
+
+# Local test media, not for the repo (large, and not ours to redistribute)
+sample_video/
+*.mp4
+*.mov
+*.mkv
+*.webm

@@ -116,26 +116,60 @@ def probe(path: str | Path) -> VideoInfo:
         )
 
 
-def _pick_encoder(container, codec: Codec, fps: float, size: tuple[int, int]):
-    """Add a video stream, preferring the hardware encoder, then software.
+def _encoder_opens(name: str, codec: Codec, fps: float, size: tuple[int, int]) -> bool:
+    """Whether this encoder will actually open and take a frame, here and now.
 
-    NVENC is guaranteed present on the machines this app runs on - DLSS needs an
-    RTX card - but a driver or a locked-down system can still refuse it, and a
-    silent fall back to libx264 is far better than failing the whole export.
+    This is the fix for a real failure: ``add_stream`` succeeds for NVENC even
+    when NVENC cannot run - the codec is only opened on the first frame, so a
+    driver refusing it, a consumer GPU's concurrent-session cap, or a frame
+    below NVENC's minimum size all surface as
+    ``avcodec_open2("h264_nvenc") returned 22`` at encode time, far from the
+    stream setup. Probing with a standalone context here, before committing the
+    output stream, is what lets the libx264 fallback actually happen instead of
+    the whole conversion dying.
+    """
+    import av
+
+    width, height = size
+    try:
+        ctx = av.CodecContext.create(name, "w")
+        ctx.width, ctx.height = width, height
+        ctx.pix_fmt = codec.pix_fmt
+        ctx.framerate = Fraction(fps).limit_denominator(90000)
+        ctx.open()
+        probe = av.VideoFrame(width, height, codec.pix_fmt)
+        ctx.encode(probe)  # forces avcodec_open2 and one real encode
+        # No explicit close: PyAV's codec context has none and frees on GC.
+        # Flushing here is unnecessary - the point was only to prove it opens.
+        return True
+    except Exception:  # noqa: BLE001 - a probe failure just means "try the next"
+        return False
+
+
+def _pick_encoder(container, codec: Codec, fps: float, size: tuple[int, int]):
+    """Add a video stream with the first encoder that actually works.
+
+    NVENC is the default because DLSS already requires an RTX card, so hardware
+    encoding is normally free - but "present" is not "usable": another app may
+    hold every NVENC session, a laptop may gate it, a driver may refuse it. Each
+    candidate is opened for real before it is chosen, and libx264 (always
+    available, CPU) is the guaranteed floor.
     """
     width, height = size
-    last_error: Exception | None = None
     for name in (codec.encoder, codec.fallback):
+        if name != codec.fallback and not _encoder_opens(name, codec, fps, size):
+            continue
         try:
             stream = container.add_stream(name, rate=Fraction(fps).limit_denominator(90000))
             stream.width = width
             stream.height = height
             stream.pix_fmt = codec.pix_fmt
             return stream, name
-        except Exception as error:  # noqa: BLE001 - try the next encoder
-            last_error = error
+        except Exception:  # noqa: BLE001 - fall through to the software floor
+            continue
     raise RuntimeError(
-        f"No usable encoder for {codec.label}: {last_error}"
+        f"No usable encoder for {codec.label}. Even the software encoder "
+        f"({codec.fallback}) would not open at {width}x{height}."
     )
 
 
