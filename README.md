@@ -1,8 +1,8 @@
-# DLSS 5 Image Converter
+# DLSS 5 Image & Video Converter
 
-Run NVIDIA's DLSS 5 neural renderer over a **still image** instead of a game frame.
-Drag and drop, paste (Ctrl+V), or browse. Free to use; please link here rather
-than reuploading.
+Run NVIDIA's DLSS 5 neural renderer over a **still image or a video** instead of a
+game frame. Drag and drop, paste (Ctrl+V), or browse. Free to use; please link
+here rather than reuploading.
 
 This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of the look.
 
