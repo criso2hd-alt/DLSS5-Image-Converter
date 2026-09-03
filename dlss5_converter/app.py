@@ -197,6 +197,12 @@ class StyleWorker(QObject):
     """
 
     progress = Signal(str)
+    #: A style is about to be converted. The pane showing it starts sweeping.
+    started = Signal(int)
+    #: One style is finished. Emitted as it lands rather than at the end, so
+    #: each pane fills in as soon as it has something to show instead of the
+    #: whole comparison appearing at once after both conversions.
+    one_done = Signal(int, object)
     finished = Signal(object)  # dict[int, pipeline.Result]
     failed = Signal(str)
 
@@ -244,9 +250,12 @@ class StyleWorker(QObject):
                         f"{name} ({position} of {len(self._styles)}) — {message}"
                     )
 
-                results[style] = pipeline.convert(
+                self.started.emit(style)
+                result = pipeline.convert(
                     self._path, settings, self._engine, progress=say, prepared=prepared
                 )
+                results[style] = result
+                self.one_done.emit(style, result)
         except Exception as error:  # noqa: BLE001 - the UI is the error handler
             self.failed.emit(str(error))
             return
@@ -1240,6 +1249,13 @@ class MainWindow(QMainWindow):
         self.style_results: dict[int, pipeline.Result] = {}
         self._style_signature_used: tuple | None = None
         self._style_worker: StyleWorker | None = None
+        #: The style being converted right now, so its pane knows to sweep.
+        self._style_running: int | None = None
+        #: How far that style has got, kept here because redrawing the panes
+        #: resets their sweep state and it has to be put back.
+        self._style_fraction = 0.0
+        #: The view whose sweep is running, if any.
+        self._sweeping = None
 
         # Debounce. A slider drag emits a change per pixel and each one costs a
         # harness restart, so wait for the drag to settle before spending one.
@@ -1558,9 +1574,17 @@ class MainWindow(QMainWindow):
         self.style_results = {}
         self._style_signature_used = self._style_signature()
         self.convert_button.setEnabled(False)
-        self.view_styles.setEnabled(False)
+        self._style_running = None
+        self._style_fraction = 0.0
 
-        self._begin_progress()
+        # Straight to the layout it is going to end up in, filled with the
+        # source and swept per pane. Showing a full-screen "working" view first
+        # and snapping to panels at the end makes the wait feel like a
+        # different operation from the thing it produces.
+        self._show_style_placeholders()
+        # After the placeholders: showing them calls _set_view_state, which
+        # would otherwise switch this straight back on.
+        self.view_styles.setEnabled(False)
 
         self._thread = QThread(self)
         self._style_worker = StyleWorker(
@@ -1570,9 +1594,55 @@ class MainWindow(QMainWindow):
         self._style_worker.moveToThread(self._thread)
         self._thread.started.connect(self._style_worker.run)
         self._style_worker.progress.connect(self._report_progress)
+        self._style_worker.started.connect(self._style_started)
+        self._style_worker.one_done.connect(self._style_one_done)
         self._style_worker.finished.connect(self._styles_ready)
         self._style_worker.failed.connect(self._styles_failed)
         self._thread.start()
+
+    def _show_style_placeholders(self) -> None:
+        """The comparison layout, before there is anything to compare.
+
+        Every pane starts as the source image. The ones waiting on a style are
+        swept; an Original pane is not, because nothing is being computed for
+        it - it is already what it will be.
+        """
+        if self.prepared is None:
+            return
+        count = self._pane_count()
+        source = self._graded_source()
+        view = self._style_view()
+        if view is self.side_by_side:
+            view.set_panes_u8([source] * count)
+        else:
+            view.set_images_u8(source, source)
+        view.set_labels(*[self._pane_source(i)[0] for i in range(count)])
+        self.stack.setCurrentWidget(view)
+        self._set_view_state("styles")
+        self.style_caption.setText("Converting each style…")
+
+    def _graded_source(self) -> np.ndarray:
+        """The source at preview size, graded like the results will be."""
+        assert self.prepared is not None
+        small = _downscale_for_preview(self.prepared.source)
+        linear = contract.srgb_to_linear(np.clip(small, 0.0, 1.0).astype(np.float32))
+        return grade.apply_preview(linear, self.settings.grade)
+
+    def _style_started(self, style: int) -> None:
+        self._style_running = style
+        self._style_fraction = 0.0
+        if self._view != "styles":
+            return
+        for index, box in enumerate(self.style_choices):
+            if box.currentData() == style and index < self._pane_count():
+                self.side_by_side.set_pane_progress(index, 0.0)
+
+    def _style_one_done(self, style: int, result: object) -> None:
+        """Drop one finished style into its pane without waiting for the rest."""
+        self.style_results[style] = result
+        self._style_running = None
+        if self._view == "styles":
+            self._render_styles()
 
     def _styles_ready(self, results: dict) -> None:
         self.style_results = results
@@ -1594,6 +1664,7 @@ class MainWindow(QMainWindow):
 
     def _style_teardown(self) -> None:
         self._end_progress()
+        self._style_running = None
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -1601,6 +1672,10 @@ class MainWindow(QMainWindow):
         self._style_worker = None
         self.convert_button.setEnabled(self.image_path is not None)
         self.view_styles.setEnabled(self.image_path is not None)
+        # Settings that moved while this run was in flight, same as _teardown.
+        if self._preview_pending:
+            self._preview_pending = False
+            self._schedule_preview()
 
     def _style_view(self):
         """Whichever comparison widget the layout box is set to."""
@@ -1651,8 +1726,13 @@ class MainWindow(QMainWindow):
         return NR_STYLES[style], self.style_results.get(style)
 
     def _render_styles(self) -> None:
-        """Draw the chosen panes, graded identically, into the chosen layout."""
-        if len(self.style_results) < len(NR_STYLES):
+        """Draw the chosen panes, graded identically, into the chosen layout.
+
+        Tolerates a half-finished comparison: a pane whose style has not been
+        converted yet shows the source, swept, rather than blocking the whole
+        view until everything is ready.
+        """
+        if self.prepared is None:
             return
         count = self._pane_count()
         for index, box in enumerate(self.style_choices):
@@ -1660,14 +1740,15 @@ class MainWindow(QMainWindow):
 
         images: list[np.ndarray] = []
         labels: list[str] = []
+        pending: list[int] = []
         for index in range(count):
             label, result = self._pane_source(index)
             if result is None:
-                # The source, graded like everything else. Comparing a graded
-                # result against an ungraded source would show the grade rather
-                # than the neural pass, which is the opposite of the point.
-                any_result = next(iter(self.style_results.values()))
-                images.append(self._graded_preview(any_result, original=True))
+                # Either the Original pane, or a style still being converted.
+                # Both show the source; only the second one sweeps.
+                images.append(self._graded_source())
+                if self.style_choices[index].currentData() != -1:
+                    pending.append(index)
             else:
                 images.append(self._graded_preview(result))
             labels.append(label)
@@ -1678,6 +1759,14 @@ class MainWindow(QMainWindow):
         else:
             view.set_images_u8(images[0], images[1])
         view.set_labels(*labels)
+        # set_panes_u8 clears the sweep state, so re-arm whatever is still
+        # outstanding after the redraw rather than before it.
+        if view is self.side_by_side:
+            for index in pending:
+                running = self.style_choices[index].currentData() == self._style_running
+                self.side_by_side.set_pane_progress(
+                    index, self._style_fraction if running else 0.0
+                )
 
         how = (
             "Scroll to zoom, right-drag to pan - every pane moves together."
@@ -1824,8 +1913,11 @@ class MainWindow(QMainWindow):
             self._set_view_state(which)
             return
 
-        # Leaving the styles view puts the wipe back to source-versus-result.
-        self.wipe.set_labels()
+        # Leaving the styles view puts the wipe back to source-versus-result,
+        # which is what its labels should say. Named rather than left to be
+        # inferred from the drag: which half is which is obvious once you move
+        # the divider, and not obvious at all before you do.
+        self.wipe.set_labels("Before", "After")
         self.side_by_side.clear()
 
         if which == "difference":
@@ -1859,7 +1951,11 @@ class MainWindow(QMainWindow):
         self.view_depth.setEnabled(self.prepared is not None)
         self.view_result.setEnabled(self.result is not None)
         self.view_photo.setEnabled(self.prepared is not None)
-        self.view_styles.setEnabled(self.image_path is not None and self._thread is None)
+        # Not "and no thread is running": _set_view_state is called while a run
+        # is in flight and not again when it ends, so keying the button on the
+        # thread left it disabled for the rest of the session. Runs disable it
+        # explicitly and the teardowns turn it back on.
+        self.view_styles.setEnabled(self.image_path is not None)
         self.style_panel.setVisible(which == "styles")
 
     def _render_depth_preview(self) -> None:
@@ -2661,8 +2757,27 @@ class MainWindow(QMainWindow):
             return
         self._preview_timer.start()
 
+    def _rerun_for_settings(self) -> bool:
+        """Handle a settings change while the style comparison is showing.
+
+        It was falling through to an ordinary preview, which converts once and
+        then switches to the result view - so changing a slider silently threw
+        you out of the comparison you were in the middle of reading. In that
+        view a settings change invalidates both panes, so both are redone and
+        the view stays put.
+        """
+        if self._view != "styles" or self.image_path is None:
+            return False
+        if self._thread is not None:
+            self._preview_pending = True
+            return True
+        self._start_style_comparison()
+        return True
+
     def _run_preview(self) -> None:
         if not self.settings.evaluation.live_preview or self.image_path is None:
+            return
+        if self._rerun_for_settings():
             return
         if self._thread is not None:
             # A run is already in flight and its settings are now stale. Mark it
@@ -2692,10 +2807,11 @@ class MainWindow(QMainWindow):
         self.convert_button.setEnabled(False)
         if not preview:
             self.save_button.setEnabled(False)
-            # Deliberately not on preview re-runs: those fire on a slider drag
-            # while the user is looking at the result, and yanking the view
-            # back to the source every time would be worse than no feedback.
-            self._begin_progress()
+        # Preview runs sweep too. They used to be excluded because the sweep
+        # moved the view; now it stays where it is, so a slider nudge shows the
+        # after half recomputing against the before half you were comparing it
+        # to - which is the whole reason to be on that view.
+        self._begin_progress()
 
         self._thread = QThread(self)
         self._worker = Worker(self.image_path, self.settings, self.engine, self.prepared)
@@ -2707,14 +2823,39 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _begin_progress(self) -> None:
-        """Show the source image, drained of colour, ready to refill."""
-        if self.prepared is None:
-            return
-        self.show_view("photo")
-        self.depth_view.set_progress(0.0)
+        """Start the sweep on whatever is already on screen.
+
+        Deliberately does not move the user. An earlier version pulled the view
+        back to the source for every run, which is wrong for the case that
+        matters most: nudging a slider while watching the result. There the
+        thing you want is the previous result still in front of you, with the
+        after half working - not the source image and no comparison at all.
+        """
+        if self._view == "result" and self.result is not None:
+            self._sweeping = self.wipe
+            self.wipe.set_progress(0.0)
+        elif self.prepared is not None:
+            self.show_view("photo")
+            self._sweeping = self.depth_view
+            self.depth_view.set_progress(0.0)
 
     def _end_progress(self) -> None:
         self.depth_view.set_progress(None)
+        self.wipe.set_progress(None)
+        self.side_by_side.clear_progress()
+        self._sweeping = None
+
+    def _sweep(self, fraction: float) -> None:
+        """Move whichever sweep is running to `fraction`."""
+        if self._view == "styles":
+            # One pane per style, and only the style being converted now.
+            self._style_fraction = fraction
+            for index, box in enumerate(self.style_choices):
+                if box.currentData() == self._style_running:
+                    self.side_by_side.set_pane_progress(index, fraction)
+            return
+        if self._sweeping is not None:
+            self._sweeping.set_progress(fraction)
 
     def _report_progress(self, message: str) -> None:
         """Status text, and the colour sweep if this message carries a count.
@@ -2726,13 +2867,12 @@ class MainWindow(QMainWindow):
         simply stops advancing, which is a harmless way to fail.
         """
         self.statusBar().showMessage(message)
-        if self.depth_view._progress is None:
-            return
         match = _PASS_COUNT.search(message)
-        if match:
-            done, total = int(match.group(1)), int(match.group(2))
-            if total > 0:
-                self.depth_view.set_progress(done / total)
+        if not match:
+            return
+        done, total = int(match.group(1)), int(match.group(2))
+        if total > 0:
+            self._sweep(done / total)
 
     def _teardown(self) -> None:
         self._end_progress()

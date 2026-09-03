@@ -117,6 +117,56 @@ class DropZone(QFrame):
         self.style().polish(self)
 
 
+def desaturated(pixmap: QPixmap) -> QPixmap:
+    """A greyscale copy, built once and reused while a sweep runs."""
+    return QPixmap.fromImage(
+        pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+    )
+
+
+def paint_sweep(
+    painter: QPainter,
+    rect: QRectF,
+    colour: QPixmap,
+    grey: QPixmap,
+    progress: float,
+    highlight: QColor,
+) -> None:
+    """Grey above the line, full colour below it, sweeping upward.
+
+    Shared by every view that can be recomputed - the single image, the
+    before/after wipe, and each pane of the style comparison - so "this is
+    being worked on" looks the same wherever it appears. A different treatment
+    per view would read as different states rather than the same one.
+    """
+    painter.drawPixmap(rect, grey, QRectF(grey.rect()))
+    # Knock the grey back as well as desaturating it. Grey alone at full
+    # brightness reads as a deliberate black-and-white treatment rather than
+    # as something unfinished.
+    painter.fillRect(rect, QColor(6, 8, 12, 90))
+
+    line = rect.bottom() - rect.height() * progress
+    if progress > 0.0:
+        painter.save()
+        painter.setClipRect(QRectF(rect.left(), line, rect.width(), rect.bottom() - line))
+        painter.drawPixmap(rect, colour, QRectF(colour.rect()))
+        painter.restore()
+
+    # A soft edge on the boundary, so the sweep reads as a moving front rather
+    # than as an image cut in half.
+    if 0.0 < progress < 1.0:
+        glow = QLinearGradient(0.0, line - 26.0, 0.0, line + 2.0)
+        faded = QColor(highlight)
+        faded.setAlpha(0)
+        edge = QColor(highlight)
+        edge.setAlpha(120)
+        glow.setColorAt(0.0, faded)
+        glow.setColorAt(1.0, edge)
+        painter.fillRect(QRectF(rect.left(), line - 26.0, rect.width(), 28.0), QBrush(glow))
+        painter.setPen(QPen(highlight, 1))
+        painter.drawLine(QPointF(rect.left(), line), QPointF(rect.right(), line))
+
+
 class CanvasView(QWidget):
     """Shared zoom and pan for the image views.
 
@@ -299,9 +349,7 @@ class ImageView(CanvasView):
         if self._grey is None and self._pixmap is not None:
             # Built once per run rather than per repaint: at 8K this is a
             # 33-megapixel conversion and the bar moves eight times.
-            self._grey = QPixmap.fromImage(
-                self._pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
-            )
+            self._grey = desaturated(self._pixmap)
         self._progress = float(np.clip(fraction, 0.0, 1.0))
         self.update()
 
@@ -332,37 +380,11 @@ class ImageView(CanvasView):
         self.set_pixmap(None)
 
     def _paint_progress(self, painter: QPainter, rect: QRectF) -> None:
-        """Grey above the line, full colour below it, sweeping upward."""
         assert self._pixmap is not None and self._grey is not None
-        painter.drawPixmap(rect, self._grey, QRectF(self._grey.rect()))
-        # Knock the grey back as well as desaturating it. Grey alone at full
-        # brightness reads as a deliberate black-and-white treatment rather
-        # than as something unfinished.
-        painter.fillRect(rect, QColor(6, 8, 12, 90))
-
-        line = rect.bottom() - rect.height() * self._progress
-        if self._progress > 0.0:
-            done = QRectF(rect.left(), line, rect.width(), rect.bottom() - line)
-            painter.save()
-            painter.setClipRect(done)
-            painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
-            painter.restore()
-
-        # A soft edge on the boundary, so the sweep reads as a moving front
-        # rather than as an image cut in half.
-        if 0.0 < self._progress < 1.0:
-            glow = QLinearGradient(0.0, line - 26.0, 0.0, line + 2.0)
-            highlight = QColor(self.palette().highlight().color())
-            highlight.setAlpha(0)
-            glow.setColorAt(0.0, highlight)
-            edge = QColor(self.palette().highlight().color())
-            edge.setAlpha(120)
-            glow.setColorAt(1.0, edge)
-            painter.fillRect(
-                QRectF(rect.left(), line - 26.0, rect.width(), 28.0), QBrush(glow)
-            )
-            painter.setPen(QPen(self.palette().highlight().color(), 1))
-            painter.drawLine(QPointF(rect.left(), line), QPointF(rect.right(), line))
+        paint_sweep(
+            painter, rect, self._pixmap, self._grey,
+            self._progress or 0.0, self.palette().highlight().color(),
+        )
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
@@ -406,7 +428,27 @@ class WipeView(CanvasView):
         self._split = 0.5
         self._dragging = False
         self._labels: tuple[str, str] | None = None
+        self._progress: float | None = None
+        self._grey: QPixmap | None = None
         self.setMouseTracking(True)
+
+    def set_progress(self, fraction: float | None) -> None:
+        """Sweep the *after* half while a new result is being computed.
+
+        Only the after half, deliberately. The before image is not being
+        recomputed, and greying it out would suggest otherwise; leaving it
+        alone also means the comparison stays readable throughout - you keep
+        the previous result to look at rather than an empty view.
+        """
+        if fraction is None:
+            self._progress = None
+            self._grey = None
+            self.update()
+            return
+        if self._grey is None and self._after is not None:
+            self._grey = desaturated(self._after)
+        self._progress = float(np.clip(fraction, 0.0, 1.0))
+        self.update()
 
     def set_labels(self, left: str = "", right: str = "") -> None:
         """Name the two halves, for a comparison that is not before/after.
@@ -431,6 +473,7 @@ class WipeView(CanvasView):
         ).size()
         self._before = QPixmap.fromImage(to_qimage(before))
         self._after = QPixmap.fromImage(to_qimage(after))
+        self._grey = None
         if changed:
             self.reset_view()
         self.update()
@@ -441,6 +484,7 @@ class WipeView(CanvasView):
         changed = self._before is None or self._before.size() != pixmap.size()
         self._before = pixmap
         self._after = QPixmap.fromImage(to_qimage_u8(after))
+        self._grey = None
         if changed:
             self.reset_view()
         self.update()
@@ -461,7 +505,13 @@ class WipeView(CanvasView):
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = self._target_rect()
-        painter.drawPixmap(rect, self._after, QRectF(self._after.rect()))
+        if self._progress is not None and self._grey is not None:
+            paint_sweep(
+                painter, rect, self._after, self._grey,
+                self._progress, self.palette().highlight().color(),
+            )
+        else:
+            painter.drawPixmap(rect, self._after, QRectF(self._after.rect()))
 
         # The "before" half is clipped rather than drawn scaled-and-cropped, so
         # both sides stay pixel-aligned and the seam does not shimmer as it moves.
@@ -481,7 +531,7 @@ class WipeView(CanvasView):
             # image rect runs off every edge and image-relative labels go with
             # it - which is precisely when someone is comparing detail and most
             # needs to know which half they are looking at.
-            band = QRectF(10, 8, self.width() - 20, 20)
+            band = QRectF(10, 6, self.width() - 20, 20)
             # Each label is clipped to its own half, so it stays correct
             # wherever the divider has been dragged to.
             painter.setClipRect(QRectF(0, 0, split_x, self.height()))
@@ -545,6 +595,37 @@ class SideBySideView(CanvasView):
         super().__init__(parent)
         self._panes: list[QPixmap] = []
         self._labels: list[str] = []
+        self._progress: list[float | None] = []
+        self._grey: list[QPixmap | None] = []
+
+    # -- progress ------------------------------------------------------------
+
+    def set_pane_progress(self, index: int, fraction: float | None) -> None:
+        """Sweep one pane while its version is being computed.
+
+        Per pane rather than per view, because the styles are converted one
+        after another - the add-on reads its configuration once at startup, so
+        each style is its own harness. Showing them all sweeping together would
+        claim work is happening that has not started.
+        """
+        while len(self._progress) < len(self._panes):
+            self._progress.append(None)
+            self._grey.append(None)
+        if not 0 <= index < len(self._progress):
+            return
+        if fraction is None:
+            self._progress[index] = None
+            self._grey[index] = None
+        else:
+            if self._grey[index] is None and index < len(self._panes):
+                self._grey[index] = desaturated(self._panes[index])
+            self._progress[index] = float(np.clip(fraction, 0.0, 1.0))
+        self.update()
+
+    def clear_progress(self) -> None:
+        self._progress = [None] * len(self._panes)
+        self._grey = [None] * len(self._panes)
+        self.update()
 
     # -- geometry ------------------------------------------------------------
 
@@ -597,7 +678,12 @@ class SideBySideView(CanvasView):
             or not self._panes
             or pixmaps[0].size() != self._panes[0].size()
         )
+        # New pictures, so any sweep state belongs to images that are gone. The
+        # caller re-arms whatever is still outstanding; keeping it here would
+        # leave a finished pane greyed because it used to be working.
         self._panes = pixmaps
+        self._progress = [None] * len(pixmaps)
+        self._grey = [None] * len(pixmaps)
         if changed:
             self.reset_view()
         self.update()
@@ -612,6 +698,8 @@ class SideBySideView(CanvasView):
 
     def clear(self) -> None:
         self._panes = []
+        self._progress = []
+        self._grey = []
         self.update()
 
     # -- painting ------------------------------------------------------------
@@ -630,7 +718,16 @@ class SideBySideView(CanvasView):
             pane = QRectF(offset, view.top(), self._pane_width(), view.height())
             painter.save()
             painter.setClipRect(pane)
-            painter.drawPixmap(rect.translated(offset, 0.0), pixmap, QRectF(pixmap.rect()))
+            here = rect.translated(offset, 0.0)
+            progress = self._progress[index] if index < len(self._progress) else None
+            grey = self._grey[index] if index < len(self._grey) else None
+            if progress is not None and grey is not None:
+                paint_sweep(
+                    painter, here, pixmap, grey,
+                    progress, self.palette().highlight().color(),
+                )
+            else:
+                painter.drawPixmap(here, pixmap, QRectF(pixmap.rect()))
             painter.restore()
 
             label = self._labels[index] if index < len(self._labels) else ""

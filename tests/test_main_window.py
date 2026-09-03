@@ -158,3 +158,96 @@ def test_the_dialogs_construct(window):
     gui.FindFilesDialog(window)
     gui.BatchDialog(window)
     gui.ExportDialog(window, (1920, 1080))
+
+
+# -- what a run looks like while it is running -------------------------------
+
+
+def test_a_preview_run_sweeps_the_after_half(window):
+    """A slider nudge must show work happening, without moving the view.
+
+    The previous result stays in front of you and only the after half is
+    recomputed - that is the whole reason to be on this view, and an earlier
+    version threw it away by switching to the source.
+    """
+    prepare(window)
+    window.result = result()
+    window._succeeded(window.result)
+    window.show_view("result")
+
+    window._start_convert(preview=True)
+    assert window._view == "result", "a preview must not move the view"
+    assert window.wipe._progress == 0.0
+    window._report_progress("DLSS 5 pass 6 of 8")
+    assert window.wipe._progress == pytest.approx(0.75)
+    window._teardown()
+    assert window.wipe._progress is None
+
+
+def test_the_wipe_names_its_halves(window):
+    prepare(window)
+    window.result = result()
+    window.show_view("result")
+    assert window.wipe._labels == ("Before", "After")
+
+
+def test_compare_styles_shows_its_panes_before_converting(window):
+    """Not a full-screen wait that snaps to panels at the end."""
+    prepare(window)
+    window.style_count_box.setCurrentIndex(1)  # three panes
+    window.show_view("styles")
+
+    assert window._view == "styles"
+    assert window.side_by_side.count() == 3
+    assert window.side_by_side._labels == ["Original", "Natural", "Cinematic"]
+    assert not window.view_styles.isEnabled(), "disabled while it runs"
+
+
+def test_each_pane_sweeps_only_while_its_own_style_converts(window):
+    """The styles run one after another, so they cannot all sweep at once."""
+    prepare(window)
+    window.style_count_box.setCurrentIndex(1)
+    window.show_view("styles")
+
+    window._style_started(0)
+    window._report_progress("DLSS 5 pass 4 of 8")
+    assert window.side_by_side._progress == [None, pytest.approx(0.5), None]
+
+    window._style_one_done(0, result())
+    assert window.side_by_side._progress[1] is None, "a finished pane stops sweeping"
+    assert window.side_by_side._progress[2] == 0.0, "the next one is still waiting"
+
+    window._style_started(1)
+    window._report_progress("DLSS 5 pass 2 of 8")
+    assert window.side_by_side._progress == [None, None, pytest.approx(0.25)]
+
+
+def test_finishing_a_comparison_clears_up(window):
+    prepare(window)
+    window.show_view("styles")
+    window._styles_ready({0: result(), 1: result()})
+    assert window._view == "styles"
+    assert window.side_by_side._progress == [None, None]
+    assert window.view_styles.isEnabled(), "the button must come back"
+
+
+def test_a_settings_change_re_runs_the_comparison_in_place(window):
+    """The reported bug: it fell through to a single conversion and left.
+
+    That switched to the result view mid-comparison and, because the button
+    was keyed on a thread that was never cleared, Compare styles then stayed
+    disabled for the rest of the session.
+    """
+    prepare(window)
+    window.style_results = {0: result(), 1: result()}
+    window._style_signature_used = window._style_signature()
+    window.show_view("styles")
+    window._styles_ready(window.style_results)
+
+    window.settings.evaluation.live_preview = True
+    window._run_preview()
+
+    assert window._view == "styles", "must not be thrown out of the comparison"
+    assert window._thread is not None, "and it should be redoing both styles"
+    window._style_teardown()
+    assert window.view_styles.isEnabled()
