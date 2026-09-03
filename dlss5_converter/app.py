@@ -11,8 +11,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -115,6 +115,25 @@ def _downscale_for_preview(image: np.ndarray) -> np.ndarray:
         image, (max(1, int(width * scale)), max(1, int(height * scale))),
         interpolation=cv2.INTER_AREA,
     )
+
+
+#: The guide lives in the repository wiki rather than in the app so it can be
+#: corrected the day a new failure is reported, instead of at the next release.
+WIKI_URL = "https://github.com/criso2hd-alt/DLSS5-Image-Converter/wiki"
+
+
+def open_help(page: str = "") -> None:
+    """Open the wiki in the user's browser.
+
+    Failing silently is deliberate: on a machine with no browser association
+    this returns False, and an error dialog about being unable to show the help
+    would be a worse experience than the missing help itself.
+    """
+    url = f"{WIKI_URL}/{page}" if page else WIKI_URL
+    try:
+        QDesktopServices.openUrl(QUrl(url))
+    except Exception:  # noqa: BLE001 - opening a browser must never take the app down
+        pass
 
 
 class Worker(QObject):
@@ -1990,10 +2009,22 @@ class MainWindow(QMainWindow):
         self.find_button.clicked.connect(self.open_find_files)
         layout.addWidget(self.find_button)
 
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
         diagnose = QPushButton("Check runtime")
         diagnose.setObjectName("secondary")
         diagnose.clicked.connect(self.diagnose)
-        layout.addWidget(diagnose)
+        tools.addWidget(diagnose, 1)
+
+        help_button = QPushButton("Help")
+        help_button.setObjectName("secondary")
+        help_button.setToolTip(
+            f"Opens the guide in your browser:\n{WIKI_URL}\n\n"
+            "Every issue anyone has reported, with what actually caused it."
+        )
+        help_button.clicked.connect(lambda: open_help())
+        tools.addWidget(help_button)
+        layout.addLayout(tools)
         return panel
 
     # -- sequence page -------------------------------------------------------
@@ -2541,7 +2572,15 @@ class MainWindow(QMainWindow):
         self._teardown()
 
     def _failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Conversion failed", message)
+        # The moment someone actually needs the guide is the moment something
+        # failed, so the way there is on the failure itself rather than only in
+        # the sidebar they are no longer looking at.
+        box = QMessageBox(QMessageBox.Icon.Warning, "Conversion failed", message, parent=self)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        guide = box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
+        box.exec()
+        if box.clickedButton() is guide:
+            open_help("Troubleshooting")
         self.statusBar().showMessage("Conversion failed")
         self._teardown()
 
@@ -2612,7 +2651,20 @@ class MainWindow(QMainWindow):
         elif status.harness is not None:
             lines.append("")
             lines.append(evaluator.probe(status.harness))
-        QMessageBox.information(self, "DLSS 5 runtime", "\n".join(lines))
+        box = QMessageBox(
+            QMessageBox.Icon.Information, "DLSS 5 runtime",
+            "\n".join(lines), parent=self,
+        )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        # Only when something is wrong. A clean report needs no reading.
+        guide = (
+            box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
+            if status.problems
+            else None
+        )
+        box.exec()
+        if guide is not None and box.clickedButton() is guide:
+            open_help("Troubleshooting")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
         self.settings.save(paths.settings_path())

@@ -403,7 +403,12 @@ Reasonable question for a random executable:
 
 ## Something not working?
 
-[**TROUBLESHOOTING.md**](TROUBLESHOOTING.md) covers every issue reported so far.
+The **Help** button in the app, beside Check runtime, opens
+[**the wiki**](https://github.com/criso2hd-alt/DLSS5-Image-Converter/wiki) —
+the same guide as [TROUBLESHOOTING.md](TROUBLESHOOTING.md), kept current
+between releases. A failed conversion offers it directly, and so does Check
+runtime when it finds a problem.
+
 Start with:
 
 ```powershell
