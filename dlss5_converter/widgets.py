@@ -451,6 +451,12 @@ class SideBySideView(CanvasView):
 
     #: Space between the panes, in pixels. Wide enough to read as two images.
     GAP = 12
+    #: Strips kept clear above and below the panes, for the labels and the zoom
+    #: readout. Reserved rather than drawn over the images: a caption centred on
+    #: the widget lands half on one picture and half on the other, which looks
+    #: broken, and a label sitting on the image obscures the thing being judged.
+    LABEL_BAND = 26
+    CAPTION_BAND = 26
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -468,7 +474,8 @@ class SideBySideView(CanvasView):
 
     def _viewport(self) -> QRectF:
         # Pane-local: both panes are the same size, so one rect describes both.
-        return QRectF(0.0, 0.0, self._pane_width(), float(self.height()))
+        height = max(1.0, self.height() - self.LABEL_BAND - self.CAPTION_BAND)
+        return QRectF(0.0, float(self.LABEL_BAND), self._pane_width(), height)
 
     def _to_viewport(self, point: QPointF) -> QPointF:
         # Whichever pane the cursor is over, expressed in that pane's own
@@ -511,7 +518,10 @@ class SideBySideView(CanvasView):
         rect = self._display_rect(self._left.size())
         for index, pixmap in enumerate((self._left, self._right)):
             offset = self._pane_left(index)
-            pane = QRectF(offset, 0.0, self._pane_width(), float(self.height()))
+            pane = QRectF(
+                offset, float(self.LABEL_BAND),
+                self._pane_width(), self._viewport().height(),
+            )
             painter.save()
             painter.setClipRect(pane)
             painter.drawPixmap(rect.translated(offset, 0.0), pixmap, QRectF(pixmap.rect()))
@@ -521,7 +531,7 @@ class SideBySideView(CanvasView):
             if label:
                 painter.setPen(self.palette().text().color())
                 painter.drawText(
-                    QRectF(offset, 8.0, self._pane_width(), 20.0),
+                    QRectF(offset, 3.0, self._pane_width(), 20.0),
                     Qt.AlignmentFlag.AlignCenter,
                     label,
                 )
@@ -529,7 +539,8 @@ class SideBySideView(CanvasView):
         # A seam, so two similar images do not read as one wide one.
         painter.setPen(QPen(self.palette().highlight().color(), 1))
         middle = self._pane_width() + self.GAP / 2
-        painter.drawLine(QPointF(middle, 0.0), QPointF(middle, float(self.height())))
+        view = self._viewport()
+        painter.drawLine(QPointF(middle, view.top()), QPointF(middle, view.bottom()))
 
         zoom = self._zoom_caption()
         if zoom:

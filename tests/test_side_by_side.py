@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QMouseEvent, QWheelEvent  # noqa: E402
+from PySide6.QtGui import QImage, QMouseEvent, QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from dlss5_converter.widgets import SideBySideView  # noqa: E402
@@ -148,3 +148,72 @@ def test_clearing_drops_both_images(view):
     view.clear()
     assert view._left is None and view._right is None
     assert view._content_size() is None
+
+
+def rendered_panes(view: SideBySideView):
+    """What each pane actually painted, below the label band.
+
+    The arrays are copied out. numpy would otherwise hold a view straight into
+    the QImage's buffer, and the QImage dies when this returns - which reads as
+    an access violation somewhere later and entirely unrelated.
+    """
+    image = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+    height, width = image.height(), image.width()
+    buffer = np.frombuffer(image.constBits(), np.uint8).reshape(
+        height, image.bytesPerLine() // 4, 4
+    )
+    pixels = np.array(buffer[:, :width, :3])
+    pane = int(view._pane_width())
+    start = int(view._pane_left(1))
+    # Only the panes. The label and zoom bands above and below are shared
+    # chrome drawn across the whole widget, not something either pane painted.
+    top = view.LABEL_BAND
+    bottom = height - view.CAPTION_BAND
+    return pixels[top:bottom, :pane], pixels[top:bottom, start:start + pane]
+
+
+def test_both_panes_render_the_same_region(view):
+    """The property the whole view exists for, checked on pixels.
+
+    The same image goes into both panes, so after any amount of zooming and
+    panning the two must paint identically. Anything else means the halves are
+    showing different parts of the picture, which is worse than useless for a
+    comparison - it would look like the styles differ where they do not.
+
+    Deliberately zooms over one pane and then the other: mapping the cursor
+    into pane-local coordinates is the step that makes that work, and getting
+    it wrong aims the second zoom half an image away.
+    """
+    same = np.random.default_rng(0).integers(0, 255, (120, 200, 3), dtype=np.uint8)
+    view.set_images_u8(same, same)
+
+    def identical() -> bool:
+        left, right = rendered_panes(view)
+        return bool((left == right).all())
+
+    assert identical(), "at fit"
+    scroll(view, QPointF(200, 300), steps=5)
+    assert identical(), "after zooming over the left pane"
+    drag(view, QPointF(400, 300), QPointF(250, 220))
+    assert identical(), "after panning"
+    scroll(view, QPointF(view._pane_left(1) + 150, 260), steps=4)
+    assert identical(), "after zooming over the right pane"
+    drag(view, QPointF(300, 300), QPointF(380, 350))
+    assert identical(), "after panning again"
+    assert view._zoom > 5.0, "should have ended up well zoomed in"
+
+
+def test_a_pan_moves_both_panes_by_the_same_amount(view):
+    """Dragging either pane drags the other with it, not merely near it."""
+    scroll(view, QPointF(200, 200), steps=4)
+    before = view._display_rect(view._left.size())
+    drag(view, QPointF(200, 200), QPointF(140, 170))
+    after = view._display_rect(view._left.size())
+
+    moved = (after.left() - before.left(), after.top() - before.top())
+    assert moved != (0.0, 0.0), "the drag should have moved something"
+    # One rect drives both panes, so the right pane moved by exactly this too.
+    right_before = before.translated(view._pane_left(1), 0.0)
+    right_after = after.translated(view._pane_left(1), 0.0)
+    assert (right_after.left() - right_before.left()) == pytest.approx(moved[0])
+    assert (right_after.top() - right_before.top()) == pytest.approx(moved[1])
