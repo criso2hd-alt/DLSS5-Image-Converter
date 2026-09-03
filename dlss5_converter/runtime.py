@@ -190,14 +190,51 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     return status
 
 
+def _already_staged(source: Path, destination: Path) -> bool:
+    """Whether `destination` is genuinely this `source`, not merely like it.
+
+    A hard link is the same file, so there is nothing to check and nothing that
+    can drift - that is the normal case and it returns True immediately.
+
+    Otherwise the copy is only trusted when size *and* modification time match.
+    Size alone was the old test and it is not enough: replacing an add-on with a
+    different build of identical size left the stale one staged, which presents
+    as the neural pass silently not running.
+    """
+    if not destination.exists():
+        return False
+    try:
+        here, there = destination.stat(), source.stat()
+    except OSError:
+        return False
+    # Same inode: it *is* the file, however either path was reached.
+    if here.st_ino and here.st_ino == there.st_ino and here.st_dev == there.st_dev:
+        return True
+    return here.st_size == there.st_size and int(here.st_mtime) == int(there.st_mtime)
+
+
 def stage_runtime(status: RuntimeStatus) -> Path:
     """Copy the runtime beside the harness, which is where the loaders look.
 
     NGX resolves ``nvngx_*.dll`` from the executable's own directory, and
     ReShade only loads add-ons sitting next to the module that hosts it. Rather
     than ask the user to arrange that by hand, the app mirrors whatever it found
-    into the harness folder. Copies are skipped when the size already matches,
-    so repeat runs do not re-copy 158 MB.
+    into the harness folder.
+
+    **The staged copy is refreshed, not merely created.** This used to skip
+    whenever the destination's size matched, which quietly kept a stale file
+    forever: two builds of ``renodx-dlss5.addon64`` are frequently the same
+    size, and an out-of-date add-on is the single most common cause of "every
+    indicator is green and the image is unchanged". Someone could follow the
+    advice to update their add-on, drop the new file in ``dlss_files``, and have
+    the app go on loading the old one - the exact failure the advice was meant
+    to cure.
+
+    Refreshing is free in the normal case. Source and destination sit on one
+    volume, so this hard links rather than copies; relinking costs nothing and
+    cannot go stale. Only when links are refused - across volumes, on FAT32 -
+    does it fall back to a real copy, and only there is it worth checking
+    whether the work can be skipped, because nvngx_dlssnr.dll is 158 MB.
     """
     if status.harness is None:
         raise RuntimeError("The native harness is not built.")
@@ -212,7 +249,7 @@ def stage_runtime(status: RuntimeStatus) -> Path:
         name = "dxgi.dll" if source.name.lower() == "reshade64.dll" else source.name
         destination = target / name
         try:
-            if destination.exists() and destination.stat().st_size == source.stat().st_size:
+            if _already_staged(source, destination):
                 continue
             destination.unlink(missing_ok=True)
             # Hard link rather than copy where the filesystem allows it. In a

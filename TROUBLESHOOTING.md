@@ -270,6 +270,29 @@ anything specific to that code.
 
 ---
 
+## HDR: highlights come back dimmer than they should
+
+**Update `renodx-dlss5.addon64`.** The add-on version changes this measurably.
+Measured here on one machine, same code, same input, same GPU — an HDR plate
+with a highlight at 8.0x diffuse white:
+
+```
+newer add-on (1,732,608 bytes)   peak 7.77x   highlight preserved
+older add-on (1,703,424 bytes)   peak 4.59x   highlight crushed to 57%
+```
+
+Ordinary SDR photos measured identical between the two, so this is specifically
+an HDR difference — and it is invisible unless you go looking, because both
+results are plausible pictures.
+
+`--selftest` prints the peak its own HDR round trip came back with, and the
+add-on's version string, so you can see which build you are on.
+
+**Click "Find my DLSS files…"** to pick up the newest add-on on your disk; it
+always prefers the freshest one it can find, wherever it lives.
+
+---
+
 ## HDR: my .jxr will not open / the result looks flat
 
 `.jxr` is decoded by Windows' own imaging codecs. `--selftest` proves they work
