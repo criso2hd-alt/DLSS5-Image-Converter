@@ -414,6 +414,11 @@ class BatchItem:
     output: Path | None  # None when skipped
     skipped: bool = False
     error: str = ""
+    #: The finished frame, display-referred, for the dialog to show. Handed
+    #: over rather than re-read from disk: it is already in memory here, and a
+    #: batch of 8K files would otherwise pay a decode per item purely to draw a
+    #: thumbnail.
+    image: np.ndarray | None = None
 
 
 def convert_batch(
@@ -532,14 +537,14 @@ def convert_batch(
                     harness.frame(colour_path, offset)
 
                 harness.write(out_path)
-                payload, is_linear, _preview = _finish(
+                payload, is_linear, preview = _finish(
                     contract.read_output(out_path, width, height),
                     is_hdr=is_hdr,
                     grade_settings=grade_settings,
                     white=white,
                 )
                 save_image(payload, output, linear=is_linear)
-                yield BatchItem(index, len(images), path, output)
+                yield BatchItem(index, len(images), path, output, image=preview)
 
             except Exception as error:  # noqa: BLE001 - one bad file, not the batch
                 # The harness may be in an unknown state after a failure, so

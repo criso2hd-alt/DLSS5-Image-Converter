@@ -167,16 +167,23 @@ is the whole choice rather than a sample of it.
 
 Side by side by default, because choosing between two pictures is a question
 about the whole frame; switch to **Wipe** if you would rather slide one over the
-other to spot a specific change. Either way both halves share one zoom and one
+other to spot a specific change. Either way every pane shares one zoom and one
 pan — they are not kept in step, they are the same numbers drawn twice, so they
 cannot drift apart. Scroll to zoom, right-drag to pan, double-click to fit.
+
+**Two panes or three**, and a dropdown over each one choosing what it shows:
+*Original*, *Natural* or *Cinematic*. Three panes default to the source next to
+both styles, which answers a different question — not "which style" but "is the
+pass helping at all". Every pane gets the same colour grade, so the only
+difference on screen is the one being judged.
 
 **Keep Natural** / **Keep Cinematic** makes that version the result, so
 `Save result…` exports it, and sets the style in the sidebar so the next
 conversion and any folder batch use it too.
 
-It costs two conversions, because the add-on reads its configuration once when
-it starts and a style change needs a new harness. Depth is estimated once and
+The source pane is free. The two styles cost a conversion each, because the
+add-on reads its configuration once when it starts and a style change needs a
+new harness. Depth is estimated once and
 shared. Measured at 1920 px, 8 passes, on an RTX 4080: 7.9 s for depth, then
 5.1 s per style — 18 s in total.
 

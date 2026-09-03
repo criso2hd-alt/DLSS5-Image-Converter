@@ -74,6 +74,18 @@ from .widgets import (
 #: The sidebar's own width. The scroll area around it adds room for a bar.
 SIDEBAR_WIDTH = 320
 
+#: How many images the style comparison can show at once. Three is the useful
+#: ceiling: the source plus both styles. A fourth would only repeat one of them,
+#: and each pane costs a third of the width to look at.
+MAX_COMPARE_PANES = 3
+
+#: "DLSS 5 pass 3 of 8" - the only progress message carrying a count, and what
+#: drives the colour sweep over the source image while a conversion runs.
+_PASS_COUNT = re.compile(r"pass (\d+) of (\d+)")
+
+#: Matches SideBySideView.GAP so the pane dropdowns line up with the panes.
+GAP_BETWEEN_PANES = 12
+
 STYLE = """
 QMainWindow, QWidget { background: #16181d; color: #e6e8ec; }
 QGroupBox { border: 1px solid #2a2e37; border-radius: 8px; margin-top: 14px; padding: 10px; }
@@ -516,7 +528,36 @@ class FindFilesDialog(QDialog):
             self._worker.stop()
             self.status.setText("Stopping…")
 
+    def _begin_progress(self) -> None:
+        """Show the source image, drained of colour, ready to refill."""
+        if self.prepared is None:
+            return
+        self.show_view("photo")
+        self.depth_view.set_progress(0.0)
+
+    def _end_progress(self) -> None:
+        self.depth_view.set_progress(None)
+
+    def _report_progress(self, message: str) -> None:
+        """Status text, and the colour sweep if this message carries a count.
+
+        Parsed out of the message rather than plumbed through as a number: the
+        progress callback is a string all the way down from the pipeline, and
+        threading a second numeric channel through three call sites to drive a
+        visual flourish is not worth it. If the wording ever changes the sweep
+        simply stops advancing, which is a harmless way to fail.
+        """
+        self.statusBar().showMessage(message)
+        if self.depth_view._progress is None:
+            return
+        match = _PASS_COUNT.search(message)
+        if match:
+            done, total = int(match.group(1)), int(match.group(2))
+            if total > 0:
+                self.depth_view.set_progress(done / total)
+
     def _teardown(self) -> None:
+        self._end_progress()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(10000)
@@ -730,6 +771,17 @@ class BatchDialog(QDialog):
         layout.addWidget(self.recursive)
         layout.addWidget(self.skip_existing)
 
+        # A count tells you the run is alive; the picture tells you it is doing
+        # the right thing. On a folder of two hundred that is the difference
+        # between watching and checking back in ten minutes.
+        self.preview = ImageView()
+        # Small by default - it is confirmation that the run is doing the right
+        # thing, not something to judge quality on. It grows with the dialog for
+        # anyone who wants a closer look.
+        self.preview.setMinimumHeight(170)
+        self.preview.setVisible(False)
+        layout.addWidget(self.preview, 1)
+
         self.bar = QProgressBar()
         self.bar.setVisible(False)
         layout.addWidget(self.bar)
@@ -807,6 +859,8 @@ class BatchDialog(QDialog):
             self.destination,
             self.skip_existing.isChecked(),
         )
+        self.preview.setVisible(True)
+        self.preview.clear()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self.status.setText)
@@ -829,6 +883,12 @@ class BatchDialog(QDialog):
             self._done += 1
         self.bar.setValue(item.index + 1)
         self.bar.setFormat(f"%v of %m — {item.source.name}")
+        if item.image is not None:
+            self.preview.setVisible(True)
+            self.preview.set_image(
+                _downscale_for_preview(item.image),
+                f"{item.index + 1} of {item.total} — {item.source.name}",
+            )
         if item.error:
             # Named, not swallowed: a batch that quietly drops files is worse
             # than one that stops.
@@ -1408,35 +1468,69 @@ class MainWindow(QMainWindow):
         return panel
 
     def _style_panel(self) -> QWidget:
-        """The row under a style comparison: which is which, and pick one.
+        """What each pane shows, and which version to keep.
 
-        Seeing the difference is only half of what was asked for - the point is
-        to choose before exporting. Without these buttons the user would have
-        to read the labels, go back to the sidebar, set the style by hand and
-        convert a third time.
+        A dropdown per pane rather than a fixed Natural-versus-Cinematic, because
+        the first thing people asked for once they had the comparison was the
+        source alongside it: "is this better" and "is this different" are
+        different questions, and only the first one needs the original in view.
+
+        The dropdowns stretch equally, so they line up under the panes they
+        control - the row is the same width as the canvas and the panes are
+        equal, so the alignment is structural rather than fiddled.
         """
         panel = QWidget()
-        layout = QHBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+
+        self.style_choices: list[QComboBox] = []
+        picker = QHBoxLayout()
+        picker.setSpacing(GAP_BETWEEN_PANES)
+        for index in range(MAX_COMPARE_PANES):
+            box = QComboBox()
+            box.addItem("Original", -1)
+            for style, name in enumerate(NR_STYLES):
+                box.addItem(name, style)
+            box.setToolTip("What this pane shows.")
+            box.currentIndexChanged.connect(self._style_selection_changed)
+            self.style_choices.append(box)
+            picker.addWidget(box, 1)
+        outer.addLayout(picker)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
 
         self.style_caption = QLabel()
         self.style_caption.setObjectName("hint")
-        layout.addWidget(self.style_caption, 1)
+        row.addWidget(self.style_caption, 1)
+
+        self.style_count_box = QComboBox()
+        self.style_count_box.addItem("2 panes", 2)
+        self.style_count_box.addItem("3 panes", 3)
+        self.style_count_box.setToolTip(
+            "Three fits the source next to both styles, which is the way to "
+            "answer whether the pass is helping at all rather than only which "
+            "style you prefer."
+        )
+        self.style_count_box.currentIndexChanged.connect(self._style_count_changed)
+        row.addWidget(self.style_count_box)
 
         self.style_layout_box = QComboBox()
         self.style_layout_box.addItem("Side by side", "side")
         self.style_layout_box.addItem("Wipe", "wipe")
         self.style_layout_box.setToolTip(
-            "Side by side shows both whole frames, which is what you want when "
+            "Side by side shows whole frames, which is what you want when "
             "choosing between them.\n\n"
             "Wipe slides one over the other in place, which is better for "
-            "spotting a small change than for judging the picture.\n\n"
-            "Either way both halves share one zoom and one pan, so they cannot "
+            "spotting a small change than for judging the picture. It uses the "
+            "first two panes.\n\n"
+            "Either way every pane shares one zoom and one pan, so they cannot "
             "drift apart."
         )
         self.style_layout_box.currentIndexChanged.connect(self._style_layout_changed)
-        layout.addWidget(self.style_layout_box)
+        row.addWidget(self.style_layout_box)
 
         self._style_buttons: list[QPushButton] = []
         for index, name in enumerate(NR_STYLES):
@@ -1449,9 +1543,11 @@ class MainWindow(QMainWindow):
             )
             button.clicked.connect(lambda _=False, i=index: self._adopt_style(i))
             self._style_buttons.append(button)
-            layout.addWidget(button)
+            row.addWidget(button)
 
+        outer.addLayout(row)
         panel.setVisible(False)
+        self._apply_pane_defaults(2)
         return panel
 
     # -- style comparison ----------------------------------------------------
@@ -1493,6 +1589,8 @@ class MainWindow(QMainWindow):
         self.convert_button.setEnabled(False)
         self.view_styles.setEnabled(False)
 
+        self._begin_progress()
+
         self._thread = QThread(self)
         self._style_worker = StyleWorker(
             self.image_path, self.settings, self.engine,
@@ -1500,7 +1598,7 @@ class MainWindow(QMainWindow):
         )
         self._style_worker.moveToThread(self._thread)
         self._thread.started.connect(self._style_worker.run)
-        self._style_worker.progress.connect(self.statusBar().showMessage)
+        self._style_worker.progress.connect(self._report_progress)
         self._style_worker.finished.connect(self._styles_ready)
         self._style_worker.failed.connect(self._styles_failed)
         self._thread.start()
@@ -1524,6 +1622,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Style comparison failed")
 
     def _style_teardown(self) -> None:
+        self._end_progress()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -1537,32 +1636,93 @@ class MainWindow(QMainWindow):
         side = self.style_layout_box.currentData() == "side"
         return self.side_by_side if side else self.wipe
 
+    def _pane_count(self) -> int:
+        """Panes on screen. The wipe has two sides whatever the box says."""
+        if self.style_layout_box.currentData() != "side":
+            return 2
+        return int(self.style_count_box.currentData() or 2)
+
+    def _apply_pane_defaults(self, count: int) -> None:
+        """Sensible starting selections for a given number of panes.
+
+        Two panes is the style question - Natural against Cinematic. Three is
+        the "is it helping" question, and that reads best with the source
+        first, so the eye moves from unprocessed to most processed.
+        """
+        defaults = [0, 1] if count == 2 else [-1, 0, 1]
+        for box, value in zip(self.style_choices, defaults):
+            index = box.findData(value)
+            if index >= 0:
+                box.setCurrentIndex(index)
+
+    def _style_count_changed(self) -> None:
+        # Changing the count re-seeds the selections: the good default for two
+        # panes is not the good default for three, and a user who has picked
+        # their own will pick again rather than puzzle over a stale third pane.
+        self._apply_pane_defaults(int(self.style_count_box.currentData() or 2))
+        if self._view == "styles":
+            self.show_view("styles")
+
+    def _style_selection_changed(self) -> None:
+        if self._view == "styles":
+            self._render_styles()
+
     def _style_layout_changed(self) -> None:
         if self._view == "styles":
             self.show_view("styles")
 
+    def _pane_source(self, index: int) -> tuple[str, object]:
+        """(label, result) for one pane. `result` is None for the source."""
+        box = self.style_choices[index]
+        style = box.currentData()
+        if style is None or style < 0:
+            return "Original", None
+        return NR_STYLES[style], self.style_results.get(style)
+
     def _render_styles(self) -> None:
-        """Draw the two styles, graded identically, into the chosen layout."""
-        if len(self.style_results) < 2:
+        """Draw the chosen panes, graded identically, into the chosen layout."""
+        if len(self.style_results) < len(NR_STYLES):
             return
+        count = self._pane_count()
+        for index, box in enumerate(self.style_choices):
+            box.setVisible(index < count)
+
+        images: list[np.ndarray] = []
+        labels: list[str] = []
+        for index in range(count):
+            label, result = self._pane_source(index)
+            if result is None:
+                # The source, graded like everything else. Comparing a graded
+                # result against an ungraded source would show the grade rather
+                # than the neural pass, which is the opposite of the point.
+                any_result = next(iter(self.style_results.values()))
+                images.append(self._graded_preview(any_result, original=True))
+            else:
+                images.append(self._graded_preview(result))
+            labels.append(label)
+
         view = self._style_view()
-        view.set_images_u8(
-            self._graded_preview(self.style_results[0]),
-            self._graded_preview(self.style_results[1]),
-        )
-        view.set_labels(NR_STYLES[0], NR_STYLES[1])
+        if view is self.side_by_side:
+            view.set_panes_u8(images)
+        else:
+            view.set_images_u8(images[0], images[1])
+        view.set_labels(*labels)
+
         how = (
-            "Scroll to zoom, right-drag to pan - both panes move together."
+            "Scroll to zoom, right-drag to pan - every pane moves together."
             if view is self.side_by_side
             else "Drag the divider; scroll to zoom, right-drag to pan."
         )
-        self.style_caption.setText(
-            f"{NR_STYLES[0]} left, {NR_STYLES[1]} right - same image, same "
-            f"settings, same grade. {how}"
-        )
+        self.style_caption.setText(f"Same image, same settings, same grade. {how}")
 
-    def _graded_preview(self, result: pipeline.Result) -> np.ndarray:
-        """One result as 8-bit, with the current grade, at preview size."""
+    def _graded_preview(
+        self, result: pipeline.Result, original: bool = False
+    ) -> np.ndarray:
+        """One image as 8-bit, with the current grade, at preview size."""
+        if original:
+            small = _downscale_for_preview(result.original)
+            linear = contract.srgb_to_linear(np.clip(small, 0.0, 1.0).astype(np.float32))
+            return grade.apply_preview(linear, self.settings.grade)
         if result.hdr and result.enhanced_linear is not None:
             linear = _downscale_for_preview(result.enhanced_linear)
             graded = hdr_mod.tonemap(
@@ -2561,12 +2721,16 @@ class MainWindow(QMainWindow):
         self.convert_button.setEnabled(False)
         if not preview:
             self.save_button.setEnabled(False)
+            # Deliberately not on preview re-runs: those fire on a slider drag
+            # while the user is looking at the result, and yanking the view
+            # back to the source every time would be worse than no feedback.
+            self._begin_progress()
 
         self._thread = QThread(self)
         self._worker = Worker(self.image_path, self.settings, self.engine, self.prepared)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self.statusBar().showMessage)
+        self._worker.progress.connect(self._report_progress)
         self._worker.finished.connect(self._succeeded)
         self._worker.failed.connect(self._failed)
         self._thread.start()

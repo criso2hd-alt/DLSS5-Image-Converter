@@ -68,13 +68,15 @@ def drag(view: SideBySideView, start: QPointF, end: QPointF) -> None:
 def test_the_panes_split_the_width_evenly(view):
     assert view._pane_left(0) == 0.0
     assert view._pane_left(1) == pytest.approx(view._pane_width() + view.GAP)
-    assert 2 * view._pane_width() + view.GAP == pytest.approx(view.width())
+    # Whole-pixel panes, so up to one pixel per pane may go spare on the right.
+    used = 2 * view._pane_width() + view.GAP
+    assert view.width() - 2 <= used <= view.width()
 
 
 def test_both_panes_use_one_rect(view):
     """Not "kept in step" - the same numbers, offset by the pane position."""
     scroll(view, QPointF(100, 200), steps=3)
-    rect = view._display_rect(view._left.size())
+    rect = view._display_rect(view._content_size())
     # Whatever the transform is, pane 1 draws the identical rect shifted right
     # by exactly the pane offset, so the same pixel lands at the same height.
     shifted = rect.translated(view._pane_left(1), 0.0)
@@ -98,7 +100,7 @@ def test_zooming_over_either_pane_gives_the_same_result(qt_app):
         )
         at = QPointF(120 + widget._pane_left(pane), 210)
         scroll(widget, at, steps=2)
-        rects.append(widget._display_rect(widget._left.size()))
+        rects.append(widget._display_rect(widget._content_size()))
         widget.deleteLater()
 
     assert rects[0].left() == pytest.approx(rects[1].left(), abs=0.5)
@@ -108,9 +110,9 @@ def test_zooming_over_either_pane_gives_the_same_result(qt_app):
 
 def test_panning_moves_one_transform(view):
     scroll(view, QPointF(200, 200), steps=3)
-    before = view._display_rect(view._left.size())
+    before = view._display_rect(view._content_size())
     drag(view, QPointF(200, 200), QPointF(160, 190))
-    after = view._display_rect(view._left.size())
+    after = view._display_rect(view._content_size())
     assert after.left() != before.left() or after.top() != before.top()
     # Still one rect for both panes after panning.
     assert after.translated(view._pane_left(1), 0.0).top() == after.top()
@@ -118,7 +120,7 @@ def test_panning_moves_one_transform(view):
 
 def test_zoom_fits_within_a_pane_not_the_widget(view):
     """At fit, each image fills its own pane rather than the whole window."""
-    rect = view._display_rect(view._left.size())
+    rect = view._display_rect(view._content_size())
     assert rect.width() <= view._pane_width() + 1
 
 
@@ -139,14 +141,14 @@ def test_a_different_size_refits(view):
     assert view._zoom == 1.0
 
 
-def test_labels_are_stored_for_both_panes(view):
+def test_labels_are_stored_for_every_pane(view):
     view.set_labels("Natural", "Cinematic")
-    assert view._labels == ("Natural", "Cinematic")
+    assert view._labels == ["Natural", "Cinematic"]
 
 
-def test_clearing_drops_both_images(view):
+def test_clearing_drops_every_pane(view):
     view.clear()
-    assert view._left is None and view._right is None
+    assert view._panes == []
     assert view._content_size() is None
 
 
@@ -206,9 +208,9 @@ def test_both_panes_render_the_same_region(view):
 def test_a_pan_moves_both_panes_by_the_same_amount(view):
     """Dragging either pane drags the other with it, not merely near it."""
     scroll(view, QPointF(200, 200), steps=4)
-    before = view._display_rect(view._left.size())
+    before = view._display_rect(view._content_size())
     drag(view, QPointF(200, 200), QPointF(140, 170))
-    after = view._display_rect(view._left.size())
+    after = view._display_rect(view._content_size())
 
     moved = (after.left() - before.left(), after.top() - before.top())
     assert moved != (0.0, 0.0), "the drag should have moved something"
@@ -217,3 +219,59 @@ def test_a_pan_moves_both_panes_by_the_same_amount(view):
     right_after = after.translated(view._pane_left(1), 0.0)
     assert (right_after.left() - right_before.left()) == pytest.approx(moved[0])
     assert (right_after.top() - right_before.top()) == pytest.approx(moved[1])
+
+
+def test_three_panes_split_the_width_evenly(view):
+    frame = np.zeros((100, 200, 3), np.uint8)
+    view.set_panes_u8([frame, frame, frame])
+    assert view.count() == 3
+    stride = view._pane_width() + view.GAP
+    assert view._pane_left(1) == pytest.approx(stride)
+    assert view._pane_left(2) == pytest.approx(2 * stride)
+    used = 3 * view._pane_width() + 2 * view.GAP
+    assert view.width() - 3 <= used <= view.width()
+
+
+def test_three_panes_render_the_same_region(view):
+    """Same guarantee as two, and the cursor mapping now has to pick from three.
+
+    Getting `_to_viewport` wrong here is quieter than with two panes: an
+    off-by-one puts the middle pane's cursor into the left pane's space, which
+    still zooms, just at the wrong place.
+    """
+    same = np.random.default_rng(1).integers(0, 255, (120, 200, 3), dtype=np.uint8)
+    view.set_panes_u8([same, same, same])
+
+    def panes():
+        image = view.grab().toImage().convertToFormat(QImage.Format.Format_RGB32)
+        buffer = np.frombuffer(image.constBits(), np.uint8).reshape(
+            image.height(), image.bytesPerLine() // 4, 4
+        )
+        pixels = np.array(buffer[:, : image.width(), :3])
+        width = int(view._pane_width())
+        top, bottom = view.LABEL_BAND, image.height() - view.CAPTION_BAND
+        return [
+            pixels[top:bottom, int(view._pane_left(i)):int(view._pane_left(i)) + width]
+            for i in range(3)
+        ]
+
+    def identical() -> bool:
+        first, *rest = panes()
+        return all(bool((first == other).all()) for other in rest)
+
+    assert identical(), "at fit"
+    # Zoom from each pane in turn; every one must leave all three agreeing.
+    for index in (0, 2, 1):
+        scroll(view, QPointF(view._pane_left(index) + 80, 260), steps=2)
+        assert identical(), f"after zooming over pane {index}"
+    drag(view, QPointF(300, 300), QPointF(340, 250))
+    assert identical(), "after panning"
+
+
+def test_dropping_back_to_two_panes_refits(view):
+    frame = np.zeros((100, 200, 3), np.uint8)
+    view.set_panes_u8([frame, frame, frame])
+    scroll(view, QPointF(200, 200), steps=3)
+    view.set_panes_u8([frame, frame])
+    assert view.count() == 2
+    assert view._zoom == 1.0, "a different layout is a different view"

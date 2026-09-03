@@ -8,7 +8,18 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QImage,
+    QLinearGradient,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -259,9 +270,40 @@ class ImageView(CanvasView):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self._caption = ""
+        self._progress: float | None = None
+        self._grey: QPixmap | None = None
 
     def _content_size(self):
         return self._pixmap.size() if self._pixmap is not None else None
+
+    # -- progress ------------------------------------------------------------
+
+    def set_progress(self, fraction: float | None) -> None:
+        """Show the image draining of colour, refilling as work completes.
+
+        `fraction` is how much is done, 0..1, or None to stop. The height of
+        the colour is the progress - it is a progress bar that happens to be
+        the picture, not an animation playing next to one. That distinction is
+        the whole reason to do it this way: an idle spinner tells you the app
+        has not frozen, this tells you how much longer.
+
+        Nothing here claims the revealed part is finished output. DLSS gives us
+        no intermediate image, so the colour returning is the source image
+        coming back, and the caption underneath says what is actually running.
+        """
+        if fraction is None:
+            self._progress = None
+            self._grey = None
+            self.update()
+            return
+        if self._grey is None and self._pixmap is not None:
+            # Built once per run rather than per repaint: at 8K this is a
+            # 33-megapixel conversion and the bar moves eight times.
+            self._grey = QPixmap.fromImage(
+                self._pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
+            )
+        self._progress = float(np.clip(fraction, 0.0, 1.0))
+        self.update()
 
     def set_pixmap(self, pixmap: QPixmap | None, caption: str = "") -> None:
         # A new image at the old zoom would land the viewport somewhere
@@ -272,6 +314,10 @@ class ImageView(CanvasView):
         )
         self._pixmap = pixmap
         self._caption = caption
+        # A new picture invalidates the desaturated copy the progress sweep
+        # draws; rebuilt on the next set_progress rather than eagerly, since
+        # most images never see one.
+        self._grey = None
         if changed:
             self.reset_view()
         self.update()
@@ -285,6 +331,39 @@ class ImageView(CanvasView):
     def clear(self) -> None:
         self.set_pixmap(None)
 
+    def _paint_progress(self, painter: QPainter, rect: QRectF) -> None:
+        """Grey above the line, full colour below it, sweeping upward."""
+        assert self._pixmap is not None and self._grey is not None
+        painter.drawPixmap(rect, self._grey, QRectF(self._grey.rect()))
+        # Knock the grey back as well as desaturating it. Grey alone at full
+        # brightness reads as a deliberate black-and-white treatment rather
+        # than as something unfinished.
+        painter.fillRect(rect, QColor(6, 8, 12, 90))
+
+        line = rect.bottom() - rect.height() * self._progress
+        if self._progress > 0.0:
+            done = QRectF(rect.left(), line, rect.width(), rect.bottom() - line)
+            painter.save()
+            painter.setClipRect(done)
+            painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
+            painter.restore()
+
+        # A soft edge on the boundary, so the sweep reads as a moving front
+        # rather than as an image cut in half.
+        if 0.0 < self._progress < 1.0:
+            glow = QLinearGradient(0.0, line - 26.0, 0.0, line + 2.0)
+            highlight = QColor(self.palette().highlight().color())
+            highlight.setAlpha(0)
+            glow.setColorAt(0.0, highlight)
+            edge = QColor(self.palette().highlight().color())
+            edge.setAlpha(120)
+            glow.setColorAt(1.0, edge)
+            painter.fillRect(
+                QRectF(rect.left(), line - 26.0, rect.width(), 28.0), QBrush(glow)
+            )
+            painter.setPen(QPen(self.palette().highlight().color(), 1))
+            painter.drawLine(QPointF(rect.left(), line), QPointF(rect.right(), line))
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
         painter.fillRect(self.rect(), self.palette().window())
@@ -292,7 +371,10 @@ class ImageView(CanvasView):
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = self._display_rect(self._pixmap.size())
-        painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
+        if self._progress is not None and self._grey is not None:
+            self._paint_progress(painter, rect)
+        else:
+            painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
         zoom = self._zoom_caption()
         if zoom:
             painter.setPen(self.palette().text().color())
@@ -436,74 +518,100 @@ class WipeView(CanvasView):
 
 
 class SideBySideView(CanvasView):
-    """Two full images in two panes, locked to one zoom and one pan.
+    """Two or three full images in a row, locked to one zoom and one pan.
 
     The wipe is better at spotting a change; this is better at judging one.
-    Sliding a divider back and forth answers "did that move?", but comparing
-    two neural styles is a question about the whole frame at once - which of
-    these two pictures do I want - and that needs both of them on screen.
+    Sliding a divider back and forth answers "did that move?", but choosing
+    between neural styles is a question about the whole frame at once - which
+    of these pictures do I want - and that needs all of them on screen.
 
     The panes do not synchronise with each other. They share a single zoom and
     pan, applied within each pane, so they cannot drift apart: there is nothing
     to keep in step. Zooming about the cursor works from whichever pane the
-    cursor is in, and the other pane lands on the same part of the image.
+    cursor is in, and the others land on the same part of the image.
     """
 
-    #: Space between the panes, in pixels. Wide enough to read as two images.
+    #: Space between the panes, in pixels. Wide enough to read as separate
+    #: images rather than one wide one.
     GAP = 12
     #: Strips kept clear above and below the panes, for the labels and the zoom
     #: readout. Reserved rather than drawn over the images: a caption centred on
-    #: the widget lands half on one picture and half on the other, which looks
-    #: broken, and a label sitting on the image obscures the thing being judged.
+    #: the widget lands half on one picture and half on the next, which looks
+    #: broken, and a label sitting on the image obscures what is being judged.
     LABEL_BAND = 26
     CAPTION_BAND = 26
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._left: QPixmap | None = None
-        self._right: QPixmap | None = None
-        self._labels = ("", "")
+        self._panes: list[QPixmap] = []
+        self._labels: list[str] = []
 
     # -- geometry ------------------------------------------------------------
 
+    def count(self) -> int:
+        return max(1, len(self._panes))
+
     def _pane_width(self) -> float:
-        return max(1.0, (self.width() - self.GAP) / 2.0)
+        """Whole pixels, deliberately.
+
+        A fractional pane width puts every pane at a fractional offset, and the
+        same image then rasterises slightly differently in each one - sub-pixel,
+        invisible, and enough to mean the panes are not actually showing you
+        identical geometry. Rounding down and letting a pixel or two go spare on
+        the right costs nothing and makes them genuinely identical.
+        """
+        panes = self.count()
+        return max(1.0, float((self.width() - self.GAP * (panes - 1)) // panes))
 
     def _pane_left(self, index: int) -> float:
-        return 0.0 if index == 0 else self._pane_width() + self.GAP
+        return float(index) * (self._pane_width() + self.GAP)
 
     def _viewport(self) -> QRectF:
-        # Pane-local: both panes are the same size, so one rect describes both.
+        # Pane-local: every pane is the same size, so one rect describes them
+        # all, and drawing that one rect at each pane offset is what makes the
+        # zoom and pan shared rather than merely synchronised.
         height = max(1.0, self.height() - self.LABEL_BAND - self.CAPTION_BAND)
         return QRectF(0.0, float(self.LABEL_BAND), self._pane_width(), height)
 
     def _to_viewport(self, point: QPointF) -> QPointF:
-        # Whichever pane the cursor is over, expressed in that pane's own
-        # coordinates - so zoom-about-cursor aims at the same pixel of the
-        # image in both.
-        index = 0 if point.x() < self._pane_left(1) else 1
+        # Whichever pane the cursor is over, in that pane's own coordinates -
+        # so zoom-about-cursor aims at the same pixel of the image in all of
+        # them, rather than at a point one or two panes away.
+        stride = self._pane_width() + self.GAP
+        index = int(np.clip(point.x() // stride, 0, self.count() - 1))
         return QPointF(point.x() - self._pane_left(index), point.y())
 
     def _content_size(self):
-        return self._left.size() if self._left is not None else None
+        return self._panes[0].size() if self._panes else None
 
     # -- content -------------------------------------------------------------
 
-    def set_images_u8(self, left: np.ndarray, right: np.ndarray) -> None:
-        pixmap = QPixmap.fromImage(to_qimage_u8(left))
-        changed = self._left is None or self._left.size() != pixmap.size()
-        self._left = pixmap
-        self._right = QPixmap.fromImage(to_qimage_u8(right))
+    def set_panes_u8(self, images: list[np.ndarray]) -> None:
+        """Replace the row. Any number of panes; two or three in practice."""
+        pixmaps = [QPixmap.fromImage(to_qimage_u8(image)) for image in images]
+        # Refit when the layout changes, not on every re-grade: snapping back
+        # to fit each time a colour slider moved would make the grade
+        # impossible to judge while zoomed in.
+        changed = (
+            len(pixmaps) != len(self._panes)
+            or not self._panes
+            or pixmaps[0].size() != self._panes[0].size()
+        )
+        self._panes = pixmaps
         if changed:
             self.reset_view()
         self.update()
 
-    def set_labels(self, left: str = "", right: str = "") -> None:
-        self._labels = (left, right)
+    def set_images_u8(self, left: np.ndarray, right: np.ndarray) -> None:
+        """Two-pane convenience, kept because most callers only ever want two."""
+        self.set_panes_u8([left, right])
+
+    def set_labels(self, *labels: str) -> None:
+        self._labels = [text for text in labels]
         self.update()
 
     def clear(self) -> None:
-        self._left = self._right = None
+        self._panes = []
         self.update()
 
     # -- painting ------------------------------------------------------------
@@ -511,23 +619,21 @@ class SideBySideView(CanvasView):
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
         painter.fillRect(self.rect(), self.palette().window())
-        if self._left is None or self._right is None:
+        if not self._panes:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        rect = self._display_rect(self._left.size())
-        for index, pixmap in enumerate((self._left, self._right)):
+        rect = self._display_rect(self._panes[0].size())
+        view = self._viewport()
+        for index, pixmap in enumerate(self._panes):
             offset = self._pane_left(index)
-            pane = QRectF(
-                offset, float(self.LABEL_BAND),
-                self._pane_width(), self._viewport().height(),
-            )
+            pane = QRectF(offset, view.top(), self._pane_width(), view.height())
             painter.save()
             painter.setClipRect(pane)
             painter.drawPixmap(rect.translated(offset, 0.0), pixmap, QRectF(pixmap.rect()))
             painter.restore()
 
-            label = self._labels[index]
+            label = self._labels[index] if index < len(self._labels) else ""
             if label:
                 painter.setPen(self.palette().text().color())
                 painter.drawText(
@@ -536,11 +642,11 @@ class SideBySideView(CanvasView):
                     label,
                 )
 
-        # A seam, so two similar images do not read as one wide one.
+        # Seams, so similar images do not read as one wide one.
         painter.setPen(QPen(self.palette().highlight().color(), 1))
-        middle = self._pane_width() + self.GAP / 2
-        view = self._viewport()
-        painter.drawLine(QPointF(middle, view.top()), QPointF(middle, view.bottom()))
+        for index in range(1, len(self._panes)):
+            middle = self._pane_left(index) - self.GAP / 2
+            painter.drawLine(QPointF(middle, view.top()), QPointF(middle, view.bottom()))
 
         zoom = self._zoom_caption()
         if zoom:
