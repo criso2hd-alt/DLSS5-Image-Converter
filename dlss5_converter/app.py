@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 import sys
 import time
@@ -64,6 +65,7 @@ from .widgets import (
     DownloadDialog,
     DropZone,
     ImageView,
+    SideBySideView,
     SliderRow,
     WipeView,
     first_supported,
@@ -148,6 +150,76 @@ class Worker(QObject):
             self.failed.emit(str(error))
             return
         self.finished.emit(result)
+
+
+class StyleWorker(QObject):
+    """Converts the same image once per neural style, back to back.
+
+    Sequential rather than parallel, and it has to be: the add-on reads its ini
+    once when it starts, so a style change means a new harness. Two styles are
+    therefore two harness launches — which is also why this exists as a
+    deliberate action behind a button rather than something that happens on
+    every convert.
+
+    Depth is the expensive half and is shared: both runs get the same
+    ``Prepared``, so the second one costs only its DLSS passes.
+    """
+
+    progress = Signal(str)
+    finished = Signal(object)  # dict[int, pipeline.Result]
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        image_path: Path,
+        settings: AppSettings,
+        engine: DepthEngine,
+        styles: list[int],
+        prepared: pipeline.Prepared | None = None,
+    ) -> None:
+        super().__init__()
+        self._path = image_path
+        self._settings = settings
+        self._engine = engine
+        self._styles = styles
+        self._prepared = prepared
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        results: dict[int, pipeline.Result] = {}
+        # A copy, so the sidebar keeps showing whatever the user actually chose
+        # while this runs through the styles behind their back.
+        settings = copy.deepcopy(self._settings)
+        try:
+            prepared = self._prepared
+            if prepared is None:
+                # Once, up front. Letting the first convert() do it internally
+                # would leave the second one to estimate depth all over again.
+                prepared = pipeline.prepare(
+                    self._path, settings, self._engine, progress=self.progress.emit
+                )
+
+            for position, style in enumerate(self._styles, start=1):
+                if self._stop:
+                    return
+                name = NR_STYLES[style]
+                settings.neural.style = style
+
+                def say(message: str, name=name, position=position) -> None:
+                    self.progress.emit(
+                        f"{name} ({position} of {len(self._styles)}) — {message}"
+                    )
+
+                results[style] = pipeline.convert(
+                    self._path, settings, self._engine, progress=say, prepared=prepared
+                )
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(results)
 
 
 class DepthWorker(QObject):
@@ -1115,6 +1187,9 @@ class MainWindow(QMainWindow):
         self._download_dialog: DownloadDialog | None = None
         self._seq_thread: QThread | None = None
         self._seq_worker: SequenceWorker | None = None
+        self.style_results: dict[int, pipeline.Result] = {}
+        self._style_signature_used: tuple | None = None
+        self._style_worker: StyleWorker | None = None
 
         # Debounce. A slider drag emits a change per pixel and each one costs a
         # harness restart, so wait for the drag to settle before spending one.
@@ -1126,7 +1201,7 @@ class MainWindow(QMainWindow):
         self._grade_timer = QTimer(self)
         self._grade_timer.setSingleShot(True)
         self._grade_timer.setInterval(30)
-        self._grade_timer.timeout.connect(self._render_result)
+        self._grade_timer.timeout.connect(self._render_current)
 
         # Dropping anywhere on the window, not just on the drop zone. The zone
         # is swapped out for the comparison view after a conversion, and when it
@@ -1149,6 +1224,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.wipe)
         self.stack.addWidget(self.depth_view)
         self.stack.addWidget(self.diff_view)
+        self.side_by_side = SideBySideView()
+        self.stack.addWidget(self.side_by_side)
 
         canvas = QWidget()
         canvas_layout = QVBoxLayout(canvas)
@@ -1158,6 +1235,8 @@ class MainWindow(QMainWindow):
         canvas_layout.addLayout(self._view_switch())
         self.grade_panel = self._grade_panel()
         canvas_layout.addWidget(self.grade_panel)
+        self.style_panel = self._style_panel()
+        canvas_layout.addWidget(self.style_panel)
 
         # Two pages, one shared sidebar. The settings mean the same thing in
         # both, and using identical settings across every frame is most of what
@@ -1223,13 +1302,26 @@ class MainWindow(QMainWindow):
             "settings on already-realistic content the change can be real and "
             "still invisible side by side. Black means nothing changed there."
         )
-        for button in (self.view_photo, self.view_depth, self.view_result, self.view_diff):
+        self.view_styles = QPushButton("Compare styles")
+        self.view_styles.setToolTip(
+            "Natural against Cinematic, on this image, at these settings.\n\n"
+            "Converts once per style and wipes between them. There are only "
+            "two, so this is the whole choice rather than a sample.\n\n"
+            "It costs two conversions: the add-on reads its configuration once "
+            "when it starts, so a style change needs a new harness. Depth is "
+            "estimated once and shared."
+        )
+        for button in (
+            self.view_photo, self.view_depth, self.view_result,
+            self.view_diff, self.view_styles,
+        ):
             button.setObjectName("secondary")
             button.setCheckable(True)
         self.view_photo.clicked.connect(lambda: self.show_view("photo"))
         self.view_depth.clicked.connect(lambda: self.show_view("depth"))
         self.view_result.clicked.connect(lambda: self.show_view("result"))
         self.view_diff.clicked.connect(lambda: self.show_view("difference"))
+        self.view_styles.clicked.connect(lambda: self.show_view("styles"))
         self.view_grade = QPushButton("Colour")
         self.view_grade.setObjectName("secondary")
         self.view_grade.setCheckable(True)
@@ -1247,6 +1339,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.view_depth)
         row.addWidget(self.view_result)
         row.addWidget(self.view_diff)
+        row.addWidget(self.view_styles)
         # Set apart: it is not another view, it changes the one you are on.
         row.addSpacing(28)
         row.addWidget(self.view_grade)
@@ -1287,6 +1380,185 @@ class MainWindow(QMainWindow):
         panel.setVisible(False)
         return panel
 
+    def _style_panel(self) -> QWidget:
+        """The row under a style comparison: which is which, and pick one.
+
+        Seeing the difference is only half of what was asked for - the point is
+        to choose before exporting. Without these buttons the user would have
+        to read the labels, go back to the sidebar, set the style by hand and
+        convert a third time.
+        """
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        self.style_caption = QLabel()
+        self.style_caption.setObjectName("hint")
+        layout.addWidget(self.style_caption, 1)
+
+        self.style_layout_box = QComboBox()
+        self.style_layout_box.addItem("Side by side", "side")
+        self.style_layout_box.addItem("Wipe", "wipe")
+        self.style_layout_box.setToolTip(
+            "Side by side shows both whole frames, which is what you want when "
+            "choosing between them.\n\n"
+            "Wipe slides one over the other in place, which is better for "
+            "spotting a small change than for judging the picture.\n\n"
+            "Either way both halves share one zoom and one pan, so they cannot "
+            "drift apart."
+        )
+        self.style_layout_box.currentIndexChanged.connect(self._style_layout_changed)
+        layout.addWidget(self.style_layout_box)
+
+        self._style_buttons: list[QPushButton] = []
+        for index, name in enumerate(NR_STYLES):
+            button = QPushButton(f"Keep {name}")
+            button.setObjectName("secondary")
+            button.setToolTip(
+                f"Make the {name} version the result, so Save exports it. "
+                "Also sets the style in the sidebar, so the next conversion "
+                "and any folder batch use it too."
+            )
+            button.clicked.connect(lambda _=False, i=index: self._adopt_style(i))
+            self._style_buttons.append(button)
+            layout.addWidget(button)
+
+        panel.setVisible(False)
+        return panel
+
+    # -- style comparison ----------------------------------------------------
+
+    def _style_signature(self) -> tuple:
+        """Everything a comparison depends on except the style itself.
+
+        Held so a stale comparison is detected rather than shown. Two images
+        that differ in strengths as well as style answer no question at all,
+        and the difference between the styles is subtle enough that nobody
+        would spot the contamination by eye.
+        """
+        neural = self.settings.neural
+        return (
+            str(self.image_path),
+            neural.intensity, neural.skin, neural.local_tone, neural.structure,
+            neural.preset, neural.paper_white,
+            neural.transfer_strength, neural.color_strength,
+            self.settings.evaluation.frames,
+            self.settings.evaluation.max_edge,
+            self.settings.evaluation.jitter,
+            self.settings.depth.contrast,
+            self.settings.depth.model_id,
+            self.settings.depth.input_size,
+            self.settings.depth.tiled,
+        )
+
+    def _styles_current(self) -> bool:
+        return (
+            len(self.style_results) == len(NR_STYLES)
+            and self._style_signature_used == self._style_signature()
+        )
+
+    def _start_style_comparison(self) -> None:
+        if self.image_path is None or self._thread is not None:
+            return
+        self.style_results = {}
+        self._style_signature_used = self._style_signature()
+        self.convert_button.setEnabled(False)
+        self.view_styles.setEnabled(False)
+
+        self._thread = QThread(self)
+        self._style_worker = StyleWorker(
+            self.image_path, self.settings, self.engine,
+            list(range(len(NR_STYLES))), self.prepared,
+        )
+        self._style_worker.moveToThread(self._thread)
+        self._thread.started.connect(self._style_worker.run)
+        self._style_worker.progress.connect(self.statusBar().showMessage)
+        self._style_worker.finished.connect(self._styles_ready)
+        self._style_worker.failed.connect(self._styles_failed)
+        self._thread.start()
+
+    def _styles_ready(self, results: dict) -> None:
+        self.style_results = results
+        self._style_teardown()
+        # Adopt nothing yet. Which one wins is the user's call, and silently
+        # keeping the last one converted would answer it for them.
+        self.show_view("styles")
+        self.statusBar().showMessage(
+            "Compare styles - drag the divider, scroll to zoom, right-drag to "
+            "pan. Both halves move together."
+        )
+
+    def _styles_failed(self, message: str) -> None:
+        self.style_results = {}
+        self._style_signature_used = None
+        self._style_teardown()
+        QMessageBox.warning(self, "Could not compare styles", message)
+        self.statusBar().showMessage("Style comparison failed")
+
+    def _style_teardown(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread = None
+        self._style_worker = None
+        self.convert_button.setEnabled(self.image_path is not None)
+        self.view_styles.setEnabled(self.image_path is not None)
+
+    def _style_view(self):
+        """Whichever comparison widget the layout box is set to."""
+        side = self.style_layout_box.currentData() == "side"
+        return self.side_by_side if side else self.wipe
+
+    def _style_layout_changed(self) -> None:
+        if self._view == "styles":
+            self.show_view("styles")
+
+    def _render_styles(self) -> None:
+        """Draw the two styles, graded identically, into the chosen layout."""
+        if len(self.style_results) < 2:
+            return
+        view = self._style_view()
+        view.set_images_u8(
+            self._graded_preview(self.style_results[0]),
+            self._graded_preview(self.style_results[1]),
+        )
+        view.set_labels(NR_STYLES[0], NR_STYLES[1])
+        how = (
+            "Scroll to zoom, right-drag to pan - both panes move together."
+            if view is self.side_by_side
+            else "Drag the divider; scroll to zoom, right-drag to pan."
+        )
+        self.style_caption.setText(
+            f"{NR_STYLES[0]} left, {NR_STYLES[1]} right - same image, same "
+            f"settings, same grade. {how}"
+        )
+
+    def _graded_preview(self, result: pipeline.Result) -> np.ndarray:
+        """One result as 8-bit, with the current grade, at preview size."""
+        if result.hdr and result.enhanced_linear is not None:
+            linear = _downscale_for_preview(result.enhanced_linear)
+            graded = hdr_mod.tonemap(
+                grade.apply_linear(linear, self.settings.grade), result.white
+            )
+            return (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+        small = _downscale_for_preview(result.enhanced)
+        linear = contract.srgb_to_linear(np.clip(small, 0.0, 1.0).astype(np.float32))
+        return grade.apply_preview(linear, self.settings.grade)
+
+    def _adopt_style(self, index: int) -> None:
+        """Make one of the compared styles the result, and the live setting."""
+        result = self.style_results.get(index)
+        if result is None:
+            return
+        self.settings.neural.style = index
+        self.style_box.setCurrentIndex(index)
+        self.settings.save(paths.settings_path())
+        self._succeeded(result)
+        self.statusBar().showMessage(
+            f"{NR_STYLES[index]} kept. Save result... exports this one."
+        )
+
     # -- colour grade --------------------------------------------------------
 
     def _grade_setter(self, field: str):
@@ -1298,9 +1570,23 @@ class MainWindow(QMainWindow):
 
         return apply_value
 
+    def _render_current(self) -> None:
+        """Re-draw whichever comparison is on screen after a grade change.
+
+        The style comparison is graded too, and identically on both halves -
+        the point is to isolate the style, so a grade that landed on only one
+        side would defeat the whole view.
+        """
+        if self._view == "styles":
+            self._render_styles()
+        else:
+            self._render_result()
+
     def _grade_toggled(self, shown: bool) -> None:
         self.grade_panel.setVisible(shown)
-        if shown and self.result is not None:
+        # Grading applies to the style comparison as well, so being on that
+        # view is not a reason to be dragged off it.
+        if shown and self.result is not None and self._view != "styles":
             self.show_view("result")
 
     def _reset_grade(self) -> None:
@@ -1368,6 +1654,21 @@ class MainWindow(QMainWindow):
             which = "depth" if self.prepared is not None else "photo"
         if which == "depth" and self.prepared is None:
             which = "photo"
+        if which == "styles":
+            # The only view that has to be computed before it can be shown.
+            # If the comparison is missing or was made at other settings, this
+            # starts it and comes back when it finishes.
+            if not self._styles_current():
+                self._start_style_comparison()
+                return
+            self._render_styles()
+            self.stack.setCurrentWidget(self._style_view())
+            self._set_view_state(which)
+            return
+
+        # Leaving the styles view puts the wipe back to source-versus-result.
+        self.wipe.set_labels()
+        self.side_by_side.clear()
 
         if which == "difference":
             self._render_difference()
@@ -1385,17 +1686,23 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(self.drop)
             which = "photo"
 
+        self._set_view_state(which)
+        if which == "depth":
+            self._render_depth_preview()
+
+    def _set_view_state(self, which: str) -> None:
         self._view = which
         self.view_photo.setChecked(which == "photo")
         self.view_depth.setChecked(which == "depth")
         self.view_result.setChecked(which == "result")
         self.view_diff.setChecked(which == "difference")
+        self.view_styles.setChecked(which == "styles")
         self.view_diff.setEnabled(self.result is not None)
         self.view_depth.setEnabled(self.prepared is not None)
         self.view_result.setEnabled(self.result is not None)
         self.view_photo.setEnabled(self.prepared is not None)
-        if which == "depth":
-            self._render_depth_preview()
+        self.view_styles.setEnabled(self.image_path is not None and self._thread is None)
+        self.style_panel.setVisible(which == "styles")
 
     def _render_depth_preview(self) -> None:
         """Re-colour the depth mask for the current contrast.
@@ -2324,6 +2631,10 @@ class MainWindow(QMainWindow):
 
         if self._seq_worker is not None:
             self._seq_worker.stop()
+        # A style comparison is two conversions; without this it would start
+        # the second one after the window has gone.
+        if self._style_worker is not None:
+            self._style_worker.stop()
         for thread in (
             self._thread,
             self._depth_thread,

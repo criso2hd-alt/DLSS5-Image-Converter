@@ -159,6 +159,39 @@ the saved file is graded at full resolution through the exact transfer curve.
 Left-drag still moves the comparison divider. Worth using — at 6K the things
 this tool changes are invisible at fit-to-window.
 
+### Compare styles
+
+**Compare styles**, next to Difference, converts the image once as *Natural* and
+once as *Cinematic* and puts both on screen. There are only two styles, so this
+is the whole choice rather than a sample of it.
+
+Side by side by default, because choosing between two pictures is a question
+about the whole frame; switch to **Wipe** if you would rather slide one over the
+other to spot a specific change. Either way both halves share one zoom and one
+pan — they are not kept in step, they are the same numbers drawn twice, so they
+cannot drift apart. Scroll to zoom, right-drag to pan, double-click to fit.
+
+**Keep Natural** / **Keep Cinematic** makes that version the result, so
+`Save result…` exports it, and sets the style in the sidebar so the next
+conversion and any folder batch use it too.
+
+It costs two conversions, because the add-on reads its configuration once when
+it starts and a style change needs a new harness. Depth is estimated once and
+shared. Measured at 1920 px, 8 passes, on an RTX 4080: 7.9 s for depth, then
+5.1 s per style — 18 s in total.
+
+Worth knowing how much the choice matters. On the sample portrait, against the
+source image:
+
+| | mean difference |
+| - | --------------- |
+| Natural vs source | 0.0105 |
+| Cinematic vs source | 0.0143 |
+| **Natural vs Cinematic** | **0.0140** |
+
+The gap between the two styles is as large as the entire effect of the neural
+pass. Picking one is not a detail.
+
 ### A second pass
 
 **Use result as input** feeds the finished image back in, with the colour grade

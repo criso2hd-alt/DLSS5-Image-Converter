@@ -131,13 +131,33 @@ class CanvasView(QWidget):
 
     # -- geometry ------------------------------------------------------------
 
+    def _viewport(self) -> QRectF:
+        """The area one image is laid out in.
+
+        The whole widget, unless a subclass splits it into panes. Everything
+        below works in this space rather than in widget coordinates, which is
+        what lets a two-pane view drive both panes from a single zoom and pan
+        - they are not synchronised, they are literally the same numbers.
+        """
+        return QRectF(0.0, 0.0, float(self.width()), float(self.height()))
+
+    def _to_viewport(self, point: QPointF) -> QPointF:
+        """Widget coordinates into the space `_viewport` describes."""
+        return point
+
     def _fit_rect(self, size) -> QRectF:
         """The image at 100% fit, centred, ignoring zoom and pan."""
-        if size.width() <= 0 or size.height() <= 0:
+        view = self._viewport()
+        if size.width() <= 0 or size.height() <= 0 or view.isEmpty():
             return QRectF()
-        scale = min(self.width() / size.width(), self.height() / size.height())
+        scale = min(view.width() / size.width(), view.height() / size.height())
         width, height = size.width() * scale, size.height() * scale
-        return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
+        return QRectF(
+            view.left() + (view.width() - width) / 2,
+            view.top() + (view.height() - height) / 2,
+            width,
+            height,
+        )
 
     def _display_rect(self, size) -> QRectF:
         base = self._fit_rect(size)
@@ -163,8 +183,9 @@ class CanvasView(QWidget):
         if size is None:
             return
         rect = self._display_rect(size)
-        margin_x = max(0.0, (rect.width() - self.width()) / 2)
-        margin_y = max(0.0, (rect.height() - self.height()) / 2)
+        view = self._viewport()
+        margin_x = max(0.0, (rect.width() - view.width()) / 2)
+        margin_y = max(0.0, (rect.height() - view.height()) / 2)
         self._pan.setX(float(np.clip(self._pan.x(), -margin_x, margin_x)))
         self._pan.setY(float(np.clip(self._pan.y(), -margin_y, margin_y)))
 
@@ -185,7 +206,7 @@ class CanvasView(QWidget):
         # Keep whatever is under the cursor under the cursor. Without this,
         # zooming always creeps towards the centre and you lose the detail you
         # were aiming at.
-        cursor = event.position()
+        cursor = self._to_viewport(event.position())
         before = self._display_rect(size)
         if before.width() > 0 and before.height() > 0:
             u = (cursor.x() - before.left()) / before.width()
@@ -302,7 +323,19 @@ class WipeView(CanvasView):
         self._after: QPixmap | None = None
         self._split = 0.5
         self._dragging = False
+        self._labels: tuple[str, str] | None = None
         self.setMouseTracking(True)
+
+    def set_labels(self, left: str = "", right: str = "") -> None:
+        """Name the two halves, for a comparison that is not before/after.
+
+        Source-versus-result needs no labels: which side is which is obvious
+        from the wipe itself. Two neural styles are not obvious at all - the
+        whole difficulty is that they look similar - so an unlabelled wipe
+        would be a puzzle rather than a comparison.
+        """
+        self._labels = (left, right) if (left or right) else None
+        self.update()
 
     def _content_size(self):
         return self._before.size() if self._before is not None else None
@@ -359,6 +392,22 @@ class WipeView(CanvasView):
         painter.setPen(QPen(self.palette().highlight().color(), 2))
         painter.drawLine(QPointF(split_x, rect.top()), QPointF(split_x, rect.bottom()))
 
+        if self._labels is not None:
+            left, right = self._labels
+            painter.setPen(self.palette().text().color())
+            # Positioned against the widget, not the image. Zoomed in, the
+            # image rect runs off every edge and image-relative labels go with
+            # it - which is precisely when someone is comparing detail and most
+            # needs to know which half they are looking at.
+            band = QRectF(10, 8, self.width() - 20, 20)
+            # Each label is clipped to its own half, so it stays correct
+            # wherever the divider has been dragged to.
+            painter.setClipRect(QRectF(0, 0, split_x, self.height()))
+            painter.drawText(band, Qt.AlignmentFlag.AlignLeft, left)
+            painter.setClipRect(QRectF(split_x, 0, self.width() - split_x, self.height()))
+            painter.drawText(band, Qt.AlignmentFlag.AlignRight, right)
+            painter.setClipping(False)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging = True
@@ -384,6 +433,112 @@ class WipeView(CanvasView):
             return
         self._split = float(np.clip((x - rect.left()) / rect.width(), 0.0, 1.0))
         self.update()
+
+
+class SideBySideView(CanvasView):
+    """Two full images in two panes, locked to one zoom and one pan.
+
+    The wipe is better at spotting a change; this is better at judging one.
+    Sliding a divider back and forth answers "did that move?", but comparing
+    two neural styles is a question about the whole frame at once - which of
+    these two pictures do I want - and that needs both of them on screen.
+
+    The panes do not synchronise with each other. They share a single zoom and
+    pan, applied within each pane, so they cannot drift apart: there is nothing
+    to keep in step. Zooming about the cursor works from whichever pane the
+    cursor is in, and the other pane lands on the same part of the image.
+    """
+
+    #: Space between the panes, in pixels. Wide enough to read as two images.
+    GAP = 12
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._left: QPixmap | None = None
+        self._right: QPixmap | None = None
+        self._labels = ("", "")
+
+    # -- geometry ------------------------------------------------------------
+
+    def _pane_width(self) -> float:
+        return max(1.0, (self.width() - self.GAP) / 2.0)
+
+    def _pane_left(self, index: int) -> float:
+        return 0.0 if index == 0 else self._pane_width() + self.GAP
+
+    def _viewport(self) -> QRectF:
+        # Pane-local: both panes are the same size, so one rect describes both.
+        return QRectF(0.0, 0.0, self._pane_width(), float(self.height()))
+
+    def _to_viewport(self, point: QPointF) -> QPointF:
+        # Whichever pane the cursor is over, expressed in that pane's own
+        # coordinates - so zoom-about-cursor aims at the same pixel of the
+        # image in both.
+        index = 0 if point.x() < self._pane_left(1) else 1
+        return QPointF(point.x() - self._pane_left(index), point.y())
+
+    def _content_size(self):
+        return self._left.size() if self._left is not None else None
+
+    # -- content -------------------------------------------------------------
+
+    def set_images_u8(self, left: np.ndarray, right: np.ndarray) -> None:
+        pixmap = QPixmap.fromImage(to_qimage_u8(left))
+        changed = self._left is None or self._left.size() != pixmap.size()
+        self._left = pixmap
+        self._right = QPixmap.fromImage(to_qimage_u8(right))
+        if changed:
+            self.reset_view()
+        self.update()
+
+    def set_labels(self, left: str = "", right: str = "") -> None:
+        self._labels = (left, right)
+        self.update()
+
+    def clear(self) -> None:
+        self._left = self._right = None
+        self.update()
+
+    # -- painting ------------------------------------------------------------
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self.palette().window())
+        if self._left is None or self._right is None:
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        rect = self._display_rect(self._left.size())
+        for index, pixmap in enumerate((self._left, self._right)):
+            offset = self._pane_left(index)
+            pane = QRectF(offset, 0.0, self._pane_width(), float(self.height()))
+            painter.save()
+            painter.setClipRect(pane)
+            painter.drawPixmap(rect.translated(offset, 0.0), pixmap, QRectF(pixmap.rect()))
+            painter.restore()
+
+            label = self._labels[index]
+            if label:
+                painter.setPen(self.palette().text().color())
+                painter.drawText(
+                    QRectF(offset, 8.0, self._pane_width(), 20.0),
+                    Qt.AlignmentFlag.AlignCenter,
+                    label,
+                )
+
+        # A seam, so two similar images do not read as one wide one.
+        painter.setPen(QPen(self.palette().highlight().color(), 1))
+        middle = self._pane_width() + self.GAP / 2
+        painter.drawLine(QPointF(middle, 0.0), QPointF(middle, float(self.height())))
+
+        zoom = self._zoom_caption()
+        if zoom:
+            painter.setPen(self.palette().text().color())
+            painter.drawText(
+                QRectF(0, self.height() - 26, self.width(), 22),
+                Qt.AlignmentFlag.AlignCenter,
+                zoom,
+            )
 
 
 def format_bytes(count: float) -> str:
