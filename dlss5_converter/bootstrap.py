@@ -43,6 +43,13 @@ TORCH_WHEEL_URL = (
 #: hostile one.
 TORCH_APPROX_BYTES = 1_915_000_000
 
+#: PyAV carries a full FFmpeg (H.264/H.265, NVENC, AAC muxing) that OpenCV's
+#: prebuilt build does not. Downloaded on first use of the Video tab rather than
+#: shipped: its wheels bundle a GPL FFmpeg, so having the user's machine fetch
+#: it from PyPI keeps this project clear of redistributing that binary.
+AV_VERSION = "18.1.0"
+AV_APPROX_BYTES = 35_000_000
+
 BytesProgress = Callable[[int, int], None]
 TextProgress = Callable[[str], None]
 
@@ -211,3 +218,93 @@ def install(
     except OSError:
         pass
     activate()
+
+
+# -- PyAV, for the Video tab -------------------------------------------------
+
+
+def av_runtime_dir() -> Path:
+    """Where the downloaded PyAV lives, beside the PyTorch one."""
+    return paths.data_dir() / "pyav"
+
+
+def activate_av() -> None:
+    """Put a downloaded PyAV on the import path, DLLs included.
+
+    PyAV's compiled modules link against FFmpeg libraries the wheel bundles in
+    an ``av.libs`` folder on Windows; that folder has to be a legal DLL search
+    path before ``import av`` will load.
+    """
+    target = av_runtime_dir()
+    if not target.is_dir():
+        return
+    entry = str(target)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+    if hasattr(os, "add_dll_directory"):
+        for libs in (target / "av.libs", target / "av"):
+            if libs.is_dir():
+                try:
+                    os.add_dll_directory(str(libs))
+                except OSError:
+                    pass
+
+
+def av_is_ready() -> bool:
+    activate_av()
+    try:
+        return importlib.util.find_spec("av") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _resolve_av_wheel() -> tuple[str, int]:
+    """Ask PyPI for the cp312 win_amd64 wheel URL and size for our version.
+
+    Resolved at download time rather than pinned, because the hashed file path
+    on files.pythonhosted.org is not something to hard-code and keep correct.
+    """
+    import json
+
+    api = f"https://pypi.org/pypi/av/{AV_VERSION}/json"
+    request = Request(api, headers={"User-Agent": "dlss5-converter"})
+    with urlopen(request, timeout=30) as response:
+        data = json.load(response)
+    want = f"cp312-cp312-win_amd64"
+    for entry in data.get("urls", []):
+        name = entry.get("filename", "")
+        if name.endswith(".whl") and want in name:
+            return entry["url"], int(entry.get("size") or AV_APPROX_BYTES)
+    raise OSError(f"No PyAV {AV_VERSION} wheel for this Python on PyPI.")
+
+
+def install_av(
+    on_bytes: BytesProgress | None = None,
+    on_text: TextProgress | None = None,
+) -> None:
+    """Download and unpack PyAV. Raises on failure. Same staging as install()."""
+    target = av_runtime_dir()
+    staging = target.with_name(target.name + ".partial")
+    archive = target.with_name(target.name + ".whl.part")
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if on_text:
+            on_text("Finding the video component...")
+        url, _size = _resolve_av_wheel()
+        if on_text:
+            on_text(f"Downloading video support (PyAV {AV_VERSION})...")
+        _download(url, archive, on_bytes)
+        if on_text:
+            on_text("Unpacking...")
+        _extract(archive, staging, on_bytes)
+        if not (staging / "av" / "__init__.py").is_file():
+            raise OSError("The downloaded video component is missing its av package.")
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        staging.rename(target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    archive.unlink(missing_ok=True)
+    activate_av()

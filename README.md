@@ -232,6 +232,30 @@ start-up once.
 Use the **Image sequence** tab instead for animation — that keeps frames
 consistent with one another and can take your renderer's depth pass.
 
+### Video
+
+The **Video** tab, between Single image and Image sequence, converts a clip and
+keeps its audio. A video here is not run like a game — each frame is an
+independent single-image conversion, DLSS's history reset between frames, so
+nothing smears from one frame into the next. That independence is why it stays
+stable: a test render measured **−4%** frame-to-frame change versus the source,
+i.e. the neural pass adds no flicker.
+
+The same sidebar controls apply — neural strengths, style, colour — plus:
+
+- **Output codec.** **H.264/MP4** by default, hardware-encoded on your GPU
+  (NVENC) — the one format every editor and player ingests. H.265/MP4 for
+  smaller files; VP9/WebM for web upload, *not* editing (editors do not import
+  WebM cleanly).
+- **Effort.** *Quick* (1 pass) or *Quality* (4 passes). The neural pass is ~0.1 s
+  a frame either way, so a 10-second clip converts in well under a minute.
+- **Range.** Convert the first few seconds to check the look before committing to
+  the whole thing.
+
+Audio is copied from the source unchanged and muxed back in, so the result keeps
+its sound and stays in sync. Video support (PyAV, ~35 MB) downloads on first use
+of this tab, like PyTorch — nothing is bundled.
+
 ### Image sequences
 
 The **Image sequence** tab converts a rendered sequence frame by frame. Pick the

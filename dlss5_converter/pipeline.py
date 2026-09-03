@@ -421,6 +421,176 @@ class BatchItem:
     image: np.ndarray | None = None
 
 
+@dataclass
+class VideoProgress:
+    """One video conversion tick, for the UI to render."""
+
+    index: int          # frames done
+    total: int          # frames planned, 0 if unknown
+    preview: np.ndarray  # the frame just converted, display-referred
+    stage: str = "converting"  # converting | encoding | muxing | done
+
+
+def convert_video(
+    source: Path,
+    destination: Path,
+    settings: AppSettings,
+    engine: DepthEngine,
+    codec_key: str = "h264",
+    start: int = 0,
+    limit: int | None = None,
+    estimate_depth: bool = False,
+    grade_settings=None,
+    progress: Progress | None = None,
+    should_stop: Callable[[], bool] | None = None,
+):
+    """Convert a video frame by frame and mux the source audio back in.
+
+    Each frame is an independent single-image conversion - DLSS history is reset
+    every frame, exactly as in convert_sequence - so nothing smears between two
+    genuinely different frames. That independence is why the result is stable.
+
+    ``estimate_depth`` runs Depth Anything per frame. It is off by default
+    because the depth plane is not read by DLSS on a still frame (there is no
+    motion to reproject through), so estimating it changes nothing in the output
+    and is by far the slowest step. It is offered only for parity with the photo
+    path, and labelled honestly in the UI.
+
+    Yields VideoProgress as each frame lands, then once more for muxing.
+    """
+    from . import video
+
+    def say(message: str) -> None:
+        if progress:
+            progress(message)
+
+    if not video.is_available():
+        raise RuntimeError(
+            "Video support needs the PyAV component, which has not been "
+            "downloaded yet."
+        )
+    codec = video.CODECS_BY_KEY.get(codec_key)
+    if codec is None:
+        raise ValueError(f"Unknown codec {codec_key!r}.")
+
+    info = video.probe(source)
+    total = info.frames
+    if limit is not None:
+        total = min(limit, total - start) if total else limit
+
+    status = runtime.detect(settings.runtime_dir or None)
+    if not status.ready:
+        raise RuntimeError("\n".join(status.problems))
+    staged = runtime.stage_runtime(status)
+    assert status.harness is not None
+    runtime.write_addon_config(staged, settings.neural)
+
+    if estimate_depth:
+        engine.load(settings.depth.model_id, progress=progress)
+    offsets = contract.jitter_sequence(settings.evaluation.frames)
+    if not settings.evaluation.jitter:
+        offsets = [(0.0, 0.0)] * len(offsets)
+
+    scratch = paths.scratch_dir()
+    colour_path = scratch / "vid_colour.bin"
+    depth_path = scratch / "vid_depth.bin"
+    motion_path = scratch / "vid_motion.bin"
+    out_path = scratch / "vid_out.bin"
+    video_only = scratch / f"vid_video_only{codec.suffix}"
+
+    harness: evaluator.Harness | None = None
+    writer: video.VideoWriter | None = None
+    size: tuple[int, int] | None = None
+    done = 0
+
+    try:
+        for source_rgb in video.frames(source, start=start, limit=limit,
+                                        should_stop=should_stop):
+            if should_stop is not None and should_stop():
+                say("Stopped.")
+                return
+            fitted = contract.fit_to_budget(source_rgb, settings.evaluation.max_edge)
+            height, width = fitted.shape[:2]
+
+            if harness is None:
+                # The first frame fixes the size for the whole clip: one harness,
+                # one set of NGX buffers, and one output stream.
+                np.zeros((height, width, 2), np.float16).tofile(motion_path)
+                np.zeros((height, width), np.float32).tofile(depth_path)
+                harness = evaluator.Harness(
+                    status.harness, width=width, height=height,
+                    depth_path=depth_path, motion_path=motion_path,
+                    neural=settings.neural, frames=settings.evaluation.frames,
+                )
+                harness.__enter__()
+                size = (width, height)
+                writer = video.VideoWriter(video_only, codec, info.fps, size)
+            elif (width, height) != size:
+                # A source whose frames change size mid-stream is degenerate;
+                # refuse rather than silently rescaling to the first frame.
+                raise RuntimeError(
+                    f"Frame {done + 1} is {width}x{height}, but the video "
+                    f"started at {size[0]}x{size[1]}."
+                )
+
+            if estimate_depth:
+                inverse = engine.infer(
+                    (np.clip(fitted, 0, 1) * 255).astype(np.uint8),
+                    input_size=settings.depth.input_size, tiled=settings.depth.tiled,
+                )
+                shaped = contract.to_hardware_depth(inverse, settings.depth.contrast)
+                np.ascontiguousarray(shaped).tofile(depth_path)
+                harness.set_depth(depth_path)
+
+            linear = contract.srgb_to_linear(np.clip(fitted, 0, 1))
+            harness.reset_history()
+            for offset in offsets:
+                shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+                plane = np.empty((height, width, 4), np.float16)
+                plane[..., :3] = shifted.astype(np.float16)
+                plane[..., 3] = np.float16(1.0)
+                plane.tofile(colour_path)
+                harness.frame(colour_path, offset)
+            harness.write(out_path)
+
+            enhanced = np.clip(
+                contract.linear_to_srgb(contract.read_output(out_path, width, height)),
+                0.0, 1.0,
+            )
+            if grade_settings is not None:
+                enhanced = grade.apply(enhanced, grade_settings)
+            assert writer is not None
+            writer.write(enhanced)
+            done += 1
+            say(f"pass {done} of {total}" if total else f"frame {done}")
+            yield VideoProgress(done, total, enhanced, "converting")
+
+        if writer is not None:
+            writer.close()
+            writer = None
+        if harness is not None:
+            harness.__exit__(None, None, None)
+            harness = None
+
+        if done == 0:
+            raise RuntimeError("No frames were converted.")
+
+        say("Adding audio…")
+        yield VideoProgress(done, total, np.zeros((1, 1, 3), np.float32), "muxing")
+        had_audio = video.mux_audio(Path(source), video_only, destination)
+        yield VideoProgress(done, total, np.zeros((1, 1, 3), np.float32),
+                            "done" if had_audio else "done-no-audio")
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if harness is not None:
+            harness.__exit__(None, None, None)
+        video_only.unlink(missing_ok=True)
+
+
 def convert_batch(
     images: list[Path],
     settings: AppSettings,

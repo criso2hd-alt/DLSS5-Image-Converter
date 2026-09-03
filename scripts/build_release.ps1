@@ -83,6 +83,7 @@ $ErrorActionPreference = "Continue"
     --workpath (Join-Path $ProjectRoot "build\pyinstaller-work") `
     --specpath (Join-Path $ProjectRoot "build") `
     --exclude-module torch `
+    --exclude-module av `
     --collect-all sympy `
     --collect-all networkx `
     --hidden-import jinja2 `

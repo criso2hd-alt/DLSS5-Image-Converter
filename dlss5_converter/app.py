@@ -48,6 +48,7 @@ from . import (
     resample,
     runtime,
     sequence,
+    video,
 )
 from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
@@ -906,6 +907,179 @@ class BatchDialog(QDialog):
         super().closeEvent(event)
 
 
+class VideoDownloadWorker(QObject):
+    """Fetches PyAV the first time the Video tab is used."""
+
+    progress = Signal(object, object)  # done, total bytes
+    status = Signal(str)
+    finished = Signal()
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            bootstrap.install_av(
+                on_bytes=lambda d, t: self.progress.emit(d, t),
+                on_text=self.status.emit,
+            )
+        except Exception as error:  # noqa: BLE001 - surfaced in the UI
+            self.failed.emit(str(error))
+            return
+        self.finished.emit()
+
+
+class VideoWorker(QObject):
+    """Drives a whole video off the UI thread, reporting each frame."""
+
+    progress = Signal(str)
+    frame_done = Signal(object)   # pipeline.VideoProgress
+    finished = Signal(object)     # the output path
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        source: Path,
+        destination: Path,
+        settings: AppSettings,
+        engine: DepthEngine,
+        codec_key: str,
+        start: int,
+        limit,
+        estimate_depth: bool,
+    ) -> None:
+        super().__init__()
+        self._source = source
+        self._destination = destination
+        self._settings = settings
+        self._engine = engine
+        self._codec = codec_key
+        self._start = start
+        self._limit = limit
+        self._estimate = estimate_depth
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            for update in pipeline.convert_video(
+                self._source, self._destination, self._settings, self._engine,
+                codec_key=self._codec, start=self._start, limit=self._limit,
+                estimate_depth=self._estimate,
+                grade_settings=self._settings.grade,
+                progress=self.progress.emit,
+                should_stop=lambda: self._stop,
+            ):
+                self.frame_done.emit(update)
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(self._destination)
+
+
+class VideoPage(QWidget):
+    """The Video tab: a clip in, a converted clip out, audio carried across.
+
+    Shares the sidebar with the photo tab - the neural strengths, style, depth
+    and colour all mean the same thing on a frame of video - and adds only what
+    video needs: which codec, how hard to work each frame, and how much of the
+    clip to do.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.source: Path | None = None
+        self.info = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.preview = ImageView()
+        layout.addWidget(self.preview, 1)
+
+        pick_row = QHBoxLayout()
+        self.pick_video = QPushButton("Choose video…")
+        self.source_label = QLabel("No video chosen")
+        self.source_label.setObjectName("hint")
+        pick_row.addWidget(self.pick_video)
+        pick_row.addWidget(self.source_label, 1)
+        layout.addLayout(pick_row)
+
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Output"))
+        self.codec_box = QComboBox()
+        for codecdef in video.CODECS:
+            self.codec_box.addItem(codecdef.label, codecdef.key)
+        self.codec_box.setToolTip(
+            "H.264/MP4 is the safe default - every editor and player takes it, "
+            "and it is hardware-encoded on your GPU.\n\n"
+            "H.265 is smaller for modern editors. VP9/WebM is for web upload, "
+            "not for editing - editors do not import WebM cleanly."
+        )
+        opts.addWidget(self.codec_box)
+
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Effort"))
+        self.mode_box = QComboBox()
+        self.mode_box.addItem("Quick (1 pass)", 1)
+        self.mode_box.addItem("Quality (4 passes)", 4)
+        self.mode_box.setToolTip(
+            "Passes let DLSS's accumulator settle. One is fast and usually "
+            "plenty for video; four is steadier on tricky material.\n\n"
+            "The neural pass is ~0.1 s a frame either way - the cost is the "
+            "passes, not the codec."
+        )
+        opts.addWidget(self.mode_box)
+        opts.addStretch(1)
+        layout.addLayout(opts)
+
+        range_row = QHBoxLayout()
+        self.whole = QCheckBox("Whole clip")
+        self.whole.setChecked(True)
+        range_row.addWidget(self.whole)
+        range_row.addWidget(QLabel("or first"))
+        self.seconds = QSpinBox()
+        self.seconds.setRange(1, 3600)
+        self.seconds.setValue(5)
+        self.seconds.setSuffix(" s")
+        self.seconds.setEnabled(False)
+        self.seconds.setToolTip("Convert a few seconds first to check the look before the whole thing.")
+        self.whole.toggled.connect(lambda on: self.seconds.setEnabled(not on))
+        range_row.addWidget(self.seconds)
+        range_row.addStretch(1)
+
+        self.estimate_depth = QCheckBox("Estimate depth per frame")
+        self.estimate_depth.setToolTip(
+            "Off by default, and honestly labelled: DLSS does not read the depth "
+            "plane on a still frame (there is no motion to reproject through), "
+            "so this changes nothing in the output and is by far the slowest "
+            "step. Here only for parity with the photo path."
+        )
+        range_row.addWidget(self.estimate_depth)
+        layout.addLayout(range_row)
+
+        self.info_label = QLabel("")
+        self.info_label.setObjectName("hint")
+        layout.addWidget(self.info_label)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.setVisible(False)
+        layout.addWidget(self.bar)
+
+        run_row = QHBoxLayout()
+        self.start = QPushButton("Convert video")
+        self.start.setEnabled(False)
+        self.stop = QPushButton("Stop")
+        self.stop.setObjectName("secondary")
+        self.stop.setVisible(False)
+        run_row.addStretch(1)
+        run_row.addWidget(self.stop)
+        run_row.addWidget(self.start)
+        layout.addLayout(run_row)
+
+
 class SequenceWorker(QObject):
     """Drives a whole sequence off the UI thread, reporting each frame."""
 
@@ -1246,6 +1420,10 @@ class MainWindow(QMainWindow):
         self._download_dialog: DownloadDialog | None = None
         self._seq_thread: QThread | None = None
         self._seq_worker: SequenceWorker | None = None
+        self._video_thread: QThread | None = None
+        self._video_worker = None
+        self._video_dl_thread: QThread | None = None
+        self._video_dl_worker = None
         self.style_results: dict[int, pipeline.Result] = {}
         self._style_signature_used: tuple | None = None
         self._style_worker: StyleWorker | None = None
@@ -1312,11 +1490,14 @@ class MainWindow(QMainWindow):
         # Two pages, one shared sidebar. The settings mean the same thing in
         # both, and using identical settings across every frame is most of what
         # makes a sequence look consistent - so they should not be duplicated.
+        self.video_page = VideoPage()
         self.sequence_page = SequencePage()
         self.tabs = QTabWidget()
         self.tabs.addTab(canvas, "Single image")
+        self.tabs.addTab(self.video_page, "Video")
         self.tabs.addTab(self.sequence_page, "Image sequence")
         self._wire_sequence_page()
+        self._wire_video_page()
 
         layout.addWidget(self.tabs, 1)
         # The sidebar scrolls rather than being squeezed. It is a fixed stack of
@@ -2319,7 +2500,182 @@ class MainWindow(QMainWindow):
 
     # -- sequence page -------------------------------------------------------
 
+    def _wire_video_page(self) -> None:
+        page = self.video_page
+        page.pick_video.clicked.connect(self._pick_video)
+        page.start.clicked.connect(self._start_video)
+        page.stop.clicked.connect(self._stop_video)
+        page.mode_box.currentIndexChanged.connect(self._video_mode_changed)
+
+    def _pick_video(self) -> None:
+        exts = " ".join(f"*{s}" for s in sorted(video.INPUT_SUFFIXES))
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose video", "", f"Video ({exts})"
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        # Probing needs PyAV. If it is not here yet, offer to fetch it now
+        # rather than after the user has set everything up and pressed Convert.
+        if not video.is_available():
+            self._download_video_support(then=lambda: self._load_video(path))
+            return
+        self._load_video(path)
+
+    def _load_video(self, path: Path) -> None:
+        try:
+            info = video.probe(path)
+        except Exception as error:  # noqa: BLE001
+            QMessageBox.warning(self, "Could not open video", str(error))
+            return
+        self.video_page.source = path
+        self.video_page.info = info
+        self.video_page.source_label.setText(path.name)
+        self.video_page.info_label.setText(info.describe())
+        self.video_page.start.setEnabled(True)
+        # Show frame one so the tab is not blank before a run.
+        try:
+            first = next(video.frames(path, limit=1))
+            self.video_page.preview.set_image(_downscale_for_preview(first), path.name)
+        except Exception:  # noqa: BLE001 - a preview is a nicety, not required
+            pass
+
+    def _video_mode_changed(self) -> None:
+        self.settings.evaluation.frames = int(self.video_page.mode_box.currentData() or 1)
+
+    def _start_video(self) -> None:
+        page = self.video_page
+        if page.source is None or self._video_thread is not None:
+            return
+        if not video.is_available():
+            self._download_video_support(then=self._start_video)
+            return
+
+        codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
+        default = paths.output_dir() / f"{page.source.stem}_dlss5{codec.suffix}"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Save video", str(default), f"{codec.label} (*{codec.suffix})"
+        )
+        if not chosen:
+            return
+
+        self.settings.evaluation.frames = int(page.mode_box.currentData() or 1)
+        limit = None
+        if not page.whole.isChecked() and page.info is not None:
+            limit = max(1, round(page.seconds.value() * page.info.fps))
+
+        page.start.setEnabled(False)
+        page.pick_video.setEnabled(False)
+        page.stop.setVisible(True)
+        page.bar.setVisible(True)
+        page.bar.setValue(0)
+        total = limit if limit is not None else (page.info.frames if page.info else 0)
+        page.bar.setMaximum(total or 0)
+
+        self._video_thread = QThread(self)
+        self._video_worker = VideoWorker(
+            page.source, Path(chosen), self.settings, self.engine,
+            page.codec_box.currentData(), 0, limit,
+            page.estimate_depth.isChecked(),
+        )
+        self._video_worker.moveToThread(self._video_thread)
+        self._video_thread.started.connect(self._video_worker.run)
+        self._video_worker.frame_done.connect(self._video_frame_done)
+        self._video_worker.finished.connect(self._video_finished)
+        self._video_worker.failed.connect(self._video_failed)
+        self._video_thread.start()
+
+    def _stop_video(self) -> None:
+        if self._video_worker is not None:
+            self._video_worker.stop()
+            self.video_page.info_label.setText("Stopping after this frame...")
+
+    def _video_frame_done(self, update) -> None:
+        page = self.video_page
+        if update.stage == "converting":
+            page.bar.setValue(update.index)
+            page.bar.setFormat("%v of %m frames")
+            # Every few frames, not every frame: repainting a preview per frame
+            # on a fast clip is wasted work.
+            if update.index % 3 == 0 or update.index == update.total:
+                page.preview.set_image(
+                    _downscale_for_preview(update.preview),
+                    f"frame {update.index}"
+                    + (f" of {update.total}" if update.total else ""),
+                )
+        elif update.stage == "muxing":
+            page.info_label.setText("Adding audio...")
+        elif update.stage.startswith("done"):
+            note = "" if update.stage == "done" else " (source had no audio)"
+            page.info_label.setText(f"Done{note}.")
+
+    def _video_finished(self, output: Path) -> None:
+        self._video_teardown()
+        self.video_page.info_label.setText(f"Saved {Path(output).name}")
+        self.statusBar().showMessage(f"Video saved: {output}")
+
+    def _video_failed(self, message: str) -> None:
+        self._video_teardown()
+        QMessageBox.warning(self, "Video conversion failed", message)
+        self.video_page.info_label.setText("Conversion failed")
+
+    def _video_teardown(self) -> None:
+        if self._video_thread is not None:
+            self._video_thread.quit()
+            self._video_thread.wait(15000)
+            self._video_thread = None
+        self._video_worker = None
+        page = self.video_page
+        page.start.setEnabled(page.source is not None)
+        page.pick_video.setEnabled(True)
+        page.stop.setVisible(False)
+
+    def _download_video_support(self, then) -> None:
+        """Fetch PyAV, then run `then`. Blocks the tab with a progress bar."""
+        if self._video_dl_thread is not None:
+            return
+        page = self.video_page
+        page.bar.setVisible(True)
+        page.bar.setMaximum(0)  # indeterminate until byte totals arrive
+        page.info_label.setText("Downloading video support (about 35 MB, once)...")
+        page.pick_video.setEnabled(False)
+        page.start.setEnabled(False)
+
+        self._video_dl_thread = QThread(self)
+        self._video_dl_worker = VideoDownloadWorker()
+        self._video_dl_worker.moveToThread(self._video_dl_thread)
+        self._video_dl_thread.started.connect(self._video_dl_worker.run)
+
+        def on_bytes(done, total):
+            page.bar.setMaximum(int(total) or 0)
+            page.bar.setValue(int(done))
+        self._video_dl_worker.progress.connect(on_bytes)
+        self._video_dl_worker.status.connect(page.info_label.setText)
+
+        def done():
+            self._video_dl_thread.quit()
+            self._video_dl_thread.wait()
+            self._video_dl_thread = None
+            self._video_dl_worker = None
+            page.bar.setVisible(False)
+            page.pick_video.setEnabled(True)
+            then()
+
+        def failed(msg):
+            self._video_dl_thread.quit()
+            self._video_dl_thread.wait()
+            self._video_dl_thread = None
+            self._video_dl_worker = None
+            page.bar.setVisible(False)
+            page.pick_video.setEnabled(True)
+            page.info_label.setText("")
+            QMessageBox.warning(self, "Could not add video support", msg)
+        self._video_dl_worker.finished.connect(done)
+        self._video_dl_worker.failed.connect(failed)
+        self._video_dl_thread.start()
+
     def _wire_sequence_page(self) -> None:
+
         page = self.sequence_page
         page.pick_frames.clicked.connect(self._pick_sequence)
         page.pick_depth.clicked.connect(self._pick_depth_sequence)
@@ -3054,11 +3410,17 @@ class MainWindow(QMainWindow):
         # the second one after the window has gone.
         if self._style_worker is not None:
             self._style_worker.stop()
+        # A video is many conversions in a row; stop it so it does not carry on
+        # feeding a harness after the window has closed.
+        if self._video_worker is not None:
+            self._video_worker.stop()
         for thread in (
             self._thread,
             self._depth_thread,
             self._download_thread,
             self._seq_thread,
+            self._video_thread,
+            self._video_dl_thread,
         ):
             if thread is None:
                 continue
