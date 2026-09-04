@@ -446,9 +446,17 @@ Reasonable question for a random executable:
 
 - The source is here. Build it yourself with the two scripts above.
 - **No NVIDIA binaries are bundled and there is no downloader for them.**
-- The app talks to exactly two hosts, both on first launch: `download.pytorch.org`
-  and `huggingface.co`. Nothing else phones home, and there is no telemetry.
+- The app talks to exactly three hosts, all HTTPS, all first-run downloads:
+  `download.pytorch.org`, `huggingface.co`, and `pypi.org` (the video
+  component). Nothing else phones home from our code, and there is no telemetry.
+- Our code **never writes to the registry**; the only key it reads is your Steam
+  install path, to find your games for *Find my DLSS files*.
 - Roughly 2,500 lines of Python and one ~600-line C++ file.
+
+**[SECURITY.md](SECURITY.md)** answers the antivirus warnings and the registry
+questions in full — including why unsigned builds get flagged, exactly which
+registry keys are read (and by what — Windows' TLS checks and NVIDIA's own NGX
+updater, not our code), and how to verify all of it yourself.
 
 ## Something not working?
 
