@@ -10,6 +10,13 @@ This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of t
 > this project will not help you obtain them. You point it at the copies you
 > already have.
 
+## Buy me a coffee
+
+If this app helped you in any way and you feel like it, you can buy me a coffee.
+No pressure, it is free either way. Thank you.
+
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-criso2hdj-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/criso2hdj)
+
 ## See it
 
 The wipe divider — drag it across the image to compare. Everything on one side
