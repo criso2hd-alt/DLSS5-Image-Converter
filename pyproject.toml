@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlss5-converter"
-version = "0.2.0"
+version = "0.2.1"
 description = "Run NVIDIA's DLSS 5 neural renderer over still images."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

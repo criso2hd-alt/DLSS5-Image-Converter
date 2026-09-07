@@ -123,3 +123,37 @@ def test_safe_parts_strips_traversal_and_empty_segments():
     assert bootstrap._safe_parts("a/b/c") == ["a", "b", "c"]
     assert bootstrap._safe_parts("../../etc/passwd") == ["etc", "passwd"]
     assert bootstrap._safe_parts("a//./b/") == ["a", "b"]
+
+
+def test_os_path_prefixes_long_paths_on_windows():
+    if os.name != "nt":
+        pytest.skip("the extended-length prefix is Windows-only")
+    prefixed = bootstrap._os_path(Path("C:/torch/include/deep"))
+    assert prefixed.startswith("\\\\?\\"), prefixed
+    # Already-prefixed paths are left as-is rather than double-prefixed.
+    assert bootstrap._os_path(Path(prefixed)) == prefixed
+
+
+def test_extraction_survives_paths_over_the_windows_limit(tmp_path):
+    """A CUDA torch tree overflows MAX_PATH; the unpack must not fail on it.
+
+    This is the "crashes/freezes at the end of the download" regression: without
+    the extended-length prefix, ZipFile.extract could not open the deepest files
+    on a machine without long-path support enabled.
+    """
+    if os.name != "nt":
+        pytest.skip("MAX_PATH only bites on Windows")
+    deep = "/".join(f"segment_{i:02d}_padding_padding" for i in range(20))
+    name = f"pkg/{deep}/leaf.bin"
+    data = os.urandom(2048)
+    archive = tmp_path / "deep.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(name, data)
+    out = tmp_path / "out"
+
+    bootstrap._extract(archive, out, on_bytes=None, on_text=None)
+
+    dest = out.joinpath(*bootstrap._safe_parts(name))
+    assert len(os.path.abspath(str(dest))) > 260, "the test path must actually exceed MAX_PATH"
+    with open(bootstrap._os_path(dest), "rb") as handle:
+        assert handle.read() == data

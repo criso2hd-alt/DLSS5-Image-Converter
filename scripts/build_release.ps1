@@ -162,6 +162,9 @@ $env:Path = (($env:Path -split ";") | Where-Object {
     --collect-all PySide6.QtMultimedia `
     --collect-all PySide6.QtMultimediaWidgets `
     --collect-all transformers `
+    --collect-submodules transformers `
+    --hidden-import transformers.models.auto.image_processing_auto `
+    --hidden-import transformers.models.auto.modeling_auto `
     --collect-all tokenizers `
     --collect-data safetensors `
     --copy-metadata transformers `

@@ -246,7 +246,22 @@ class DepthEngine:
         enable_system_trust_store()
 
         import torch
-        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+        try:
+            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        except ImportError:
+            # In the frozen (PyInstaller) build transformers' lazy top-level
+            # __init__ can fail to expose these - "cannot import name
+            # 'AutoImageProcessor' from 'transformers'" - even though the
+            # submodules are bundled. Importing straight from those submodules
+            # sidesteps the lazy loader and works where the top-level import does
+            # not. Harmless on a normal install, where the first import succeeds.
+            from transformers.models.auto.image_processing_auto import (
+                AutoImageProcessor,
+            )
+            from transformers.models.auto.modeling_auto import (
+                AutoModelForDepthEstimation,
+            )
 
         if self.model_id == model_id and self.model is not None:
             return self.device
