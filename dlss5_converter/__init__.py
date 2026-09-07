@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # OpenCV ships the OpenEXR codec but disables it at runtime unless this is set
 # (opencv/opencv#21326). EXR matters more here than in a normal photo app: the

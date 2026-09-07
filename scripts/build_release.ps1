@@ -13,6 +13,11 @@ $Release = Join-Path $ProjectRoot "release"
 $Engine = Join-Path $Release "engine"
 $Staging = Join-Path $ProjectRoot "build\pyinstaller"
 
+# Absolute so --add-data resolves against the project, not the --specpath dir
+# (PyInstaller resolves a relative data source relative to the spec folder,
+# which is build\, where dlss5_converter\assets does not exist).
+$AssetsSrc = Join-Path $ProjectRoot "dlss5_converter\assets"
+
 # Folders that belong to the user, not to the build. A rebuild must never take
 # out a 400 MB model download or a folder of converted images, which is the
 # hazard that made CLAUDE.md keep weights out of the app directory in the first
@@ -58,6 +63,17 @@ Write-Host "Freezing the application (lean: PyTorch is fetched on first run)." -
 # honest signal here anyway.
 $Previous = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
+
+# Codex desktop adds its document/PDF runtime (including Poppler's private ICU
+# build) to PATH. PyInstaller follows PATH while resolving Qt6Core's dependency
+# on Windows' system ICU shim and can therefore bundle Poppler's incompatible
+# `icuuc.dll` instead. The names match, the exports do not, and the frozen app
+# then fails at import with "specified procedure could not be found". External
+# Codex runtimes are build-host tooling, never application dependencies.
+$PreviousPath = $env:Path
+$env:Path = (($env:Path -split ";") | Where-Object {
+    $_ -and $_ -notmatch "[\\/]\.cache[\\/]codex-runtimes[\\/]"
+}) -join ";"
 
 # torch is excluded on purpose: it is 2.7 GB of the ~3 GB a bundled build used
 # to be, and dlss5_converter.bootstrap downloads the wheel on first launch
@@ -162,8 +178,10 @@ $ErrorActionPreference = "Continue"
     --exclude-module tkinter `
     --exclude-module matplotlib `
     --exclude-module pytest `
+    --add-data "$AssetsSrc;dlss5_converter/assets" `
     main.py
 $FrozenExit = $LASTEXITCODE
+$env:Path = $PreviousPath
 $ErrorActionPreference = $Previous
 if ($FrozenExit -ne 0) { throw "PyInstaller failed (exit $FrozenExit)." }
 
@@ -190,6 +208,30 @@ Get-ChildItem -LiteralPath $Release -Force | Where-Object {
 
 Write-Host "Copying the frozen application into release\ ..." -ForegroundColor Cyan
 Copy-Item -Path (Join-Path $Frozen "*") -Destination $Release -Recurse -Force
+
+# PyInstaller brings Python's older VC runtime into _internal, while current
+# PySide6 ships the newer runtime it was linked against inside PySide6\. Windows
+# loads the root copy first, so QtCore then fails with "specified procedure could
+# not be found" even though every Qt DLL is present. Put PySide's matching pair
+# at the shared search root; they are backward-compatible with Python and keep
+# the frozen app self-contained on machines without the latest VC redistributable.
+$Internal = Join-Path $Release "_internal"
+$PySideInternal = Join-Path $Internal "PySide6"
+foreach ($RuntimeDll in @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll")) {
+    $MatchingRuntime = Join-Path $PySideInternal $RuntimeDll
+    if (-not (Test-Path -LiteralPath $MatchingRuntime)) {
+        throw "PySide6 did not supply $RuntimeDll; cannot guarantee a compatible Qt runtime."
+    }
+    Copy-Item -LiteralPath $MatchingRuntime -Destination (Join-Path $Internal $RuntimeDll) -Force
+}
+
+# Qt on Windows intentionally resolves `icuuc.dll` from System32. A copy at the
+# application root can only shadow that contract; in our build environment it
+# means Poppler leaked in from PATH. Fail before presenting a broken release.
+$ForeignIcu = Join-Path $Internal "icuuc.dll"
+if (Test-Path -LiteralPath $ForeignIcu) {
+    throw "A foreign icuuc.dll was bundled at $ForeignIcu. Check PATH contamination."
+}
 
 foreach ($Folder in $UserFolders) {
     New-Item -ItemType Directory -Force -Path (Join-Path $Release $Folder) | Out-Null

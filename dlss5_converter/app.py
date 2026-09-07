@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsDropShadowEffect,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -40,9 +41,12 @@ from PySide6.QtWidgets import (
 from . import (
     bootstrap,
     contract,
+    detail,
     discovery,
+    effects,
     evaluator,
     grade,
+    onboarding,
     paths,
     pipeline,
     resample,
@@ -53,9 +57,11 @@ from . import (
 from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
 from .settings import (
+    DETAIL_BOOST_FACTORS,
     MAX_EDGE_CHOICES,
     NR_COLOR_MAX,
     NR_PAPER_WHITE_MAX,
+    ONBOARDING_VERSION,
     NR_PRESETS,
     NR_STRENGTH_MAX,
     NR_STYLES,
@@ -63,14 +69,24 @@ from .settings import (
     AppSettings,
 )
 from .widgets import (
+    FONT_DISPLAY,
+    FONT_MONO,
+    ChipSliderGroup,
     DownloadDialog,
+    GpuGauge,
+    HoverBar,
+    ModuleCard,
+    StageHost,
     TimelineWidget,
     DropZone,
     ImageView,
+    SegmentedControl,
     SideBySideView,
     SliderRow,
     WipeView,
+    apply_font,
     first_supported,
+    stage_placeholder,
 )
 
 #: The sidebar's own width. The scroll area around it adds room for a bar.
@@ -88,25 +104,292 @@ _PASS_COUNT = re.compile(r"pass (\d+) of (\d+)")
 #: Matches SideBySideView.GAP so the pane dropdowns line up with the panes.
 GAP_BETWEEN_PANES = 12
 
-STYLE = """
-QMainWindow, QWidget { background: #16181d; color: #e6e8ec; }
-QGroupBox { border: 1px solid #2a2e37; border-radius: 8px; margin-top: 14px; padding: 10px; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #9aa2b1; }
-QLabel#hint { color: #7d8698; }
+#: The dark "instrument cockpit" theme, as a set of interchangeable palettes.
+#: Each is a full colour world with a resting accent (`signal`) and a warm
+#: action accent (`heat`, the Convert hover — "the neural pass firing"), so
+#: colour reads as activity rather than decoration. The stylesheet is one
+#: template; a palette fills its tokens. Glows come from a drop-shadow in code
+#: (QSS has no box-shadow) and the dark canvas from a Fusion dark QPalette.
+from string import Template as _Template
+
+#: Curated, not open-ended: five tastes rather than a colour picker, so every
+#: choice is one someone designed. Order is the order shown in the menu.
+PALETTES: dict[str, dict[str, str]] = {
+    "Neural Cyan": dict(
+        ground="#0A0E15", panel_hi="#141d2c", panel_lo="#101825", base="#0b1220",
+        line="#23304a", line_soft="#1a2436", ink="#E8EEF9", ink_dim="#93A2BC",
+        ink_faint="#5C6B85", signal="#37E1FF", signal_deep="#0d8fb8",
+        signal_light="#5eeaff", heat="#FF7A3C", heat_deep="#d9531f",
+        heat_light="#ffd0a8", on_accent="#04121a",
+    ),
+    "Ember": dict(
+        ground="#100C09", panel_hi="#20180F", panel_lo="#17110B", base="#140F0A",
+        line="#3B2C1E", line_soft="#241A12", ink="#F6ECE2", ink_dim="#B79E88",
+        ink_faint="#7C6857", signal="#FF9838", signal_deep="#C25E13",
+        signal_light="#FFB566", heat="#FF4E67", heat_deep="#C21F38",
+        heat_light="#FF9DAB", on_accent="#1A0D02",
+    ),
+    "Violet Flux": dict(
+        ground="#0C0A17", panel_hi="#191529", panel_lo="#130F22", base="#100C1E",
+        line="#2E2650", line_soft="#1C1636", ink="#ECE8F9", ink_dim="#A79BCC",
+        ink_faint="#675C85", signal="#A96BFF", signal_deep="#6A2FD8",
+        signal_light="#C295FF", heat="#37E1FF", heat_deep="#0d8fb8",
+        heat_light="#8EF0FF", on_accent="#0D0420",
+    ),
+    "Emerald": dict(
+        ground="#08120E", panel_hi="#10201A", panel_lo="#0C1913", base="#0A1611",
+        line="#1E4436", line_soft="#142B22", ink="#E4F5EC", ink_dim="#8FBBA6",
+        ink_faint="#567A68", signal="#35E0A1", signal_deep="#12A56A",
+        signal_light="#6FF0C1", heat="#FFC24B", heat_deep="#D99320",
+        heat_light="#FFE0A0", on_accent="#04140C",
+    ),
+    "Slate Mono": dict(
+        ground="#0D1017", panel_hi="#171C26", panel_lo="#12161F", base="#0F131B",
+        line="#2A3242", line_soft="#1D2330", ink="#E6EAF1", ink_dim="#97A0B2",
+        ink_faint="#5E6675", signal="#8FB4E0", signal_deep="#567AA8",
+        signal_light="#B3D0F0", heat="#E0A96B", heat_deep="#A8763C",
+        heat_light="#F0D0A8", on_accent="#0A1420",
+    ),
+}
+DEFAULT_THEME = "Neural Cyan"
+
+_STYLE_TEMPLATE = _Template("""
+* { font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif; }
+QMainWindow, QDialog { background: $ground; }
+QWidget { background: transparent; color: $ink; font-size: 13px; }
+
+QGroupBox {
+    border: 1px solid $line_soft; border-radius: 14px; margin-top: 16px;
+    padding: 15px 14px 13px 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $panel_hi, stop:1 $panel_lo);
+}
+QGroupBox::title {
+    subcontrol-origin: margin; left: 14px; top: 2px; padding: 0 6px;
+    color: $ink_dim; font-weight: 700;
+}
+
+QLabel { background: transparent; }
+QLabel#hint { color: $ink_faint; }
+QLabel#linkSep { color: $line; }
+QLabel#onboardingEyebrow { color: $signal; }
+QLabel#onboardingTitle { color: $ink; font-weight: 700; }
+QListWidget#onboardingSources {
+    background: $base; border: 1px solid $line_soft; border-radius: 9px;
+    padding: 6px; color: $ink_dim;
+}
+QListWidget#onboardingSources::item { padding: 5px; }
+QListWidget#onboardingSources::item:selected { background: $panel_hi; color: $ink; }
+
 QFrame#dropZone {
-    border: 2px dashed #39404e; border-radius: 12px; background: #1b1e25;
+    border: 2px dashed $line; border-radius: 16px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $panel_lo, stop:1 $ground);
 }
-QFrame#dropZone[hovering="true"] { border-color: #5b8cff; background: #1f2532; }
+QFrame#dropZone[hovering="true"] { border-color: $signal; background: $panel_hi; }
+
 QPushButton {
-    background: #2b6cf6; border: none; border-radius: 6px; padding: 9px 16px; font-weight: 600;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep);
+    color: $on_accent; border: none; border-radius: 9px; padding: 9px 16px; font-weight: 700;
 }
-QPushButton:disabled { background: #2a2e37; color: #6b7280; }
-QPushButton#secondary { background: #262a33; }
-QSlider::groove:horizontal { height: 4px; background: #2a2e37; border-radius: 2px; }
+QPushButton:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal_light, stop:1 $signal_deep);
+}
+QPushButton:disabled { background: $panel_lo; color: $ink_faint; }
+QPushButton#secondary {
+    background: $panel_lo; color: $ink; border: 1px solid $line; font-weight: 600;
+}
+QPushButton#secondary:hover { border-color: $signal_deep; color: $ink; background: $panel_hi; }
+QPushButton#secondary:checked {
+    background: $base; color: $signal; border: 1px solid $signal_deep;
+}
+QPushButton#secondary:disabled { color: $ink_faint; border-color: $line_soft; background: $panel_lo; }
+QPushButton#convert {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal_light, stop:0.5 $signal, stop:1 $signal_deep);
+    color: $on_accent; border-radius: 12px; padding: 15px; font-weight: 800; font-size: 15px;
+}
+QPushButton#convert:hover {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $heat_light, stop:0.5 $heat, stop:1 $heat_deep);
+}
+QPushButton#convert:disabled { background: $panel_lo; color: $ink_faint; }
+QPushButton#link {
+    background: transparent; color: $ink_faint; border: none; padding: 4px 2px; font-weight: 500;
+}
+QPushButton#link:hover { color: $signal; }
+QPushButton#chip {
+    background: $base; color: $ink_dim; border: 1px solid $line; border-radius: 9px;
+    padding: 7px 13px; font-weight: 500;
+}
+QPushButton#chip:hover { color: $ink; border-color: $signal_deep; }
+QPushButton#chip:checked {
+    color: $on_accent; font-weight: 600; border-color: transparent;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep);
+}
+
+QSlider:horizontal { min-height: 22px; }
+QSlider::groove:horizontal { height: 6px; border-radius: 3px; background: $base; border: 1px solid $line_soft; margin: 0 9px; }
+QSlider::sub-page:horizontal {
+    height: 6px; border-radius: 3px; margin: 0 9px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $signal_deep, stop:1 $signal);
+}
+QSlider::add-page:horizontal { height: 6px; border-radius: 3px; background: $base; margin: 0 9px; }
 QSlider::handle:horizontal {
-    background: #5b8cff; width: 14px; margin: -6px 0; border-radius: 7px;
+    background: $signal_light; border: 2px solid $signal; width: 15px; height: 15px;
+    margin: -6px -9px; border-radius: 9px;
 }
-"""
+QSlider::handle:horizontal:hover { border-color: $signal_light; }
+
+QComboBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 7px 12px; }
+QComboBox:hover { border-color: $signal_deep; }
+QComboBox:disabled { color: $ink_faint; border-color: $line_soft; }
+QComboBox::drop-down { border: none; width: 22px; }
+QComboBox QAbstractItemView {
+    background: $panel_lo; color: $ink; border: 1px solid $line;
+    selection-background-color: $line; outline: none; padding: 4px;
+}
+QSpinBox { background: $base; color: $ink; border: 1px solid $line; border-radius: 9px; padding: 6px 8px; }
+QSpinBox:hover { border-color: $signal_deep; }
+
+QCheckBox { color: $ink; spacing: 8px; background: transparent; }
+QCheckBox::indicator { width: 17px; height: 17px; border-radius: 5px; border: 1px solid $line; background: $base; }
+QCheckBox::indicator:hover { border-color: $signal; }
+QCheckBox::indicator:checked {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep); border-color: $signal;
+}
+
+QProgressBar {
+    background: $base; border: 1px solid $line_soft; border-radius: 6px; height: 12px;
+    text-align: center; color: $ink_dim; font-size: 11px;
+}
+QProgressBar::chunk {
+    border-radius: 5px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $signal_deep, stop:1 $signal);
+}
+
+QTabWidget::pane { border: none; }
+/* Full-width tab band: its own strip under the command bar, with a baseline
+   that runs the whole width of the window. */
+QTabWidget#mainTabs { background: #0a0f18; }
+QTabWidget#mainTabs::pane { border: none; border-top: 1px solid $line_soft; top: -1px; }
+QTabBar { background: #0a0f18; qproperty-drawBase: 0; padding: 3px 10px 0 10px; }
+QTabBar::tab {
+    background: transparent; color: $ink_dim; padding: 11px 16px; margin-right: 2px;
+    border: none; border-bottom: 2px solid transparent; font-weight: 500;
+}
+QTabBar::tab:hover { color: $ink; }
+QTabBar::tab:selected { color: $signal; border-bottom: 2px solid $signal; }
+QPushButton#tabAction {
+    background: transparent; color: $ink_faint; border: none; padding: 8px 18px; font-weight: 500;
+}
+QPushButton#tabAction:hover { color: $signal; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: $line; border-radius: 5px; min-height: 30px; }
+QScrollBar::handle:vertical:hover { background: $signal_deep; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal { background: $line; border-radius: 5px; min-width: 30px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+
+QStatusBar { background: $ground; color: $ink_faint; border-top: 1px solid $line_soft; }
+QToolTip { background: $panel_lo; color: $ink; border: 1px solid $line; padding: 6px 8px; }
+
+/* command bar */
+QFrame#commandBar {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0d1420, stop:1 $ground);
+    border: none; border-bottom: 1px solid $line_soft;
+}
+QLabel#brandGlyph {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 $signal, stop:1 $heat);
+    color: $on_accent; border-radius: 8px; font-weight: 800; font-size: 15px;
+    min-width: 30px; max-width: 30px; min-height: 30px; max-height: 30px;
+}
+QLabel#wordmark { color: $ink; font-weight: 800; font-size: 15px; letter-spacing: 2px; }
+QLabel#wordmark #accent { color: $signal; }
+QLabel#wordmarkSub { color: $ink_faint; font-size: 9px; letter-spacing: 4px; }
+QFrame#gauge { background: $base; border: 1px solid $line; border-radius: 11px; }
+QLabel#gaugeLab { color: $ink_faint; font-size: 9px; letter-spacing: 2px; }
+QLabel#gpuName { color: $ink; font-weight: 700; font-size: 12px; }
+QLabel#vramRead { color: $ink_dim; font-size: 10px; }
+QProgressBar#vramBar { background: $base; border: 1px solid $line_soft; border-radius: 3px; }
+QProgressBar#vramBar::chunk {
+    border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $signal_deep, stop:1 $signal);
+}
+QLabel#runtimePill {
+    font-size: 10px; letter-spacing: 1px; padding: 7px 13px; border-radius: 9px;
+    border: 1px solid #204a3a; background: #0c1a15; color: #54E39B;
+}
+QLabel#runtimePill[state="setup"] {
+    border: 1px solid #4a3a20; background: #1a140c; color: $heat;
+}
+
+/* footer */
+QFrame#footer { background: #0a0f18; border: none; border-top: 1px solid $line_soft; }
+QLabel#footFile { color: $ink_dim; font-size: 11px; }
+
+/* module cards (title inside a divider header, then a padded body) */
+QFrame#modCard {
+    border: 1px solid $line_soft; border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $panel_hi, stop:1 $panel_lo);
+}
+QFrame#modHead { background: transparent; border: none; border-bottom: 1px solid $line_soft; }
+QLabel#modTitle { color: $ink_dim; background: transparent; }
+QCheckBox#modTitle { color: $ink_dim; background: transparent; spacing: 9px; }
+QLabel#modTag { color: $ink_faint; background: transparent; }
+
+/* preview stage (Video / Sequence): the bordered panel content appears in */
+QFrame#stage {
+    border: 1px solid $line_soft; border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $panel_lo, stop:1 $ground);
+}
+QLabel#phTitle { color: $ink_dim; background: transparent; }
+
+/* floating view bar (hover-revealed over the image, mockup's stagefoot) */
+QFrame#viewBar {
+    background: rgba(10, 16, 24, 0.82); border: 1px solid $line; border-radius: 12px;
+}
+QFrame#viewBarSep { background: $line; border: none; margin: 5px 0; }
+QFrame#viewBar QPushButton#viewChip {
+    background: transparent; color: $ink_dim; border: none; border-radius: 8px;
+    padding: 6px 12px; font-weight: 500; font-size: 12px;
+}
+QFrame#viewBar QPushButton#viewChip:hover { color: $ink; background: $panel_hi; }
+QFrame#viewBar QPushButton#viewChip:checked {
+    color: $on_accent; font-weight: 600;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 $signal, stop:1 $signal_deep);
+}
+QFrame#viewBar QPushButton#viewChip:disabled { color: $ink_faint; background: transparent; }
+""")
+
+
+def _style_for(name: str) -> str:
+    """The stylesheet for a palette name, falling back to the default."""
+    return _STYLE_TEMPLATE.substitute(PALETTES.get(name, PALETTES[DEFAULT_THEME]))
+
+
+def _qpalette_for(name: str) -> QPalette:
+    """The Fusion QPalette for a palette, for the canvas and native controls."""
+    p = PALETTES.get(name, PALETTES[DEFAULT_THEME])
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, QColor(p["ground"]))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor(p["ink"]))
+    pal.setColor(QPalette.ColorRole.Base, QColor(p["base"]))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor(p["panel_lo"]))
+    pal.setColor(QPalette.ColorRole.Text, QColor(p["ink"]))
+    pal.setColor(QPalette.ColorRole.Button, QColor(p["panel_lo"]))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor(p["ink"]))
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor(p["panel_lo"]))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor(p["ink"]))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, QColor(p["ink_faint"]))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor(p["signal"]))
+    pal.setColor(QPalette.ColorRole.HighlightedText, QColor(p["on_accent"]))
+    for role in (QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, QColor(p["ink_faint"]))
+    return pal
+
+
+#: The active stylesheet, reassigned when the theme changes. Dialogs read this
+#: at creation, so a switch reaches every window opened afterwards.
+STYLE = _style_for(DEFAULT_THEME)
 
 
 #: Longest edge of the copy the colour sliders are dragged against.
@@ -118,6 +401,57 @@ QSlider::handle:horizontal {
 #: is the difference between a slider that drags and one that lurches.
 #: The saved file is always graded at full resolution.
 _PREVIEW_EDGE = 1200
+
+
+def _format_duration(seconds: float) -> str:
+    """A short, human "time left" — "45s", "2m 30s", "1h 05m".
+
+    Rounded and coarse on purpose: an ETA on a neural conversion is an estimate
+    that jitters frame to frame, and second-precision on a ten-minute job reads
+    as false confidence. Hours show minutes, minutes show seconds, and under a
+    minute is just seconds.
+    """
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{int(round(seconds))}s"
+    if seconds < 3600:
+        minutes, secs = divmod(int(round(seconds)), 60)
+        return f"{minutes}m {secs:02d}s"
+    hours, rest = divmod(int(round(seconds)), 3600)
+    minutes = rest // 60
+    return f"{hours}h {minutes:02d}m"
+
+
+class _EtaTracker:
+    """Smoothed seconds-per-frame turned into a time-remaining estimate.
+
+    The first inter-frame gap of a conversion is dominated by the ~3.5 s harness
+    start-up — and, with per-frame depth on, the model load — which is nothing
+    like steady-state throughput. So the first sample seeds nothing: the moving
+    average begins at the second frame, and ``remaining`` returns None until
+    there is a real rate to quote rather than a wildly wrong one.
+    """
+
+    def __init__(self, smoothing: float = 0.25) -> None:
+        self._alpha = smoothing
+        self._ema: float | None = None
+        self._prev: float | None = None
+
+    def start(self) -> None:
+        self._ema = None
+        self._prev = None
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        if self._prev is not None:
+            dt = now - self._prev
+            self._ema = dt if self._ema is None else self._alpha * dt + (1 - self._alpha) * self._ema
+        self._prev = now
+
+    def remaining(self, frames_left: int) -> float | None:
+        if self._ema is None or frames_left <= 0:
+            return None
+        return self._ema * frames_left
 
 
 def _downscale_for_preview(image: np.ndarray) -> np.ndarray:
@@ -134,6 +468,14 @@ def _downscale_for_preview(image: np.ndarray) -> np.ndarray:
 #: The guide lives in the repository wiki rather than in the app so it can be
 #: corrected the day a new failure is reported, instead of at the next release.
 WIKI_URL = "https://github.com/criso2hd-alt/DLSS5-Image-Converter/wiki"
+
+#: Where the support banner and its button point. The same link the README
+#: badge uses, kept here as the single source the app reads.
+COFFEE_URL = "https://buymeacoffee.com/criso2hdj"
+
+#: The project's home. Reachable from the actions panel so it stays available
+#: after the (one-time, dismissable) support banner is gone for good.
+GITHUB_URL = "https://github.com/criso2hd-alt/DLSS5-Image-Converter"
 
 
 def open_help(page: str = "") -> None:
@@ -315,6 +657,105 @@ class RuntimeWorker(QObject):
         self.finished.emit()
 
 
+class RuntimeProbeWorker(QObject):
+    """Prove DLSS, ReShade, RenoDX and the neural module all load."""
+
+    finished = Signal(bool, str)
+
+    def __init__(self, harness: Path) -> None:
+        super().__init__()
+        self._harness = harness
+
+    def run(self) -> None:
+        try:
+            report = evaluator.probe(self._harness)
+        except Exception as error:  # noqa: BLE001 - reported in the setup dialog
+            self.finished.emit(False, str(error))
+            return
+        self.finished.emit(onboarding.probe_succeeded(report), report)
+
+
+class RuntimeProbe(QObject):
+    """Run the native DLSS check off the UI thread, watchdog-guarded so it can
+    never hang the app.
+
+    The live check launches the harness, which initialises DLSS on the GPU. On
+    some driver/runtime combinations that initialisation wedges, and the process
+    holds a D3D12 device while it does - which used to freeze the whole window
+    with no escape but Task Manager, because the check ran on a modal path the
+    user could not leave.
+
+    Here a worker thread runs the probe and a watchdog force-kills the child if
+    it overruns. Killing that one process releases the device, exactly as
+    force-quitting the app would, except the app survives. Completion, timeout
+    and an explicit skip all arrive as one ``done(ok, report)`` on the UI thread,
+    and nothing ever calls ``wait()`` there - so the event loop keeps running no
+    matter what the runtime does.
+    """
+
+    done = Signal(bool, str)
+
+    #: A working probe is a few seconds (NGX + add-on warm-up). Well past that is
+    #: a runtime that has hung, so the watchdog steps in rather than waiting.
+    TIMEOUT_MS = 30000
+
+    def __init__(self, harness: Path, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._settled = False
+        self._thread = QThread()
+        self._worker = RuntimeProbeWorker(harness)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_worker_finished)
+        # Canonical fire-and-forget teardown: the worker and thread delete
+        # themselves once the (possibly killed) child returns, and the UI thread
+        # never blocks on it. This object itself is kept alive by its parent -
+        # deleting it here, mid-signal, would pull its own connections and
+        # watchdog out from under the emission and crash.
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.setInterval(self.TIMEOUT_MS)
+        self._watchdog.timeout.connect(self._on_timeout)
+
+    def start(self) -> None:
+        self._thread.start()
+        self._watchdog.start()
+
+    def skip(self) -> None:
+        """Abandon the check now - the dialog's Skip, or app shutdown."""
+        self._settle(
+            False,
+            "Skipped - the live check was stopped. Open Settings - Check "
+            "runtime to run it again.",
+        )
+
+    def _on_timeout(self) -> None:
+        self._settle(
+            False,
+            "The live check did not finish and was stopped. The DLSS runtime "
+            "may be hanging on this GPU - open Settings - Check runtime for the "
+            "full report.",
+        )
+
+    def _on_worker_finished(self, ok: bool, report: str) -> None:
+        self._settle(ok, report)
+
+    def _settle(self, ok: bool, report: str) -> None:
+        # First outcome wins - the worker finishing, the watchdog and a skip all
+        # route here and only the first is real. cancel_probe() releases the GPU
+        # if the child is still up; the worker then returns and the thread tears
+        # itself down, with no wait() on the UI thread.
+        if self._settled:
+            return
+        self._settled = True
+        self._watchdog.stop()
+        evaluator.cancel_probe()
+        self.done.emit(ok, report)
+
+
 def ensure_runtime_ready(parent: QWidget | None = None) -> bool:
     """Fetch PyTorch if this build did not ship it. True if the app can run.
 
@@ -327,8 +768,8 @@ def ensure_runtime_ready(parent: QWidget | None = None) -> bool:
         return True
 
     dialog = DownloadDialog(
-        "First-run setup",
-        f"PyTorch {bootstrap.TORCH_VERSION} is downloaded once, rather than "
+        "Setting up — just this once.",
+        f"FIRST RUN · STEP 1 OF 3\n\nPyTorch {bootstrap.TORCH_VERSION} is downloaded once, rather than "
         "shipped with the app - it is roughly 1.8 GB and would otherwise be in "
         "every copy. It is kept in the pytorch folder beside the app and "
         "survives updates.",
@@ -365,10 +806,9 @@ def ensure_runtime_ready(parent: QWidget | None = None) -> bool:
         QMessageBox.critical(
             parent,
             "Could not set up the runtime",
-            (state["error"] or "The download did not finish.")
-            + "\n\nThe app needs PyTorch for depth estimation. Check your "
-            "connection and start it again - the download resumes from scratch "
-            "but nothing is left half-installed.",
+            (state["error"] or ("The download did not finish.\n\n" + bootstrap.NETWORK_HELP))
+            + "\n\nPyTorch is needed for depth estimation, so the app cannot "
+            "start without it. Nothing is left half-installed.",
         )
     return state["ok"]
 
@@ -441,16 +881,19 @@ class FindFilesDialog(QDialog):
     matters or which of their games has the newest add-on.
     """
 
-    def __init__(self, window: MainWindow) -> None:
+    runtime_ready = Signal()
+
+    def __init__(self, window: MainWindow, *, onboarding_mode: bool = False) -> None:
         super().__init__(window)
         self._window = window
+        self._onboarding_mode = onboarding_mode
         self._candidates: list[discovery.Candidate] = []
         self._extra_roots: list[Path] = []
         self._thread: QThread | None = None
         self._worker: FindFilesWorker | None = None
 
         self.setWindowTitle("Find my DLSS files")
-        self.setModal(False)
+        self.setModal(onboarding_mode)
         self.setMinimumWidth(720)
         self.setStyleSheet(STYLE)
 
@@ -458,9 +901,20 @@ class FindFilesDialog(QDialog):
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(10)
 
+        if onboarding_mode:
+            eyebrow = QLabel("FIRST RUN  ·  STEP 2 OF 3")
+            eyebrow.setObjectName("onboardingEyebrow")
+            apply_font(eyebrow, family=FONT_MONO, size=8.5, spacing=2.0, caps=True)
+            layout.addWidget(eyebrow)
+            title = QLabel("Connect your DLSS 5 files.")
+            title.setObjectName("onboardingTitle")
+            apply_font(title, family=FONT_DISPLAY, size=19)
+            layout.addWidget(title)
+
         blurb = QLabel(
-            "Searches your Steam libraries, Downloads and Documents for the four "
-            "files, and copies them here.\n\n"
+            "The automatic search checks your Steam libraries, Downloads and "
+            "Documents for the four files, then copies the best matching set "
+            "into the app.\n\n"
             "Nothing is downloaded — this only looks at files already on your "
             "machine. If DLSS 5 works in a game for you, that game's folder is "
             "what it is looking for."
@@ -470,7 +924,12 @@ class FindFilesDialog(QDialog):
         layout.addWidget(blurb)
 
         self.results = QListWidget()
-        self.results.setMinimumHeight(180)
+        if onboarding_mode:
+            self.results.setObjectName("onboardingSources")
+            self.results.addItem("Automatic search will list matching folders here.")
+        self.results.setMinimumHeight(130 if onboarding_mode else 180)
+        if onboarding_mode:
+            self.results.setMaximumHeight(160)
         self.results.currentRowChanged.connect(self._selection_changed)
         layout.addWidget(self.results)
 
@@ -478,13 +937,15 @@ class FindFilesDialog(QDialog):
         self.summary.setObjectName("hint")
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+        if onboarding_mode:
+            self._set_plan_summary({}, searching=True)
 
         self.status = QLabel("Ready.")
         self.status.setObjectName("hint")
         layout.addWidget(self.status)
 
         buttons = QHBoxLayout()
-        self.close_button = QPushButton("Close")
+        self.close_button = QPushButton("Skip for now" if onboarding_mode else "Close")
         self.close_button.setObjectName("secondary")
         self.add_folder = QPushButton("Search another folder…")
         self.add_folder.setObjectName("secondary")
@@ -493,7 +954,9 @@ class FindFilesDialog(QDialog):
         self.stop_button = QPushButton("Stop")
         self.stop_button.setObjectName("secondary")
         self.stop_button.setVisible(False)
-        self.copy_button = QPushButton("Copy these files")
+        self.copy_button = QPushButton(
+            "Use these files & verify" if onboarding_mode else "Copy these files"
+        )
         self.copy_button.setEnabled(False)
         buttons.addWidget(self.close_button)
         buttons.addWidget(self.add_folder)
@@ -519,7 +982,12 @@ class FindFilesDialog(QDialog):
             self.status.setText("Nowhere obvious to look. Use 'Search another folder…'.")
             return
         self.results.clear()
-        self.summary.setText("")
+        if self._onboarding_mode:
+            self.results.addItem("Searching likely game and download folders…")
+        if self._onboarding_mode:
+            self._set_plan_summary({}, searching=True)
+        else:
+            self.summary.setText("")
         self.copy_button.setEnabled(False)
         self.rescan.setEnabled(False)
         self.stop_button.setVisible(True)
@@ -551,7 +1019,10 @@ class FindFilesDialog(QDialog):
     def _scan_done(self, candidates: list[discovery.Candidate]) -> None:
         self._teardown()
         self._candidates = candidates
+        self.results.clear()
         if not candidates:
+            if self._onboarding_mode:
+                self._set_plan_summary({})
             self.status.setText(
                 "Nothing found. If DLSS 5 works in a game, use 'Search another "
                 "folder…' and point it at that game."
@@ -595,7 +1066,13 @@ class FindFilesDialog(QDialog):
         plan = self._plan()
         self.copy_button.setEnabled(len(plan) == len(discovery.WANTED))
         if not plan:
-            self.summary.setText("")
+            if self._onboarding_mode:
+                self._set_plan_summary({})
+            else:
+                self.summary.setText("")
+            return
+        if self._onboarding_mode:
+            self._set_plan_summary(plan)
             return
         lines = []
         for name in discovery.WANTED:
@@ -614,6 +1091,22 @@ class FindFilesDialog(QDialog):
             )
         self.summary.setText("Would copy:\n" + "\n".join(lines) + note)
 
+    def _set_plan_summary(
+        self, plan: dict[str, Path], *, searching: bool = False,
+    ) -> None:
+        """Show the mockup's four-file checklist during first-run setup."""
+        lines = []
+        for name in discovery.WANTED:
+            path = plan.get(name)
+            if path is not None:
+                size = path.stat().st_size / 1048576
+                lines.append(f"FOUND       {name}  ·  {size:.1f} MB")
+            elif searching:
+                lines.append(f"SEARCHING   {name}")
+            else:
+                lines.append(f"MISSING     {name}")
+        self.summary.setText("FILES REQUIRED\n\n" + "\n".join(lines))
+
     def _copy(self) -> None:
         plan = self._plan()
         if not plan:
@@ -628,12 +1121,25 @@ class FindFilesDialog(QDialog):
         self.status.setText("; ".join(parts) or "Nothing to do.")
         self._window.refresh_runtime_status()
         if copied:
+            next_step = (
+                "The app will now run one live check."
+                if self._onboarding_mode
+                else "Use Check runtime to confirm everything is working."
+            )
             QMessageBox.information(
                 self,
                 "Files copied",
                 f"{len(copied)} file(s) copied into:\n{destination}\n\n"
-                "Use Check runtime to confirm everything is working.",
+                + next_step,
             )
+        if self._onboarding_mode:
+            try:
+                ready = runtime.detect(self._window.settings.runtime_dir or None).ready
+            except Exception:  # noqa: BLE001 - remain in setup on a bad check
+                ready = False
+            if ready:
+                self.runtime_ready.emit()
+                self.accept()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
         if self._worker is not None:
@@ -908,6 +1414,335 @@ class BatchDialog(QDialog):
         super().closeEvent(event)
 
 
+#: File dialog filter for choosing videos to queue. Broad on purpose — PyAV
+#: reads far more than this, and an over-strict filter only hides a user's file.
+_VIDEO_FILTER = (
+    "Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.wmv *.flv *.mpg *.mpeg *.ts);;"
+    "All files (*)"
+)
+
+
+class VideoQueueDialog(QDialog):
+    """Queue several videos and convert them one after another.
+
+    The "batch video convert" / "several videos in a row" ask. A dialog rather
+    than a mode on the Video tab, for the same reason the image batch is one:
+    the tab is where you tune the look on a single clip — scrub it, mark a
+    range, watch a preview — and the queue is the separate act of pointing that
+    look at a stack of whole clips and leaving. Codec, effort and depth default
+    from the tab; the neural and colour settings come from the shared sidebar,
+    exactly as a single conversion reads them.
+    """
+
+    def __init__(self, window: MainWindow) -> None:
+        super().__init__(window)
+        self._window = window
+        self.jobs: list[Path] = []
+        self.destination = paths.output_dir()
+        self._thread: QThread | None = None
+        self._worker: VideoQueueWorker | None = None
+        self._eta = _EtaTracker()
+        self._done = 0
+        self._skipped = 0
+        self._failed = 0
+        self._failures: list[str] = []
+
+        self.setWindowTitle("Convert several videos")
+        self.setModal(False)
+        self.setMinimumWidth(620)
+        self.setStyleSheet(STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        blurb = QLabel(
+            "Videos are converted back to back with the settings below and the "
+            "neural and colour settings in the sidebar. Each clip is converted "
+            "whole — to convert only part of one, use Convert video on the tab "
+            "instead. You can keep using the app; leave this open while it runs."
+        )
+        blurb.setWordWrap(True)
+        blurb.setObjectName("hint")
+        layout.addWidget(blurb)
+
+        self.list = QListWidget()
+        self.list.setMinimumHeight(150)
+        self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        layout.addWidget(self.list, 1)
+
+        list_buttons = QHBoxLayout()
+        self.add_button = QPushButton("Add videos…")
+        self.remove_button = QPushButton("Remove selected")
+        self.remove_button.setObjectName("secondary")
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setObjectName("secondary")
+        list_buttons.addWidget(self.add_button)
+        list_buttons.addWidget(self.remove_button)
+        list_buttons.addWidget(self.clear_button)
+        list_buttons.addStretch(1)
+        layout.addLayout(list_buttons)
+
+        dest_row = QHBoxLayout()
+        self.pick_dest = QPushButton("Output folder…")
+        self.pick_dest.setObjectName("secondary")
+        self.dest_label = QLabel(str(self.destination))
+        self.dest_label.setObjectName("hint")
+        dest_row.addWidget(self.pick_dest)
+        dest_row.addWidget(self.dest_label, 1)
+        layout.addLayout(dest_row)
+
+        # Output options, defaulted from the Video tab so the queue matches what
+        # the user was just doing on a single clip.
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Output"))
+        self.codec_box = QComboBox()
+        for codecdef in video.CODECS:
+            self.codec_box.addItem(codecdef.label, codecdef.key)
+        self.codec_box.setCurrentIndex(max(0, window.video_page.codec_box.currentIndex()))
+        opts.addWidget(self.codec_box)
+        opts.addSpacing(12)
+        opts.addWidget(QLabel("Effort"))
+        self.mode_box = QComboBox()
+        self.mode_box.addItem("Quick (1 pass)", 1)
+        self.mode_box.addItem("Quality (4 passes)", 4)
+        self.mode_box.setCurrentIndex(max(0, window.video_page.mode_box.currentIndex()))
+        opts.addWidget(self.mode_box)
+        opts.addStretch(1)
+        layout.addLayout(opts)
+
+        self.estimate_depth = QCheckBox("Estimate depth per frame")
+        self.estimate_depth.setChecked(window.video_page.estimate_depth.isChecked())
+        self.estimate_depth.setToolTip(
+            "Off by default: DLSS does not read depth on a still frame, so this "
+            "changes nothing in the output and is by far the slowest step."
+        )
+        self.skip_existing = QCheckBox("Skip videos already converted")
+        self.skip_existing.setChecked(True)
+        self.skip_existing.setToolTip(
+            "Lets an interrupted queue be restarted without redoing everything."
+        )
+        layout.addWidget(self.estimate_depth)
+        layout.addWidget(self.skip_existing)
+
+        self.preview = ImageView()
+        self.preview.setMinimumHeight(150)
+        self.preview.setVisible(False)
+        layout.addWidget(self.preview, 1)
+
+        # Two bars: the top counts clips, the bottom counts frames within the
+        # current clip. A queue of long videos otherwise looks frozen for
+        # minutes at a time, because the clip counter only moves once per file.
+        self.overall_bar = QProgressBar()
+        self.overall_bar.setTextVisible(True)
+        self.overall_bar.setVisible(False)
+        layout.addWidget(self.overall_bar)
+        self.frame_bar = QProgressBar()
+        self.frame_bar.setTextVisible(True)
+        self.frame_bar.setVisible(False)
+        layout.addWidget(self.frame_bar)
+
+        self.status = QLabel("")
+        self.status.setObjectName("hint")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        self.close_button = QPushButton("Close")
+        self.close_button.setObjectName("secondary")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("secondary")
+        self.stop_button.setVisible(False)
+        self.start_button = QPushButton("Convert queue")
+        self.start_button.setEnabled(False)
+        buttons.addWidget(self.close_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.start_button)
+        layout.addLayout(buttons)
+
+        self.add_button.clicked.connect(self._add)
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.clear_button.clicked.connect(self._clear)
+        self.pick_dest.clicked.connect(self._choose_destination)
+        self.start_button.clicked.connect(self._start)
+        self.stop_button.clicked.connect(self._stop)
+        self.close_button.clicked.connect(self.close)
+
+    # -- building the queue --------------------------------------------------
+
+    def _add(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileNames(
+            self, "Add videos to the queue", "", _VIDEO_FILTER
+        )
+        for name in chosen:
+            path = Path(name)
+            if path not in self.jobs:
+                self.jobs.append(path)
+                self.list.addItem(QListWidgetItem(path.name))
+        self._refresh_controls()
+
+    def _remove_selected(self) -> None:
+        for item in self.list.selectedItems():
+            row = self.list.row(item)
+            self.list.takeItem(row)
+            del self.jobs[row]
+        self._refresh_controls()
+
+    def _clear(self) -> None:
+        self.list.clear()
+        self.jobs.clear()
+        self._refresh_controls()
+
+    def _refresh_controls(self) -> None:
+        running = self._thread is not None
+        self.start_button.setEnabled(bool(self.jobs) and not running)
+        self.status.setText(
+            "" if not self.jobs else f"{len(self.jobs)} video(s) queued."
+        )
+
+    def _choose_destination(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Where should the converted videos go?", str(self.destination)
+        )
+        if chosen:
+            self.destination = Path(chosen)
+            self.dest_label.setText(chosen)
+
+    # -- running -------------------------------------------------------------
+
+    def _output_for(self, source: Path, suffix: str) -> Path:
+        # A distinct name so a queue pointed at its own source folder never
+        # overwrites an input, and the H.264 default does not collide with an
+        # H.264 source of the same stem.
+        return self.destination / f"{source.stem}_dlss5{suffix}"
+
+    def _start(self) -> None:
+        if not self.jobs or self._thread is not None:
+            return
+        settings = copy.deepcopy(self._window.settings)
+        settings.evaluation.frames = int(self.mode_box.currentData() or 1)
+        codec_key = self.codec_box.currentData()
+        suffix = video.CODECS_BY_KEY[codec_key].suffix
+        pairs = [(source, self._output_for(source, suffix)) for source in self.jobs]
+
+        self._done = self._skipped = self._failed = 0
+        self._failures = []
+        self.overall_bar.setVisible(True)
+        self.overall_bar.setRange(0, len(pairs))
+        self.overall_bar.setValue(0)
+        self.overall_bar.setFormat("%v of %m videos")
+        self.frame_bar.setVisible(True)
+        self.frame_bar.setValue(0)
+        self.start_button.setEnabled(False)
+        self.add_button.setEnabled(False)
+        self.remove_button.setEnabled(False)
+        self.clear_button.setEnabled(False)
+        self.pick_dest.setEnabled(False)
+        self.stop_button.setVisible(True)
+
+        self._thread = QThread(self)
+        self._worker = VideoQueueWorker(
+            pairs, settings, self._window.engine, codec_key,
+            self.estimate_depth.isChecked(), self.skip_existing.isChecked(),
+        )
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self.status.setText)
+        self._worker.video_started.connect(self._video_started)
+        self._worker.frame_done.connect(self._frame_done)
+        self._worker.video_done.connect(self._video_done)
+        self._worker.video_skipped.connect(self._video_skipped)
+        self._worker.video_failed.connect(self._video_failed)
+        self._worker.finished.connect(self._finished)
+        self._thread.start()
+
+    def _stop(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
+            self.status.setText("Stopping after this frame…")
+
+    def _video_started(self, index: int, total: int, source: object) -> None:
+        self._eta.start()
+        self.frame_bar.setValue(0)
+        self.frame_bar.setMaximum(0)  # unknown until the first frame reports total
+        self.frame_bar.setFormat("%p%")
+        self.status.setText(f"Video {index + 1} of {total}: {Path(source).name}")
+
+    def _frame_done(self, update: object, index: int, total: int) -> None:
+        if getattr(update, "stage", "") != "converting":
+            return
+        if update.total and self.frame_bar.maximum() != update.total:
+            self.frame_bar.setMaximum(update.total)
+        self.frame_bar.setValue(update.index)
+        self._eta.tick()
+        left = self._eta.remaining((update.total - update.index) if update.total else 0)
+        clip = f"clip {index + 1}/{total}"
+        if left is not None:
+            self.frame_bar.setFormat(f"%v of %m frames — ~{_format_duration(left)} left ({clip})")
+        else:
+            self.frame_bar.setFormat(f"%v of %m frames ({clip})")
+        if update.index % 3 == 0 or update.index == update.total:
+            self.preview.setVisible(True)
+            self.preview.set_image(
+                _downscale_for_preview(update.preview),
+                f"{clip} — frame {update.index}"
+                + (f" of {update.total}" if update.total else ""),
+            )
+
+    def _video_done(self, source: object, output: object) -> None:
+        self._done += 1
+        self.overall_bar.setValue(self._done + self._skipped + self._failed)
+
+    def _video_skipped(self, source: object) -> None:
+        self._skipped += 1
+        self.overall_bar.setValue(self._done + self._skipped + self._failed)
+        self.status.setText(f"{Path(source).name} — already converted, skipped.")
+
+    def _video_failed(self, source: object, error: str) -> None:
+        self._failed += 1
+        self._failures.append(f"{Path(source).name}: {error}")
+        self.overall_bar.setValue(self._done + self._skipped + self._failed)
+        # Named, not swallowed — a queue that quietly drops a file is worse than
+        # one that tells you which failed and carries on.
+        self.status.setText(f"{Path(source).name} failed — {error}")
+
+    def _teardown(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(15000)
+            self._thread = None
+        self._worker = None
+        self.stop_button.setVisible(False)
+        self.add_button.setEnabled(True)
+        self.remove_button.setEnabled(True)
+        self.clear_button.setEnabled(True)
+        self.pick_dest.setEnabled(True)
+        self.start_button.setEnabled(bool(self.jobs))
+
+    def _finished(self) -> None:
+        self._teardown()
+        self.frame_bar.setVisible(False)
+        parts = [f"{self._done} converted"]
+        if self._skipped:
+            parts.append(f"{self._skipped} already done")
+        if self._failed:
+            parts.append(f"{self._failed} failed")
+        summary = ", ".join(parts) + f" — {self.destination}"
+        self.status.setText(summary)
+        if self._failures:
+            QMessageBox.warning(
+                self, "Some videos failed",
+                "These videos were not converted:\n\n" + "\n".join(self._failures),
+            )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._worker is not None:
+            self._worker.stop()
+        self._teardown()
+        super().closeEvent(event)
+
+
 class VideoDownloadWorker(QObject):
     """Fetches PyAV the first time the Video tab is used."""
 
@@ -978,6 +1813,78 @@ class VideoWorker(QObject):
         self.finished.emit(self._destination)
 
 
+class VideoQueueWorker(QObject):
+    """Convert a list of videos back to back, off the UI thread.
+
+    One worker for the whole queue rather than one per clip, so the thread and
+    its teardown are set up once. A failure on one video is reported and the
+    queue moves on — a batch that stops dead on the third of twenty files,
+    hours in, is worse than one that finishes the other seventeen and tells you
+    which failed.
+    """
+
+    progress = Signal(str)
+    #: index (0-based), total, source Path — a clip is starting.
+    video_started = Signal(int, int, object)
+    #: VideoProgress, index, total — a frame of the current clip landed.
+    frame_done = Signal(object, int, int)
+    #: source Path, output Path — a clip finished.
+    video_done = Signal(object, object)
+    #: source Path — skipped because its output already existed.
+    video_skipped = Signal(object)
+    #: source Path, error — a clip failed; the queue continues.
+    video_failed = Signal(object, str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        jobs: list[tuple[Path, Path]],   # (source, output) pairs
+        settings: AppSettings,
+        engine: DepthEngine,
+        codec_key: str,
+        estimate_depth: bool,
+        skip_existing: bool,
+    ) -> None:
+        super().__init__()
+        self._jobs = jobs
+        self._settings = settings
+        self._engine = engine
+        self._codec = codec_key
+        self._estimate = estimate_depth
+        self._skip = skip_existing
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        total = len(self._jobs)
+        for index, (source, output) in enumerate(self._jobs):
+            if self._stop:
+                break
+            if self._skip and output.exists():
+                self.video_skipped.emit(source)
+                continue
+            self.video_started.emit(index, total, source)
+            try:
+                for update in pipeline.convert_video(
+                    source, output, self._settings, self._engine,
+                    codec_key=self._codec, start=0, limit=None,
+                    estimate_depth=self._estimate,
+                    grade_settings=self._settings.grade,
+                    progress=self.progress.emit,
+                    should_stop=lambda: self._stop,
+                ):
+                    self.frame_done.emit(update, index, total)
+            except Exception as error:  # noqa: BLE001 - reported, not fatal to the queue
+                self.video_failed.emit(source, str(error))
+                continue
+            if self._stop:
+                break
+            self.video_done.emit(source, output)
+        self.finished.emit()
+
+
 class VideoPage(QWidget):
     """The Video tab: inspect a clip, mark a range, convert it, keep the audio.
 
@@ -994,30 +1901,43 @@ class VideoPage(QWidget):
         self.source: Path | None = None
         self.info = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        # Same shape as the single-image tab: a bordered stage on the left with a
+        # welcoming empty state, and a rail of cards with the controls on the
+        # right, the convert actions pinned at its foot.
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(16)
 
-        # Two faces of the same area: the source video while inspecting, the
-        # converted frames while converting. A stack rather than swapping
-        # widgets in and out, so the layout never jumps.
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
         from PySide6.QtMultimediaWidgets import QVideoWidget
 
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumHeight(320)
         self.preview = ImageView()  # kept: conversion progress draws here
+        self.placeholder = stage_placeholder(
+            "🎞", "Drop a video here, or choose one",
+            "MP4 · MOV · MKV — then scrub, mark a range, and convert",
+        )
+        # Three faces of one area: the empty state, the source video while
+        # inspecting, the converted frames while converting. A stack so the
+        # layout never jumps.
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.video_widget)
-        self.stack.addWidget(self.preview)
-        layout.addWidget(self.stack, 1)
+        self.stack.addWidget(self.placeholder)    # 0 — until a clip loads
+        self.stack.addWidget(self.video_widget)   # 1
+        self.stack.addWidget(self.preview)         # 2
+        self.stack.setCurrentWidget(self.placeholder)
+
+        stage = QFrame()
+        stage.setObjectName("stage")
+        stage_v = QVBoxLayout(stage)
+        stage_v.setContentsMargins(0, 0, 0, 0)
+        stage_v.addWidget(self.stack, 1)
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video_widget)
 
-        # Transport: play/pause and the scrub timeline together.
         transport = QHBoxLayout()
         self.play_button = QPushButton("Play")
         self.play_button.setObjectName("secondary")
@@ -1026,27 +1946,36 @@ class VideoPage(QWidget):
         transport.addWidget(self.play_button)
         self.timeline = TimelineWidget()
         transport.addWidget(self.timeline, 1)
-        layout.addLayout(transport)
 
-        pick_row = QHBoxLayout()
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.setVisible(False)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(stage, 1)
+        left.addLayout(transport)
+        left.addWidget(self.bar)
+        outer.addLayout(left, 1)
+
+        # -- Source card --
+        source_card = ModuleCard("Source")
         self.pick_video = QPushButton("Choose video…")
         self.source_label = QLabel("No video chosen")
         self.source_label.setObjectName("hint")
-        pick_row.addWidget(self.pick_video)
-        pick_row.addWidget(self.source_label, 1)
-        layout.addLayout(pick_row)
-
-        out_row = QHBoxLayout()
+        self.source_label.setWordWrap(True)
+        source_card.add(self.pick_video)
+        source_card.add(self.source_label)
         self.pick_output = QPushButton("Output…")
         self.pick_output.setObjectName("secondary")
         self.output_label = QLabel("Output: choose a video first")
         self.output_label.setObjectName("hint")
-        out_row.addWidget(self.pick_output)
-        out_row.addWidget(self.output_label, 1)
-        layout.addLayout(out_row)
+        self.output_label.setWordWrap(True)
+        source_card.add(self.pick_output)
+        source_card.add(self.output_label)
 
-        opts = QHBoxLayout()
-        opts.addWidget(QLabel("Output"))
+        # -- Export card --
+        export_card = ModuleCard("Export")
         self.codec_box = QComboBox()
         for codecdef in video.CODECS:
             self.codec_box.addItem(codecdef.label, codecdef.key)
@@ -1056,64 +1985,69 @@ class VideoPage(QWidget):
             "H.265 is smaller for modern editors. VP9/WebM is for web upload, "
             "not for editing - editors do not import WebM cleanly."
         )
-        opts.addWidget(self.codec_box)
-
-        opts.addSpacing(12)
-        opts.addWidget(QLabel("Effort"))
         self.mode_box = QComboBox()
         self.mode_box.addItem("Quick (1 pass)", 1)
         self.mode_box.addItem("Quality (4 passes)", 4)
         self.mode_box.setToolTip(
             "Passes let DLSS's accumulator settle. One is fast and usually "
-            "plenty for video; four is steadier on tricky material.\n\n"
-            "The neural pass is ~0.1 s a frame either way - the cost is the "
-            "passes, not the codec."
+            "plenty for video; four is steadier on tricky material."
         )
-        opts.addWidget(self.mode_box)
-
-        opts.addSpacing(12)
-        opts.addWidget(QLabel("Range"))
         self.range_box = QComboBox()
         self.range_box.addItem("Whole clip", "whole")
         self.range_box.addItem("Select In/Out", "range")
         self.range_box.setToolTip(
             "Whole clip converts everything. Select In/Out shows brackets on the "
             "timeline - drag them to the part you want, scroll to zoom in for a "
-            "precise edit. A short range is the way to test the look before "
-            "committing to a long clip."
+            "precise edit."
         )
-        opts.addWidget(self.range_box)
-        opts.addStretch(1)
-        layout.addLayout(opts)
-
+        for label, widget in (
+            ("Format", self.codec_box), ("Effort", self.mode_box), ("Range", self.range_box),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addStretch(1)
+            widget.setMinimumWidth(150)
+            row.addWidget(widget)
+            export_card.add_layout(row)
         self.estimate_depth = QCheckBox("Estimate depth per frame")
         self.estimate_depth.setToolTip(
             "Off by default, and honestly labelled: DLSS does not read the depth "
             "plane on a still frame (there is no motion to reproject through), "
-            "so this changes nothing in the output and is by far the slowest "
-            "step. Here only for parity with the photo path."
+            "so this changes nothing in the output and is by far the slowest step."
         )
-        layout.addWidget(self.estimate_depth)
+        export_card.add(self.estimate_depth)
 
         self.info_label = QLabel("")
         self.info_label.setObjectName("hint")
-        layout.addWidget(self.info_label)
+        self.info_label.setWordWrap(True)
 
-        self.bar = QProgressBar()
-        self.bar.setTextVisible(True)
-        self.bar.setVisible(False)
-        layout.addWidget(self.bar)
-
-        run_row = QHBoxLayout()
+        self.queue_button = QPushButton("Convert several…")
+        self.queue_button.setObjectName("secondary")
+        self.queue_button.setToolTip(
+            "Queue several videos and convert them back to back with the current "
+            "settings. Each is converted whole; use Convert video for a range "
+            "within one clip."
+        )
         self.start = QPushButton("Convert video")
         self.start.setEnabled(False)
+        apply_font(self.start, family=FONT_DISPLAY, size=11.5, spacing=1.8, caps=True)
         self.stop = QPushButton("Stop")
         self.stop.setObjectName("secondary")
         self.stop.setVisible(False)
-        run_row.addStretch(1)
-        run_row.addWidget(self.stop)
-        run_row.addWidget(self.start)
-        layout.addLayout(run_row)
+
+        rail = QWidget()
+        rail.setFixedWidth(SIDEBAR_WIDTH + 18)
+        rail_col = QVBoxLayout(rail)
+        rail_col.setContentsMargins(0, 0, 0, 0)
+        rail_col.setSpacing(12)
+        rail_col.addWidget(source_card)
+        rail_col.addWidget(export_card)
+        rail_col.addWidget(self.info_label)
+        rail_col.addStretch(1)
+        rail_col.addWidget(self.queue_button)
+        rail_col.addWidget(self.stop)
+        rail_col.addWidget(self.start)
+        outer.addWidget(rail)
 
     def show_video(self) -> None:
         self.stack.setCurrentWidget(self.video_widget)
@@ -1188,22 +2122,48 @@ class SequencePage(QWidget):
         self.depth_frames: list[Path] = []
         self.outputs: list[Path] = []
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        # Same language as the single-image and video tabs: a bordered stage on
+        # the left (with a welcoming empty state), a rail of cards on the right.
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(16)
 
         self.preview = ImageView()
-        layout.addWidget(self.preview, 1)
+        self.placeholder = stage_placeholder(
+            "🎬", "Choose the first frame of a sequence",
+            "A folder of PNG/EXR frames — all converted with identical settings "
+            "for a steady result",
+        )
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.placeholder)  # 0 — until frames load
+        self.stack.addWidget(self.preview)       # 1
+        self.stack.setCurrentWidget(self.placeholder)
 
+        stage = QFrame()
+        stage.setObjectName("stage")
+        stage_v = QVBoxLayout(stage)
+        stage_v.setContentsMargins(0, 0, 0, 0)
+        stage_v.addWidget(self.stack, 1)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(True)
+        self.bar.setVisible(False)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        left.addWidget(stage, 1)
+        left.addWidget(self.bar)
+        outer.addLayout(left, 1)
+
+        # -- Frames card --
+        frames_card = ModuleCard("Frames")
+        self.pick_frames = QPushButton("Choose first frame…")
         self.frames_label = QLabel("No sequence chosen")
         self.frames_label.setObjectName("hint")
-        self.depth_label = QLabel("Depth: estimated per frame (Depth Anything)")
-        self.depth_label.setObjectName("hint")
-        self.output_label = QLabel("")
-        self.output_label.setObjectName("hint")
+        self.frames_label.setWordWrap(True)
+        frames_card.add(self.pick_frames)
+        frames_card.add(self.frames_label)
 
-        pick_row = QHBoxLayout()
-        self.pick_frames = QPushButton("Choose first frame…")
         self.pick_depth = QPushButton("Choose first depth frame…")
         self.pick_depth.setObjectName("secondary")
         self.pick_depth.setToolTip(
@@ -1216,11 +2176,9 @@ class SequencePage(QWidget):
         self.clear_depth = QPushButton("Use estimated depth")
         self.clear_depth.setObjectName("secondary")
         self.clear_depth.setVisible(False)
-        pick_row.addWidget(self.pick_frames)
-        pick_row.addWidget(self.pick_depth)
-        pick_row.addWidget(self.clear_depth)
-        pick_row.addStretch(1)
-
+        self.depth_label = QLabel("Depth: estimated per frame (Depth Anything)")
+        self.depth_label.setObjectName("hint")
+        self.depth_label.setWordWrap(True)
         self.invert_depth = QCheckBox("Depth is inverted (near is dark)")
         self.invert_depth.setToolTip(
             "Renderers disagree about which way up a depth pass goes. A Blender "
@@ -1228,15 +2186,18 @@ class SequencePage(QWidget):
             "whichever looks right - near should read as red on the depth mask."
         )
         self.invert_depth.setVisible(False)
+        frames_card.add(self.pick_depth)
+        frames_card.add(self.clear_depth)
+        frames_card.add(self.depth_label)
+        frames_card.add(self.invert_depth)
 
-        layout.addLayout(pick_row)
-        layout.addWidget(self.frames_label)
-        layout.addWidget(self.depth_label)
-        layout.addWidget(self.invert_depth)
-
-        out_row = QHBoxLayout()
+        # -- Output card --
+        out_card = ModuleCard("Output")
         self.pick_output = QPushButton("Output folder…")
         self.pick_output.setObjectName("secondary")
+        self.output_label = QLabel("")
+        self.output_label.setObjectName("hint")
+        self.output_label.setWordWrap(True)
         self.write_video = QCheckBox("Also write MP4")
         self.fps = QSpinBox()
         self.fps.setRange(1, 240)
@@ -1246,31 +2207,277 @@ class SequencePage(QWidget):
         self.write_video.toggled.connect(self.fps.setEnabled)
         self.write_video.setToolTip(
             "Encoded with mp4v, not H.264 - OpenCV ships no H.264 encoder. The "
-            "PNG frames are always written too, so you can re-encode them with "
-            "anything you like."
+            "PNG frames are always written too, so you can re-encode them later."
         )
-        out_row.addWidget(self.pick_output)
-        out_row.addWidget(self.write_video)
-        out_row.addWidget(self.fps)
-        out_row.addStretch(1)
-        layout.addLayout(out_row)
-        layout.addWidget(self.output_label)
+        out_card.add(self.pick_output)
+        mp4_row = QHBoxLayout()
+        mp4_row.addWidget(self.write_video)
+        mp4_row.addStretch(1)
+        mp4_row.addWidget(self.fps)
+        out_card.add_layout(mp4_row)
+        out_card.add(self.output_label)
 
-        self.bar = QProgressBar()
-        self.bar.setTextVisible(True)
-        self.bar.setVisible(False)
-        layout.addWidget(self.bar)
-
-        run_row = QHBoxLayout()
         self.start = QPushButton("Convert sequence")
         self.start.setEnabled(False)
+        apply_font(self.start, family=FONT_DISPLAY, size=11.5, spacing=1.8, caps=True)
         self.stop = QPushButton("Stop")
         self.stop.setObjectName("secondary")
         self.stop.setVisible(False)
-        run_row.addStretch(1)
-        run_row.addWidget(self.stop)
-        run_row.addWidget(self.start)
-        layout.addLayout(run_row)
+
+        rail = QWidget()
+        rail.setFixedWidth(SIDEBAR_WIDTH + 18)
+        rail_col = QVBoxLayout(rail)
+        rail_col.setContentsMargins(0, 0, 0, 0)
+        rail_col.setSpacing(12)
+        rail_col.addWidget(frames_card)
+        rail_col.addWidget(out_card)
+        rail_col.addStretch(1)
+        rail_col.addWidget(self.stop)
+        rail_col.addWidget(self.start)
+        outer.addWidget(rail)
+
+
+class EffectsPage(QWidget):
+    """The Effects tab: the app's native ReShade-style post-processing stack.
+
+    A tab of its own, as asked, but everything on it acts on the *current
+    result* — the same image the photo and video tabs produce — because effects
+    are a final look laid over a finished conversion, not a separate conversion.
+    Turn effects on here and they show live in the preview, and are baked into
+    every save, video and batch from then on.
+
+    Live and instant, like the colour grade: the DLSS result is already
+    computed, so a slider here re-runs only the cheap effect pass over a small
+    preview, never the harness. See effects.apply.
+    """
+
+    #: (group title, enable field, blurb, [(label, field, min, max, tip), ...]).
+    #: The LUT group is inserted separately, since it is a file picker not a
+    #: slider bank.
+    _GROUPS = (
+        ("Sharpen", "sharpen_enabled",
+         "Unsharp mask — crisp up the detail the neural pass produced.", (
+            ("Amount", "sharpen_amount", 0.0, 2.0, "Strength of the sharpening."),
+            ("Radius", "sharpen_radius", 0.3, 5.0, "Width of the edge halo, in pixels."),
+        )),
+        ("Bloom", "bloom_enabled",
+         "Light bleeding out of the brightest areas, like a bright screen or lens.", (
+            ("Threshold", "bloom_threshold", 0.0, 1.0, "Brightness where the glow starts."),
+            ("Intensity", "bloom_intensity", 0.0, 1.0, "How much glow is added."),
+            ("Radius", "bloom_radius", 1.0, 30.0, "Spread of the glow, in pixels."),
+        )),
+        ("Chromatic aberration", "chroma_enabled",
+         "Colour fringing that grows toward the corners, the way a real lens splits light.", (
+            ("Amount", "chroma_amount", 0.0, 1.0, "How far red and blue pull apart."),
+        )),
+        ("CRT", "crt_enabled",
+         "Scanlines, an RGB phosphor mask and tube curvature — the retro-display look.", (
+            ("Scanlines", "crt_scanline", 0.0, 1.0, "Darkening of alternate lines."),
+            ("Mask", "crt_mask", 0.0, 1.0, "RGB phosphor-stripe strength."),
+            ("Curvature", "crt_curvature", 0.0, 1.0, "Bulge of the tube face. Off by default; it is the slow knob."),
+        )),
+        ("Vignette", "vignette_enabled",
+         "Darkened corners, to draw the eye in.", (
+            ("Amount", "vignette_amount", 0.0, 1.0, "How dark the corners go."),
+            ("Feather", "vignette_feather", 0.0, 1.0, "How far in the darkening reaches."),
+        )),
+        ("Film grain", "grain_enabled",
+         "Monochrome grain laid over everything, like film stock.", (
+            ("Amount", "grain_amount", 0.0, 1.0, "Strength of the grain."),
+            ("Size", "grain_size", 1.0, 6.0, "Coarseness — larger is chunkier grain."),
+        )),
+    )
+
+    def __init__(self, effects_settings, on_change, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._settings = effects_settings
+        self._on_change = on_change
+        self._rows: dict[str, SliderRow] = {}
+        self._groups: dict[str, ModuleCard] = {}
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+
+        # The live preview — the whole point of a tab rather than a menu: you
+        # shape the look while looking at it.
+        self.preview = ImageView()
+        self.hint = QLabel(
+            "Convert an image on the Single image tab, then shape the look here.\n"
+            "Every effect is off until you turn it on, and applies to saves, "
+            "videos and batches too."
+        )
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_stack = QStackedWidget()
+        self.preview_stack.addWidget(self.hint)
+        self.preview_stack.addWidget(self.preview)
+        layout.addWidget(self.preview_stack, 1)
+
+        # The controls, scrolled — there are more of them than fit a short window.
+        controls = QWidget()
+        column = QVBoxLayout(controls)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(10)
+
+        insert_lut_after = "Chromatic aberration"
+        for title, enable_field, blurb, rows in self._GROUPS:
+            column.addWidget(self._make_group(title, enable_field, blurb, rows))
+            if title == insert_lut_after:
+                column.addWidget(self._make_lut_group())
+        column.addStretch(1)
+
+        scroller = QScrollArea()
+        scroller.setWidget(controls)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroller.setFixedWidth(SIDEBAR_WIDTH + 40)
+
+        side = QWidget()
+        side_col = QVBoxLayout(side)
+        side_col.setContentsMargins(0, 0, 0, 0)
+        side_col.setSpacing(8)
+        side_col.addWidget(scroller, 1)
+        self.reset_button = QPushButton("Reset all effects")
+        self.reset_button.setObjectName("secondary")
+        self.reset_button.clicked.connect(self._reset)
+        side_col.addWidget(self.reset_button)
+        side.setFixedWidth(SIDEBAR_WIDTH + 40)
+        layout.addWidget(side)
+
+    # -- building the controls ----------------------------------------------
+
+    def _make_group(self, title, enable_field, blurb, rows) -> ModuleCard:
+        group = ModuleCard(title, checkable=True)
+        group.setToolTip(blurb)
+        group.toggled.connect(lambda on, f=enable_field: self._set_enabled(f, on))
+        self._groups[enable_field] = group
+
+        note = QLabel(blurb)
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        group.add(note)
+        for label, field, low, high, tip in rows:
+            row = SliderRow(
+                label, getattr(self._settings, field), self._slider_setter(field),
+                tip, maximum=high, minimum=low,
+            )
+            self._rows[field] = row
+            group.add(row)
+        group.setChecked(bool(getattr(self._settings, enable_field)))
+        return group
+
+    def _make_lut_group(self) -> ModuleCard:
+        group = ModuleCard("LUT (.cube)", checkable=True)
+        group.setToolTip(
+            "Apply a 3D .cube colour LUT — film emulations, CRT looks, cinematic "
+            "grades. Drop .cube files in the LUTs folder and pick one here; any "
+            "pack that exports .cube works."
+        )
+        group.toggled.connect(lambda on: self._set_enabled("lut_enabled", on))
+        self._groups["lut_enabled"] = group
+
+        picker = QHBoxLayout()
+        self.lut_combo = QComboBox()
+        self.lut_combo.currentIndexChanged.connect(self._lut_chosen)
+        picker.addWidget(self.lut_combo, 1)
+        self.refresh_button = QPushButton("↻")
+        self.refresh_button.setObjectName("secondary")
+        self.refresh_button.setFixedWidth(36)
+        self.refresh_button.setToolTip("Rescan the LUTs folder.")
+        picker.addWidget(self.refresh_button)
+        self.open_folder_button = QPushButton("Folder…")
+        self.open_folder_button.setObjectName("secondary")
+        self.open_folder_button.setToolTip("Open the LUTs folder to add .cube files.")
+        picker.addWidget(self.open_folder_button)
+        group.add_layout(picker)
+
+        self.lut_status = QLabel("")
+        self.lut_status.setObjectName("hint")
+        self.lut_status.setWordWrap(True)
+        group.add(self.lut_status)
+
+        row = SliderRow(
+            "Amount", self._settings.lut_amount, self._slider_setter("lut_amount"),
+            "How strongly the LUT is blended in.", maximum=1.0, minimum=0.0,
+        )
+        self._rows["lut_amount"] = row
+        group.add(row)
+        group.setChecked(bool(self._settings.lut_enabled))
+        return group
+
+    # -- behaviour -----------------------------------------------------------
+
+    def _slider_setter(self, field: str):
+        def apply_value(value: float) -> None:
+            setattr(self._settings, field, value)
+            self._on_change()
+        return apply_value
+
+    def _set_enabled(self, field: str, on: bool) -> None:
+        setattr(self._settings, field, bool(on))
+        self._on_change()
+
+    def _lut_chosen(self, _index: int) -> None:
+        self._settings.lut_name = self.lut_combo.currentData() or ""
+        self._on_change()
+
+    def set_luts(self, names: list[str]) -> None:
+        """Refill the LUT picker, keeping the current choice if it survives."""
+        current = self._settings.lut_name
+        self.lut_combo.blockSignals(True)
+        self.lut_combo.clear()
+        self.lut_combo.addItem("(none)", "")
+        for name in names:
+            self.lut_combo.addItem(name, name)
+        index = self.lut_combo.findData(current)
+        self.lut_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.lut_combo.blockSignals(False)
+        if not names:
+            self.lut_status.setText("No .cube files yet — add some via Folder….")
+        else:
+            self.lut_status.setText(f"{len(names)} LUT(s) available.")
+
+    def set_lut_status(self, text: str) -> None:
+        self.lut_status.setText(text)
+
+    def show_preview(self, image_u8) -> None:
+        if image_u8 is None:
+            self.preview_stack.setCurrentWidget(self.hint)
+            return
+        # _graded_preview hands back 8-bit; ImageView.set_image wants 0..1 float.
+        self.preview.set_image(
+            image_u8.astype(np.float32) / 255.0, effects.describe(self._settings)
+        )
+        self.preview_stack.setCurrentWidget(self.preview)
+
+    def _reset(self) -> None:
+        from .settings import EffectsSettings
+
+        defaults = EffectsSettings()
+        for f in fields_of(self._settings):
+            setattr(self._settings, f, getattr(defaults, f))
+        # Push the defaults back into every widget without firing on_change per
+        # control, then redraw once.
+        for enable_field, group in self._groups.items():
+            group.blockSignals(True)
+            group.setChecked(bool(getattr(self._settings, enable_field)))
+            group.blockSignals(False)
+        for field, row in self._rows.items():
+            row.set_value(getattr(self._settings, field))
+        if hasattr(self, "lut_combo"):
+            index = self.lut_combo.findData(self._settings.lut_name)
+            self.lut_combo.setCurrentIndex(index if index >= 0 else 0)
+        self._on_change()
+
+
+def fields_of(dataclass_instance) -> list[str]:
+    """Field names of a dataclass instance — a tiny import-free helper."""
+    from dataclasses import fields as _fields
+
+    return [f.name for f in _fields(dataclass_instance)]
 
 
 class ExportDialog(QDialog):
@@ -1457,6 +2664,9 @@ class MainWindow(QMainWindow):
         self._preview_after_linear: np.ndarray | None = None
         self._preview_before_u8: np.ndarray | None = None
         self._grade_rows: dict[str, SliderRow] = {}
+        #: Every ChipSliderGroup in the window, so the density toggle can flip
+        #: them all between Compact and Full at once.
+        self._chip_groups: list[ChipSliderGroup] = []
         self._download_thread: QThread | None = None
         self._download_worker: DownloadWorker | None = None
         self._download_dialog: DownloadDialog | None = None
@@ -1467,6 +2677,10 @@ class MainWindow(QMainWindow):
         self._video_dl_thread: QThread | None = None
         self._video_dl_worker = None
         self._video_after_download = None
+        self._tour_overlay: onboarding.SpotlightOverlay | None = None
+        #: The background DLSS check, while it runs. Kept so shutdown can end it
+        #: and so a second one is not started on top of the first.
+        self._runtime_probe: RuntimeProbe | None = None
         self.style_results: dict[int, pipeline.Result] = {}
         self._style_signature_used: tuple | None = None
         self._style_worker: StyleWorker | None = None
@@ -1505,16 +2719,36 @@ class MainWindow(QMainWindow):
         self._grade_full_timer.setInterval(250)
         self._grade_full_timer.timeout.connect(self._render_full)
 
+        # The effects tab's own preview, on the same coalescing idea as the
+        # grade: an effect slider drag re-runs the stack over a small image, so
+        # wait for the drag to settle rather than redrawing per pixel of travel.
+        self._effects_preview_timer = QTimer(self)
+        self._effects_preview_timer.setSingleShot(True)
+        self._effects_preview_timer.setInterval(60)
+        self._effects_preview_timer.timeout.connect(self._update_effects_preview)
+
         # Dropping anywhere on the window, not just on the drop zone. The zone
         # is swapped out for the comparison view after a conversion, and when it
         # was the only drop target there was no way at all to open a second
         # image without restarting the app.
         self.setAcceptDrops(True)
 
+        # The window is a vertical stack now: a branded command bar across the
+        # top, the working area (tabs + sidebar) in the middle, and the native
+        # status bar as the footer. The command bar is what turns a form into a
+        # cockpit — GPU/VRAM at a glance and the runtime state always in view.
         central = QWidget()
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(16)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._command_bar())
+
+        # Full-bleed so the tab band below can span the whole window edge to
+        # edge; each page supplies its own inner padding.
+        main = QWidget()
+        layout = QHBoxLayout(main)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self.stack = QStackedWidget()
         self.drop = DropZone()
@@ -1533,50 +2767,81 @@ class MainWindow(QMainWindow):
         canvas_layout = QVBoxLayout(canvas)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         canvas_layout.setSpacing(8)
-        canvas_layout.addWidget(self.stack, 1)
-        canvas_layout.addLayout(self._view_switch())
+        # The view controls float on the picture (bottom-left, like the mockup)
+        # and are revealed only while the pointer is over it, so the image is
+        # unobstructed while it is being judged. The StageHost owns that reveal.
+        self.stage_host = StageHost(self.stack, self._view_bar())
+        canvas_layout.addWidget(self.stage_host, 1)
         self.grade_panel = self._grade_panel()
         canvas_layout.addWidget(self.grade_panel)
         self.style_panel = self._style_panel()
         canvas_layout.addWidget(self.style_panel)
 
-        # Two pages, one shared sidebar. The settings mean the same thing in
-        # both, and using identical settings across every frame is most of what
-        # makes a sequence look consistent - so they should not be duplicated.
+        # The four other pages, then Settings — built before the rail so the
+        # theme, density, HDR and Depth controls Settings owns exist as instance
+        # state the rail and the rest of the app read.
         self.video_page = VideoPage()
         self.sequence_page = SequencePage()
-        self.tabs = QTabWidget()
-        self.tabs.addTab(canvas, "Single image")
-        self.tabs.addTab(self.video_page, "Video")
-        self.tabs.addTab(self.sequence_page, "Image sequence")
-        self._wire_sequence_page()
-        self._wire_video_page()
+        self.effects_page = EffectsPage(self.settings.effects, self._effects_changed)
+        self.settings_page = self._settings_page()
 
-        layout.addWidget(self.tabs, 1)
-        # The sidebar scrolls rather than being squeezed. It is a fixed stack of
-        # group boxes, and on a shorter window - or simply at 125% or 150%
-        # display scaling, where every widget is taller - the bottom of it was
-        # being clipped away silently. A user reported the neural sliders
-        # missing entirely and the HDR labels cut in half.
+        # The rail is the Single-image controls, so it lives *inside* that tab —
+        # not beside the tab widget, where it used to sit on top of every tab
+        # including Video and Settings. It scrolls; the actions under it pin.
         scroller = QScrollArea()
         scroller.setWidget(self._sidebar())
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QFrame.Shape.NoFrame)
         scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.single_scroller = scroller
+        rail = QWidget()
+        rail_col = QVBoxLayout(rail)
+        rail_col.setContentsMargins(0, 0, 0, 0)
+        rail_col.setSpacing(0)
+        rail_col.addWidget(scroller, 1)
+        rail_col.addWidget(self._actions())
+        rail.setFixedWidth(SIDEBAR_WIDTH + 18)
 
-        # Only the settings scroll. The actions sit under them and stay put.
-        sidebar = QWidget()
-        column = QVBoxLayout(sidebar)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(0)
-        column.addWidget(scroller, 1)
-        column.addWidget(self._actions())
-        # Room for the scrollbar so it never overlaps the slider readouts.
-        sidebar.setFixedWidth(SIDEBAR_WIDTH + 18)
-        layout.addWidget(sidebar)
+        single = QWidget()
+        single_row = QHBoxLayout(single)
+        single_row.setContentsMargins(16, 16, 16, 16)
+        single_row.setSpacing(16)
+        single_row.addWidget(canvas, 1)
+        single_row.addWidget(rail)
+        self.single_page = single
 
+        # One full-width tab band across the whole window (documentMode makes it
+        # flat with a baseline), with the mockup's "+ Apply to folder" shortcut
+        # pinned to the right corner of the band.
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        self.tabs.setDocumentMode(True)
+        self.tabs.addTab(single, "Single image")
+        self.tabs.addTab(self.video_page, "Video")
+        self.tabs.addTab(self.sequence_page, "Image sequence")
+        self.tabs.addTab(self.effects_page, "Effects")
+        self.tabs.addTab(self.settings_page, "Settings")
+
+        self.tab_apply = QPushButton("+  Apply to folder")
+        self.tab_apply.setObjectName("tabAction")
+        self.tab_apply.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tab_apply.setToolTip(
+            "Run a whole folder with the current single-image settings."
+        )
+        self.tab_apply.clicked.connect(self.open_batch)
+        self.tabs.setCornerWidget(self.tab_apply, Qt.Corner.TopRightCorner)
+
+        self._wire_sequence_page()
+        self._wire_video_page()
+        self._wire_effects_page()
+        self.tabs.currentChanged.connect(self._tab_changed)
+
+        layout.addWidget(self.tabs, 1)
+
+        root.addWidget(main, 1)
         self.setCentralWidget(central)
+        self._build_footer_links()
         self.setStyleSheet(STYLE)
 
         # Ctrl+V anywhere in the window. A screenshot is the most common way an
@@ -1590,21 +2855,123 @@ class MainWindow(QMainWindow):
         # with nothing on screen and nothing in a log, which is the least
         # debuggable failure this app can have. Diagnose reports the details.
         try:
-            message = runtime.describe(runtime.detect(self.settings.runtime_dir))
+            status = runtime.detect(self.settings.runtime_dir)
+            message = runtime.describe(status)
+            self._set_runtime_pill(status.ready)
         except Exception as error:  # noqa: BLE001 - startup must survive anything
             message = f"Could not check the DLSS runtime: {error}"
+            self._set_runtime_pill(False)
         self.statusBar().showMessage(message)
 
         # After the event loop starts, so the window is painted behind the
         # dialog rather than the app appearing to hang on a bare download box.
-        QTimer.singleShot(0, self.ensure_model_downloaded)
+        QTimer.singleShot(0, self._start_initial_setup)
 
-    # -- sidebar -------------------------------------------------------------
+    # -- command bar ---------------------------------------------------------
+
+    def _command_bar(self) -> QWidget:
+        """The branded top strip: identity, GPU/VRAM, and the runtime state.
+
+        This is most of what separates the cockpit look from a plain form. The
+        GPU gauge answers "will this fit in VRAM" before a conversion, and the
+        runtime pill keeps "am I set up" in view at all times rather than buried
+        in a status line that scrolls away.
+        """
+        bar = QFrame()
+        bar.setObjectName("commandBar")
+        bar.setFixedHeight(64)
+        row = QHBoxLayout(bar)
+        # Vertical margins so the gauge and pill sit centred with air above and
+        # below, rather than glued to the top and bottom edges.
+        row.setContentsMargins(20, 12, 20, 12)
+        row.setSpacing(16)
+
+        glyph = QLabel("N")
+        glyph.setObjectName("brandGlyph")
+        glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        apply_font(glyph, family=FONT_DISPLAY, size=14)
+        row.addWidget(glyph)
+
+        # One line, the app's real name, in the display face and spaced out like
+        # the mockup — no subtitle.
+        self.wordmark = QLabel()
+        self.wordmark.setObjectName("wordmark")
+        apply_font(self.wordmark, family=FONT_DISPLAY, size=12.5, spacing=2.6)
+        self._set_wordmark()
+        row.addWidget(self.wordmark)
+
+        row.addStretch(1)
+
+        self.gpu_gauge = GpuGauge()
+        row.addWidget(self.gpu_gauge)
+
+        self.runtime_pill = QLabel("●  CHECKING")
+        self.runtime_pill.setObjectName("runtimePill")
+        self.runtime_pill.setProperty("state", "setup")
+        apply_font(self.runtime_pill, family=FONT_MONO, size=8.5, spacing=1.4)
+        row.addWidget(self.runtime_pill)
+        return bar
+
+    def _set_wordmark(self) -> None:
+        """DLSS·5 IMAGE & VIDEO CONVERTER on one line, dot in the accent colour."""
+        if not hasattr(self, "wordmark"):
+            return
+        signal = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])["signal"]
+        self.wordmark.setText(
+            f'DLSS<span style="color:{signal};">·</span>5&nbsp;&nbsp;'
+            f'IMAGE&nbsp;&amp;&nbsp;VIDEO&nbsp;CONVERTER'
+        )
+
+    def _set_runtime_pill(self, ready: bool) -> None:
+        """Green READY / amber SETUP NEEDED, mirroring the status-bar message."""
+        if not hasattr(self, "runtime_pill"):
+            return
+        self.runtime_pill.setText("●  RUNTIME READY" if ready else "●  SETUP NEEDED")
+        self.runtime_pill.setProperty("state", "ready" if ready else "setup")
+        # Qt does not re-evaluate a property selector on its own.
+        self.runtime_pill.style().unpolish(self.runtime_pill)
+        self.runtime_pill.style().polish(self.runtime_pill)
+
+    def _build_footer_links(self) -> None:
+        """Turn the status bar into the footer: GitHub · Support on the right.
+
+        The status bar already carries the operational message on the left, which
+        is exactly the mockup's footer shape, so it is reused rather than a second
+        bar being stacked under it. Permanent widgets sit to the right of any
+        transient message.
+        """
+        github = QPushButton("GitHub")
+        github.setObjectName("link")
+        github.setCursor(Qt.CursorShape.PointingHandCursor)
+        github.setToolTip(f"Opens the project page:\n{GITHUB_URL}")
+        github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
+
+        sep = QLabel("·")
+        sep.setObjectName("linkSep")
+
+        coffee = QPushButton("Support the project ☕")
+        coffee.setObjectName("link")
+        coffee.setCursor(Qt.CursorShape.PointingHandCursor)
+        coffee.setToolTip("Buy me a coffee — entirely optional, and thank you.")
+        coffee.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(COFFEE_URL)))
+
+        self.statusBar().addPermanentWidget(github)
+        self.statusBar().addPermanentWidget(sep)
+        self.statusBar().addPermanentWidget(coffee)
 
     # -- view switching ------------------------------------------------------
 
-    def _view_switch(self) -> QHBoxLayout:
-        row = QHBoxLayout()
+    def _view_bar(self) -> HoverBar:
+        """The floating view controls, revealed on hover over the picture.
+
+        A translucent pill pinned to the bottom-left of the stage, in the
+        mockup's instrument language. The StageHost fades it in and out with the
+        on-image pills so the picture is clean while it is being studied.
+        """
+        bar = HoverBar()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(6, 6, 6, 6)
+        row.setSpacing(3)
         self.view_photo = QPushButton("Photo")
         self.view_depth = QPushButton("Depth mask")
         self.view_result = QPushButton("Result")
@@ -1628,16 +2995,18 @@ class MainWindow(QMainWindow):
             self.view_photo, self.view_depth, self.view_result,
             self.view_diff, self.view_styles,
         ):
-            button.setObjectName("secondary")
+            button.setObjectName("viewChip")
             button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.view_photo.clicked.connect(lambda: self.show_view("photo"))
         self.view_depth.clicked.connect(lambda: self.show_view("depth"))
         self.view_result.clicked.connect(lambda: self.show_view("result"))
         self.view_diff.clicked.connect(lambda: self.show_view("difference"))
         self.view_styles.clicked.connect(lambda: self.show_view("styles"))
         self.view_grade = QPushButton("Colour")
-        self.view_grade.setObjectName("secondary")
+        self.view_grade.setObjectName("viewChip")
         self.view_grade.setCheckable(True)
+        self.view_grade.setCursor(Qt.CursorShape.PointingHandCursor)
         self.view_grade.setToolTip(
             "Exposure, contrast, saturation and vibrance, applied to the "
             "finished image.\n\n"
@@ -1647,43 +3016,52 @@ class MainWindow(QMainWindow):
         )
         self.view_grade.toggled.connect(self._grade_toggled)
 
-        row.addStretch(1)
         row.addWidget(self.view_photo)
         row.addWidget(self.view_depth)
         row.addWidget(self.view_result)
         row.addWidget(self.view_diff)
         row.addWidget(self.view_styles)
-        # Set apart: it is not another view, it changes the one you are on.
-        row.addSpacing(28)
+        # A hairline divider, then Colour set apart: it is not another view, it
+        # changes the one you are on.
+        sep = QFrame()
+        sep.setObjectName("viewBarSep")
+        sep.setFixedWidth(1)
+        row.addSpacing(6)
+        row.addWidget(sep)
+        row.addSpacing(6)
         row.addWidget(self.view_grade)
-        row.addStretch(1)
-        return row
+        return bar
 
     def _grade_panel(self) -> QWidget:
         panel = QWidget()
         layout = QHBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
+        layout.setSpacing(12)
         grade = self.settings.grade
 
-        for label, field, low, high, tip in (
+        specs = (
             ("Exposure", "exposure", -2.0, 2.0, "Stops of light. Applied in linear."),
             ("Contrast", "contrast", -1.0, 1.0, "S-curve around middle grey."),
             ("Saturation", "saturation", -1.0, 1.0, "Uniform. -1 is greyscale."),
             ("Vibrance", "vibrance", -1.0, 1.0,
              "Lifts muted colour and leaves saturated colour alone, so skies "
              "move and skin mostly does not."),
-        ):
-            row = SliderRow(
-                label,
-                getattr(grade, field),
-                self._grade_setter(field),
-                tip,
-                maximum=high,
-                minimum=low,
-            )
-            self._grade_rows[field] = row
-            layout.addWidget(row, 1)
+        )
+        # The same chip pattern as the sidebar, one row wide since the strip has
+        # the whole canvas width — four chips, one slider, honouring the density
+        # toggle like every other multi-slider group.
+        self._grade_group = ChipSliderGroup(
+            [(label, getattr(grade, field), self._grade_setter(field), tip, low, high)
+             for (label, field, low, high, tip) in specs],
+            mode=self.settings.density,
+            columns=4,
+        )
+        self._chip_groups.append(self._grade_group)
+        # Keep the field→row map _reset_grade relies on, sourced from the group.
+        self._grade_rows = {
+            field: self._grade_group.rows[label] for (label, field, *_rest) in specs
+        }
+        layout.addWidget(self._grade_group, 1)
 
         reset = QPushButton("Reset")
         reset.setObjectName("secondary")
@@ -2004,9 +3382,11 @@ class MainWindow(QMainWindow):
         view = self._style_view()
         if view is self.side_by_side:
             view.set_panes_u8(images)
+            view.set_labels(*labels)
         else:
             view.set_images_u8(images[0], images[1])
-        view.set_labels(*labels)
+            # Neither style is "the result", so no accent - both pills neutral.
+            view.set_labels(*labels, accent_right=False)
         # set_panes_u8 clears the sweep state, so re-arm every pending pane
         # after the redraw. The one being converted now sits at its real
         # progress; the rest sit fully grey at 0.0, waiting their turn.
@@ -2027,23 +3407,109 @@ class MainWindow(QMainWindow):
             )
             self.style_caption.setText(f"Same image, same settings, same grade. {how}")
 
+    # -- grade + effects, the shared display stage ---------------------------
+    #
+    # Effects run after the grade, in display sRGB, exactly as pipeline._finish
+    # does — so what the preview shows is what a save writes. These helpers are
+    # the one place that pairing lives on the UI side, and every redraw and the
+    # single-image save go through them.
+
+    def _effects_active(self) -> bool:
+        return not self.settings.effects.is_neutral
+
+    def _detail_active(self) -> bool:
+        # Only Preserve is a display-stage op; Boost is a conversion-time mode.
+        return self.settings.detail.mode == "preserve"
+
+    def _post_active(self) -> bool:
+        """Whether any post-DLSS display stage (detail or effects) is on."""
+        return self._detail_active() or self._effects_active()
+
+    def _apply_preserve(
+        self, srgb: np.ndarray, source_srgb: np.ndarray | None, preserve_range: bool = False
+    ) -> np.ndarray:
+        """Re-inject the source's detail, if Preserve is on and a source is given.
+
+        Source-less callers (or a size mismatch, which happens on the HDR path
+        where the scene-referred source is a different array) simply skip it.
+        """
+        if not self._detail_active() or source_srgb is None:
+            return srgb
+        if source_srgb.shape != srgb.shape:
+            return srgb
+        d = self.settings.detail
+        return detail.preserve_detail(
+            srgb, source_srgb, amount=d.amount, radius=d.radius, preserve_range=preserve_range
+        )
+
+    def _display_u8_from_linear(
+        self, linear: np.ndarray, source_srgb: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Linear RGB -> graded, detail-preserved, effected, 8-bit sRGB.
+
+        Keeps grade.apply_preview's fast uint8 path when nothing post-DLSS is on,
+        and only drops to the float route (which detail and effects need) when
+        one is.
+        """
+        if not self._post_active():
+            return grade.apply_preview(linear, self.settings.grade)
+        srgb = grade.apply_to_linear(linear, self.settings.grade)  # float sRGB [0,1]
+        srgb = self._apply_preserve(srgb, source_srgb)
+        srgb = effects.apply(srgb, self.settings.effects, paths.luts_dir())
+        return (np.clip(srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    def _display_u8_from_srgb(
+        self, srgb: np.ndarray, source_srgb: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Already-graded sRGB float -> detail-preserved, effected, 8-bit sRGB."""
+        srgb = self._apply_preserve(srgb, source_srgb)
+        if self._effects_active():
+            srgb = effects.apply(srgb, self.settings.effects, paths.luts_dir())
+        return (np.clip(srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    def _hdr_linear_with_effects(
+        self, graded_linear: np.ndarray, source_srgb: np.ndarray | None = None
+    ) -> np.ndarray:
+        """Apply detail + effects to a graded HDR linear image, keeping its range.
+
+        The same range-preserving round trip pipeline._finish uses, so an HDR
+        preview and an HDR save agree: linear -> extended sRGB -> detail/effects
+        -> linear, with highlights above white carried through intact.
+        """
+        if not self._post_active():
+            return graded_linear
+        srgb = contract.linear_to_srgb(graded_linear)
+        srgb = self._apply_preserve(srgb, source_srgb, preserve_range=True)
+        srgb = effects.apply(srgb, self.settings.effects, paths.luts_dir(), preserve_range=True)
+        return contract.srgb_to_linear(srgb)
+
     def _graded_preview(
         self, result: pipeline.Result, original: bool = False
     ) -> np.ndarray:
-        """One image as 8-bit, with the current grade, at preview size."""
+        """One image as 8-bit, with the current grade and effects, at preview size."""
         if original:
             small = _downscale_for_preview(result.original)
             linear = contract.srgb_to_linear(np.clip(small, 0.0, 1.0).astype(np.float32))
+            # Graded like the rest of the comparison (the caption promises "same
+            # grade"), but effects are the look under test, so the source pane is
+            # left free of them to compare against.
             return grade.apply_preview(linear, self.settings.grade)
         if result.hdr and result.enhanced_linear is not None:
             linear = _downscale_for_preview(result.enhanced_linear)
             graded = hdr_mod.tonemap(
-                grade.apply_linear(linear, self.settings.grade), result.white
+                self._hdr_linear_with_effects(
+                    grade.apply_linear(linear, self.settings.grade)
+                ),
+                result.white,
             )
             return (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
         small = _downscale_for_preview(result.enhanced)
         linear = contract.srgb_to_linear(np.clip(small, 0.0, 1.0).astype(np.float32))
-        return grade.apply_preview(linear, self.settings.grade)
+        # The source at the same preview size, for Preserve to lift detail from.
+        source_small = _downscale_for_preview(result.original)
+        return self._display_u8_from_linear(
+            linear, np.clip(source_small, 0.0, 1.0).astype(np.float32)
+        )
 
     def _adopt_style(self, index: int) -> None:
         """Make one of the compared styles the result, and the live setting."""
@@ -2051,7 +3517,7 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         self.settings.neural.style = index
-        self.style_box.setCurrentIndex(index)
+        self.style_box.set_index(index)
         self.settings.save(paths.settings_path())
         self._succeeded(result)
         self.statusBar().showMessage(
@@ -2151,25 +3617,33 @@ class MainWindow(QMainWindow):
             before_u8 = self._preview_before_u8
             if self.result.hdr:
                 graded = hdr_mod.tonemap(
-                    grade.apply_linear(self._preview_after_linear, self.settings.grade),
+                    self._hdr_linear_with_effects(
+                        grade.apply_linear(self._preview_after_linear, self.settings.grade)
+                    ),
                     self.result.white,
                 )
                 after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
             else:
-                after_u8 = grade.apply_preview(self._preview_after_linear, self.settings.grade)
+                after_u8 = self._display_u8_from_linear(
+                    self._preview_after_linear, self._preview_before
+                )
         else:
             before_u8 = self._full_before_u8
             if self.result.hdr and self.result.enhanced_linear is not None:
                 graded = hdr_mod.tonemap(
-                    grade.apply_linear(self.result.enhanced_linear, self.settings.grade),
+                    self._hdr_linear_with_effects(
+                        grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
+                    ),
                     self.result.white,
                 )
                 after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
             else:
-                # Reuses the exact full-resolution grade the export uses, so what
-                # is inspected is what gets saved.
+                # Reuses the exact full-resolution grade, detail and effects the
+                # export uses, so what is inspected is what gets saved.
                 graded = grade.apply(self.result.enhanced, self.settings.grade)
-                after_u8 = (np.clip(graded, 0.0, 1.0) * 255.0).astype(np.uint8)
+                after_u8 = self._display_u8_from_srgb(
+                    graded, np.clip(self.result.original, 0.0, 1.0).astype(np.float32)
+                )
 
         self.wipe.set_images_u8(before_u8, after_u8, keep_view=not new)
 
@@ -2192,10 +3666,10 @@ class MainWindow(QMainWindow):
             return
 
         # Leaving the styles view puts the wipe back to source-versus-result,
-        # which is what its labels should say. Named rather than left to be
-        # inferred from the drag: which half is which is obvious once you move
-        # the divider, and not obvious at all before you do.
-        self.wipe.set_labels("Before", "After")
+        # which is what its labels should say. SOURCE / DLSS 5, matching the
+        # mockup's on-image pills, with the result half accented so which is
+        # which is clear before the divider is even moved.
+        self.wipe.set_labels("SOURCE", "DLSS 5")
         self.side_by_side.clear()
 
         if which == "difference":
@@ -2291,8 +3765,20 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.browse)
 
         self.convert_button = QPushButton("Convert")
+        self.convert_button.setObjectName("convert")
         self.convert_button.setEnabled(False)
+        # The hero action, in the display face, spaced and capitalised like the
+        # mockup so it reads as the thing the whole panel points at.
+        apply_font(self.convert_button, family=FONT_DISPLAY, size=12.5, spacing=2.4, caps=True)
         self.convert_button.clicked.connect(self.convert)
+        # The one glow QSS cannot do: an accent halo so Convert reads as the hero
+        # action, the thing the whole cockpit is pointed at. Kept on self so a
+        # theme switch can retint it.
+        self._convert_glow = QGraphicsDropShadowEffect(self.convert_button)
+        self._convert_glow.setBlurRadius(34)
+        self._convert_glow.setOffset(0, 0)
+        self._tint_convert_glow()
+        self.convert_button.setGraphicsEffect(self._convert_glow)
 
         self.save_button = QPushButton("Save result…")
         self.save_button.setObjectName("secondary")
@@ -2327,51 +3813,224 @@ class MainWindow(QMainWindow):
         )
         self.feedback_button.clicked.connect(self.use_result_as_input)
 
-        self.find_button = QPushButton("Find my DLSS files…")
-        self.find_button.setObjectName("secondary")
-        self.find_button.setToolTip(
-            "Search your Steam libraries, Downloads and Documents for the four "
-            "files, and copy them in.\n\n"
-            "Nothing is downloaded - this only looks at files already on your "
-            "machine. If DLSS 5 works in a game for you, that game's folder is "
-            "what it is looking for."
-        )
-        self.find_button.clicked.connect(self.open_find_files)
-
-        diagnose = QPushButton("Check runtime")
-        diagnose.setObjectName("secondary")
-        diagnose.clicked.connect(self.diagnose)
-
-        help_button = QPushButton("Help")
-        help_button.setObjectName("secondary")
-        help_button.setToolTip(
-            f"Opens the guide in your browser:\n{WIKI_URL}\n\n"
-            "Every issue anyone has reported, with what actually caused it."
-        )
-        help_button.clicked.connect(lambda: open_help())
-
-        # One column, not two. Two-across was tried and measured: at a 320 px
-        # sidebar a half cell is 156 px, and "Check runtime" needs 188, "Apply
-        # to folder..." 224, "Find my DLSS files..." 260. Fitting them means
-        # cutting to "Runtime", "To folder...", "Find files..." - and that last
-        # one exists to say DLSS files, which is the whole reason someone
-        # stuck on missing files spots it. Costing that to reclaim 72 px is a
-        # bad trade, and pinning the block already took 252 px out of the
-        # scrolling region, which was the actual crowding.
+        # Runtime setup, Check runtime, Help and the theme picker moved to the
+        # Settings tab — the action bar now carries only what you do to an image.
+        # Apply to folder moved to the tab band's right corner (self.tab_apply),
+        # so it is not repeated here; batch_button is kept as state for its
+        # tooltip and any enable/disable, just not shown in this column.
         layout.addWidget(self.open_button)
         layout.addWidget(self.convert_button)
         layout.addWidget(self.save_button)
         layout.addWidget(self.feedback_button)
-        layout.addWidget(self.batch_button)
-        layout.addWidget(self.find_button)
 
-        # The one pair that fits: Help is a single short word.
-        tools = QHBoxLayout()
-        tools.setSpacing(8)
-        tools.addWidget(diagnose, 1)
-        tools.addWidget(help_button)
-        layout.addLayout(tools)
+        # The GitHub · Support links moved to the footer (the status bar) so they
+        # read as a footer across the whole window rather than tucked under the
+        # sidebar buttons — see _build_footer_links.
         return panel
+
+    # -- theme ---------------------------------------------------------------
+
+    def _tint_convert_glow(self) -> None:
+        """Colour the Convert halo with the active palette's signal accent."""
+        signal = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])["signal"]
+        colour = QColor(signal)
+        colour.setAlpha(150)
+        self._convert_glow.setColor(colour)
+
+    def _theme_changed(self, _index: int) -> None:
+        name = self.theme_box.currentData() or DEFAULT_THEME
+        self.settings.theme = name
+        self.settings.save(paths.settings_path())
+        self._apply_theme(name)
+
+    def _apply_theme(self, name: str) -> None:
+        """Repaint the whole app in a palette, live. STYLE is reassigned in
+        apply_app_theme, so re-setting it on this window restyles every child."""
+        app = QApplication.instance()
+        if app is not None:
+            apply_app_theme(app, name)
+        self.setStyleSheet(STYLE)
+        self._tint_convert_glow()
+        self._set_wordmark()
+
+    def _density_changed(self, _index: int) -> None:
+        """Flip every chip/slider group between Compact and Full, live."""
+        mode = self.density_toggle.current_data() or "compact"
+        self.settings.density = mode
+        self.settings.save(paths.settings_path())
+        for group in self._chip_groups:
+            group.set_mode(mode)
+
+    def _settings_page(self) -> QWidget:
+        """The Settings tab — a home for everything that is configured once and
+        then left alone, so the sidebar can hold only per-image controls.
+
+        Appearance, the DLSS runtime setup (previously loose buttons), and the
+        advanced HDR and Depth controls all live here. Their widgets are still
+        created as the same instance attributes the rest of the app reads, just
+        parented into this page instead of the sidebar.
+        """
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        inner = QWidget()
+        cols = QHBoxLayout(inner)
+        cols.setContentsMargins(18, 18, 18, 18)
+        cols.setSpacing(16)
+        left = QVBoxLayout()
+        left.setSpacing(14)
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        s = self.settings.neural
+
+        # -- Appearance --
+        appearance = ModuleCard("Appearance")
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("Colour theme"))
+        self.theme_box = QComboBox()
+        for palette_name in PALETTES:
+            self.theme_box.addItem(palette_name, palette_name)
+        current = self.theme_box.findData(self.settings.theme)
+        self.theme_box.setCurrentIndex(current if current >= 0 else 0)
+        self.theme_box.setToolTip("The colour palette the whole app is drawn in.")
+        self.theme_box.currentIndexChanged.connect(self._theme_changed)
+        theme_row.addStretch(1)
+        theme_row.addWidget(self.theme_box, 1)
+        appearance.add_layout(theme_row)
+
+        density_row = QHBoxLayout()
+        density_label = QLabel("Controls")
+        density_label.setToolTip(
+            "Compact — parameters become a row of chips over one slider, so a "
+            "group of four sliders takes one slider's height.\n\n"
+            "Full — every slider is shown at once, the classic stacked layout."
+        )
+        density_row.addWidget(density_label)
+        density_row.addStretch(1)
+        self.density_toggle = SegmentedControl(
+            [("Compact", "compact"), ("Full", "full")],
+            current=0 if self.settings.density != "full" else 1,
+        )
+        self.density_toggle.changed.connect(self._density_changed)
+        density_row.addWidget(self.density_toggle, 1)
+        appearance.add_layout(density_row)
+
+        # -- DLSS runtime (the setup that used to be loose buttons) --
+        runtime_grp = ModuleCard("DLSS runtime")
+        self.settings_runtime_status = QLabel("")
+        self.settings_runtime_status.setObjectName("hint")
+        self.settings_runtime_status.setWordWrap(True)
+        runtime_grp.add(self.settings_runtime_status)
+        r_buttons = QHBoxLayout()
+        find_btn = QPushButton("Find my DLSS files…")
+        find_btn.setObjectName("secondary")
+        find_btn.setToolTip(
+            "Search your Steam libraries, Downloads and Documents for the files, "
+            "and copy them in. Nothing is downloaded."
+        )
+        find_btn.clicked.connect(self.open_find_files)
+        check_btn = QPushButton("Check runtime")
+        check_btn.setObjectName("secondary")
+        check_btn.clicked.connect(self.diagnose)
+        r_buttons.addWidget(find_btn)
+        r_buttons.addWidget(check_btn)
+        r_buttons.addStretch(1)
+        runtime_grp.add_layout(r_buttons)
+
+        # -- Advanced: HDR / display --
+        hdr = ModuleCard("HDR / display")
+        hdr.setToolTip(
+            "The add-on's HDR controls. This pipeline is SDR end to end, but "
+            "these still change the result — the neural pass reasons about light "
+            "before anything is tonemapped back. Defaults match the add-on's own."
+        )
+        hdr.add(SliderRow(
+            "Paper white", s.paper_white, self._neural_setter("paper_white"),
+            "The luminance the model treats as diffuse white. On an HDR or OLED "
+            "display this decides how hard highlights are pushed. The add-on "
+            "defaults to 1; shipping game configs use 16, where it stops changing.",
+            maximum=NR_PAPER_WHITE_MAX,
+        ))
+        hdr.add(SliderRow(
+            "HDR transfer", s.transfer_strength, self._neural_setter("transfer_strength"),
+            "Strength of the transfer curve the pass works through. Range 0..1.",
+            maximum=NR_TRANSFER_MAX,
+        ))
+        hdr.add(SliderRow(
+            "Colour strength", s.color_strength, self._neural_setter("color_strength"),
+            "How much of the model's colour change is kept. At 0 the source colour "
+            "survives and only structure changes. Range 0..1.",
+            maximum=NR_COLOR_MAX,
+        ))
+
+        # -- Advanced: Depth --
+        depth = ModuleCard("Depth")
+        self.model_box = QComboBox()
+        for label, model_id in MODELS.items():
+            self.model_box.addItem(label, model_id)
+        index = self.model_box.findData(self.settings.depth.model_id)
+        self.model_box.setCurrentIndex(max(0, index))
+        self.model_box.currentIndexChanged.connect(self._model_changed)
+        depth.add(self.model_box)
+        depth.add(SliderRow(
+            "Depth contrast", min(1.0, self.settings.depth.contrast / 3.0),
+            self._contrast_changed,
+            "Reshapes the near-far spread. Higher pushes more of the frame into "
+            "the foreground. Updates the depth mask live.",
+        ))
+        self.tiled = QCheckBox("Tiled depth (slow, sharper silhouettes)")
+        self.tiled.setChecked(self.settings.depth.tiled)
+        self.tiled.toggled.connect(self._tiled_changed)
+        depth.add(self.tiled)
+
+        # -- Help --
+        help_card = ModuleCard("Help")
+        help_btn = QPushButton("Open the guide…")
+        help_btn.setObjectName("secondary")
+        help_btn.setToolTip(f"Opens the guide in your browser:\n{WIKI_URL}")
+        help_btn.clicked.connect(lambda: open_help())
+        help_card.add(help_btn)
+        replay_btn = QPushButton("Replay introduction…")
+        replay_btn.setObjectName("secondary")
+        replay_btn.setToolTip(
+            "Show the first-conversion introduction and the guided tour again."
+        )
+        replay_btn.clicked.connect(self.replay_onboarding)
+        help_card.add(replay_btn)
+
+        # Two balanced columns, so nothing — a slider especially — sprawls the
+        # full width of the window.
+        left.addWidget(appearance)
+        left.addWidget(hdr)
+        left.addStretch(1)
+        right.addWidget(runtime_grp)
+        right.addWidget(depth)
+        right.addWidget(help_card)
+        right.addStretch(1)
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+
+        scroller = QScrollArea()
+        scroller.setWidget(inner)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(scroller)
+        self._refresh_settings_runtime()
+        return page
+
+    def _refresh_settings_runtime(self) -> None:
+        """Fill the Settings runtime line with a plain ready / not-ready verdict."""
+        if not hasattr(self, "settings_runtime_status"):
+            return
+        try:
+            status = runtime.detect(self.settings.runtime_dir or None)
+            if status.ready:
+                text = "✓ Runtime ready — all files found."
+            else:
+                text = "✗ Not ready:\n• " + "\n• ".join(status.problems)
+        except Exception as error:  # noqa: BLE001 - status must never crash the tab
+            text = f"Could not check the runtime: {error}"
+        self.settings_runtime_status.setText(text)
 
     def _sidebar(self) -> QWidget:
         panel = QWidget()
@@ -2379,8 +4038,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        neural = QGroupBox("Neural rendering")
-        neural_layout = QVBoxLayout(neural)
+        neural = ModuleCard("Neural", tag="RenoDX · DLAA")
+        self.neural_card = neural
+        neural_layout = neural.body
         settings = self.settings.neural
 
         # Preset and style first: they choose *which* model runs, and the
@@ -2400,93 +4060,38 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(self.preset_box, 1)
         neural_layout.addLayout(preset_row)
 
-        style_row = QHBoxLayout()
-        style_row.addWidget(QLabel("Style"))
-        self.style_box = QComboBox()
-        self.style_box.addItems(NR_STYLES)
-        self.style_box.setCurrentIndex(min(len(NR_STYLES) - 1, max(0, settings.style)))
+        # Style is two choices — Natural or Cinematic — so it reads better as a
+        # segmented control with both visible than as a dropdown that hides one.
+        self.style_box = SegmentedControl(
+            list(NR_STYLES),
+            current=min(len(NR_STYLES) - 1, max(0, settings.style)),
+        )
         self.style_box.setToolTip("Broad look, applied on top of the preset.")
-        self.style_box.currentIndexChanged.connect(self._style_changed)
-        style_row.addWidget(self.style_box, 1)
-        neural_layout.addLayout(style_row)
+        self.style_box.changed.connect(self._style_changed)
+        neural_layout.addWidget(self.style_box)
 
-        neural_layout.addWidget(
-            SliderRow(
-                "Intensity",
-                settings.intensity,
-                self._neural_setter("intensity"),
-                "Overall strength of the neural pass. At 0 this is a plain DLAA resolve. "
-                "The add-on's own range is 0..2; it stops changing above 2.",
-                maximum=NR_STRENGTH_MAX,
-            )
-        )
-        neural_layout.addWidget(
-            SliderRow(
-                "Skin",
-                settings.skin,
-                self._neural_setter("skin"),
-                "Subsurface scattering and pore detail on faces. Lower this first "
-                "if results look waxy.",
-                maximum=NR_STRENGTH_MAX,
-            )
-        )
-        neural_layout.addWidget(
-            SliderRow(
-                "Local tone",
-                settings.local_tone,
-                self._neural_setter("local_tone"),
-                "How much the model may relight the scene.",
-                maximum=NR_STRENGTH_MAX,
-            )
-        )
-        neural_layout.addWidget(
-            SliderRow(
-                "Structure",
-                settings.structure,
-                self._neural_setter("structure"),
-                "Micro-contrast in fabric, hair, and surface material.",
-                maximum=NR_STRENGTH_MAX,
-            )
-        )
-        hdr = QGroupBox("HDR / display")
-        hdr.setToolTip(
-            "The add-on's HDR controls. This pipeline is SDR end to end, but "
-            "these still change the result — the neural pass reasons about light "
-            "before anything is tonemapped back. Defaults match the add-on's own."
-        )
-        hdr_layout = QVBoxLayout(hdr)
-        hdr_layout.addWidget(
-            SliderRow(
-                "Paper white",
-                settings.paper_white,
-                self._neural_setter("paper_white"),
-                "The luminance the model treats as diffuse white. On an HDR or "
-                "OLED display this decides how hard highlights are pushed. The "
-                "add-on defaults to 1; shipping game configs use 16, which is "
-                "also where it stops changing.",
-                maximum=NR_PAPER_WHITE_MAX,
-            )
-        )
-        hdr_layout.addWidget(
-            SliderRow(
-                "HDR transfer",
-                settings.transfer_strength,
-                self._neural_setter("transfer_strength"),
-                "Strength of the transfer curve the pass works through. "
-                "Measured range 0..1.",
-                maximum=NR_TRANSFER_MAX,
-            )
-        )
-        hdr_layout.addWidget(
-            SliderRow(
-                "Colour strength",
-                settings.color_strength,
-                self._neural_setter("color_strength"),
-                "How much of the model's colour change is kept. At 0 the source "
-                "colour survives and only structure changes. Measured range 0..1.",
-                maximum=NR_COLOR_MAX,
-            )
-        )
+        # One chip per strength, one slider shown at a time. Four stacked sliders
+        # were most of what made this group read as a wall; the chips carry the
+        # names and the selected one drops its slider in below — the same
+        # segmented pattern as the view switch under the image.
+        self.neural_params = ChipSliderGroup([
+            ("Intensity", settings.intensity, self._neural_setter("intensity"),
+             "Overall strength of the neural pass. At 0 this is a plain DLAA "
+             "resolve. The add-on's own range is 0..2; it stops changing above 2.",
+             0.0, NR_STRENGTH_MAX),
+            ("Skin", settings.skin, self._neural_setter("skin"),
+             "Subsurface scattering and pore detail on faces. Lower this first "
+             "if results look waxy.",
+             0.0, NR_STRENGTH_MAX),
+            ("Local tone", settings.local_tone, self._neural_setter("local_tone"),
+             "How much the model may relight the scene.",
+             0.0, NR_STRENGTH_MAX),
+            ("Structure", settings.structure, self._neural_setter("structure"),
+             "Micro-contrast in fabric, hair, and surface material.",
+             0.0, NR_STRENGTH_MAX),
+        ], mode=self.settings.density)
+        self._chip_groups.append(self.neural_params)
+        neural_layout.addWidget(self.neural_params)
         self.live = QCheckBox("Live preview")
         self.live.setChecked(self.settings.evaluation.live_preview)
         self.live.setToolTip(
@@ -2497,34 +4102,14 @@ class MainWindow(QMainWindow):
         self.live.toggled.connect(self._live_toggled)
         neural_layout.addWidget(self.live)
         layout.addWidget(neural)
-        layout.addWidget(hdr)
 
-        depth = QGroupBox("Depth")
-        depth_layout = QVBoxLayout(depth)
-        self.model_box = QComboBox()
-        for label, model_id in MODELS.items():
-            self.model_box.addItem(label, model_id)
-        index = self.model_box.findData(self.settings.depth.model_id)
-        self.model_box.setCurrentIndex(max(0, index))
-        self.model_box.currentIndexChanged.connect(self._model_changed)
-        depth_layout.addWidget(self.model_box)
-        depth_layout.addWidget(
-            SliderRow(
-                "Depth contrast",
-                min(1.0, self.settings.depth.contrast / 3.0),
-                self._contrast_changed,
-                "Reshapes the near-far spread. Higher pushes more of the frame "
-                "into the foreground. Updates the depth mask live.",
-            )
-        )
-        self.tiled = QCheckBox("Tiled depth (slow, sharper silhouettes)")
-        self.tiled.setChecked(self.settings.depth.tiled)
-        self.tiled.toggled.connect(self._tiled_changed)
-        depth_layout.addWidget(self.tiled)
-        layout.addWidget(depth)
+        # HDR/display and Depth are rarely touched, so they live on the Settings
+        # tab now (see _settings_page) — the sidebar keeps only what you reach for
+        # on every image. The controls are still built here as instance state so
+        # everything downstream that reads them is unchanged.
 
-        evaluation = QGroupBox("Evaluation")
-        eval_layout = QVBoxLayout(evaluation)
+        evaluation = ModuleCard("Output")
+        eval_layout = evaluation.body
         row = QHBoxLayout()
         row.addWidget(QLabel("Passes"))
         self.frames = QSpinBox()
@@ -2573,8 +4158,137 @@ class MainWindow(QMainWindow):
         self.jitter.toggled.connect(lambda v: setattr(self.settings.evaluation, "jitter", v))
         eval_layout.addWidget(self.jitter)
         layout.addWidget(evaluation)
+
+        layout.addWidget(self._detail_group())
         layout.addStretch(1)
         return panel
+
+    def _detail_group(self) -> QWidget:
+        """Detail recovery — give back the fine texture DLAA softens.
+
+        Preserve is instant and lives here with the neural controls because it is
+        about the *quality* of the result, not an optional look. It re-injects
+        the source photo's own fine detail onto the DLSS output, so brick, fabric
+        and mesh stay crisp while the neural relighting is kept.
+        """
+        group = ModuleCard("Detail", tag="New")
+        self.detail_card = group
+        group.setToolTip(
+            "DLAA is an anti-aliaser: on a photo it smooths genuine fine texture "
+            "(brick, perforations, railings). Preserve puts that detail back by "
+            "lifting the source's own high-frequency band onto the result — the "
+            "real detail, not a sharpen, so it cannot halo."
+        )
+        d_layout = group.body
+
+        modes = [("Off", "off"), ("Preserve", "preserve"), ("Boost", "boost")]
+        current = next(
+            (i for i, (_, data) in enumerate(modes) if data == self.settings.detail.mode),
+            0,
+        )
+        self.detail_mode = SegmentedControl(modes, current=current)
+        self.detail_mode.setToolTip(
+            "Off — the plain DLSS result.\n\n"
+            "Preserve — re-inject the source's real fine detail (instant, native "
+            "resolution, no halos). The right default for renders and textured "
+            "photos.\n\n"
+            "Boost — supersample: run DLSS at 2×/4×/8× the size, crispened, "
+            "then downscale. Sharper still on renders, but slow (many more "
+            "pixels) and it takes effect on the next Convert, not live."
+        )
+        self.detail_mode.changed.connect(self._detail_mode_changed)
+        d_layout.addWidget(self.detail_mode)
+
+        self.detail_amount = SliderRow(
+            "Amount",
+            self.settings.detail.amount,
+            self._detail_amount_setter,
+            "Preserve: how much source detail to blend back (0 = plain DLSS, "
+            "1 = full detail).\nBoost: strength of the pre-DLSS crispen.",
+            maximum=1.0,
+            minimum=0.0,
+        )
+        d_layout.addWidget(self.detail_amount)
+
+        # Boost-only: how far to supersample. Sits under Amount, greyed unless
+        # Boost is selected, since it means nothing to the other modes.
+        ss_row = QHBoxLayout()
+        self.detail_super_label = QLabel("Supersample")
+        ss_row.addWidget(self.detail_super_label)
+        self.detail_supersample = QComboBox()
+        for factor in DETAIL_BOOST_FACTORS:
+            self.detail_supersample.addItem(f"{factor}x", factor)
+        self.detail_supersample.setToolTip(
+            "Boost only. 2×/4×/8× process 4/16/64 times the pixels. The app "
+            "uses current free VRAM for a preflight instead of silently stepping "
+            "the factor down. D3D12 has a hard 16,384 px limit per side, and "
+            "the installed DLSS runtime may impose a lower working limit."
+        )
+        ss_idx = self.detail_supersample.findData(self.settings.detail.supersample)
+        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 1)
+        self.detail_supersample.currentIndexChanged.connect(self._detail_super_changed)
+        ss_row.addStretch(1)
+        ss_row.addWidget(self.detail_supersample)
+        d_layout.addLayout(ss_row)
+
+        # A one-line explainer under the controls, like the mockup's card copy —
+        # updated to whichever mode is selected.
+        self.detail_hint = QLabel()
+        self.detail_hint.setObjectName("hint")
+        self.detail_hint.setWordWrap(True)
+        d_layout.addWidget(self.detail_hint)
+
+        self._sync_detail_controls()
+        return group
+
+    _DETAIL_HINTS = {
+        "off": "The plain DLSS result — no detail recovery.",
+        "preserve": "Preserve re-injects the source's real fine detail — brick, "
+                    "mesh and fabric stay crisp while the neural relight is kept. "
+                    "No halos.",
+        "boost": "Boost supersamples: DLSS runs at 2×/4×/8× the size, crispened, "
+                 "then downscales. The selected factor is never silently reduced; "
+                 "VRAM is checked first and DLSS reports its own runtime limit.",
+    }
+
+    def _sync_detail_controls(self) -> None:
+        """Grey the supersample row unless Boost is the active mode, and set the
+        card's explainer to match the selected mode."""
+        mode = self.settings.detail.mode
+        is_boost = mode == "boost"
+        self.detail_supersample.setEnabled(is_boost)
+        self.detail_super_label.setEnabled(is_boost)
+        if hasattr(self, "detail_hint"):
+            self.detail_hint.setText(self._DETAIL_HINTS.get(mode, ""))
+
+    def _detail_mode_changed(self, _index: int) -> None:
+        self.settings.detail.mode = self.detail_mode.current_data() or "off"
+        self.settings.save(paths.settings_path())
+        self._sync_detail_controls()
+        self._detail_redraw()
+
+    def _detail_super_changed(self, _index: int) -> None:
+        self.settings.detail.supersample = int(self.detail_supersample.currentData() or 2)
+        self.settings.save(paths.settings_path())
+        # Boost is a conversion-time mode, so this takes effect on the next
+        # Convert; there is nothing to redraw live.
+
+    def _detail_amount_setter(self, value: float):
+        self.settings.detail.amount = value
+        self.settings.save(paths.settings_path())
+        self._detail_redraw()
+
+    def _detail_redraw(self) -> None:
+        """Repaint the result and the effects preview on the grade timers.
+
+        Preserve is a cheap post-DLSS pass like the grade, so it rides the same
+        coalesced fast/sharp beat — the wipe stays responsive while the amount
+        slider drags, and sharpens once it settles.
+        """
+        if self._view in ("result", "styles"):
+            self._grade_timer.start()
+            self._grade_full_timer.start()
+        self._effects_preview_timer.start()
 
 
     # -- sequence page -------------------------------------------------------
@@ -2585,6 +4299,7 @@ class MainWindow(QMainWindow):
         page.pick_output.clicked.connect(self._pick_video_output)
         page.start.clicked.connect(self._start_video)
         page.stop.clicked.connect(self._stop_video)
+        page.queue_button.clicked.connect(self.open_video_queue)
         page.mode_box.currentIndexChanged.connect(self._video_mode_changed)
         page.range_box.currentIndexChanged.connect(self._video_range_changed)
         page.play_button.clicked.connect(self._toggle_video_play)
@@ -2595,6 +4310,62 @@ class MainWindow(QMainWindow):
         page.player.playbackStateChanged.connect(self._video_playback_state)
         page.timeline.seeked.connect(self._video_scrub)
         page.output_path: Path | None = None
+
+    # -- effects tab ---------------------------------------------------------
+
+    def _wire_effects_page(self) -> None:
+        page = self.effects_page
+        page.refresh_button.clicked.connect(self._refresh_luts)
+        page.open_folder_button.clicked.connect(self._open_luts_folder)
+        self._refresh_luts()
+        # A LUT chosen in a previous session needs validating on startup so its
+        # status line is right before the tab is ever opened.
+        self._validate_lut()
+
+    def _refresh_luts(self) -> None:
+        self.effects_page.set_luts(effects.available_luts(paths.luts_dir()))
+        self._validate_lut()
+
+    def _open_luts_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(paths.luts_dir())))
+
+    def _validate_lut(self) -> None:
+        """Say whether the chosen LUT actually loads, so a bad .cube is obvious."""
+        e = self.settings.effects
+        if not (e.lut_enabled and e.lut_name):
+            return
+        try:
+            effects.load_cube(paths.luts_dir() / e.lut_name)
+            self.effects_page.set_lut_status(f"Using {e.lut_name}.")
+        except ValueError as error:
+            self.effects_page.set_lut_status(f"Cannot use {e.lut_name}: {error}")
+
+    def _effects_changed(self) -> None:
+        """An effect toggled or a slider moved: persist, redraw, keep it live.
+
+        Reuses the grade timers so the main result view and the effects preview
+        both refresh on the same coalesced beat — a drag stays responsive and
+        the sharp redraw lands once it settles.
+        """
+        self.settings.save(paths.settings_path())
+        self._validate_lut()
+        # The main comparison view, when it is showing the result.
+        if self._view in ("result", "styles"):
+            self._grade_timer.start()
+            self._grade_full_timer.start()
+        self._effects_preview_timer.start()
+
+    def _update_effects_preview(self) -> None:
+        if self.result is None:
+            self.effects_page.show_preview(None)
+            return
+        self.effects_page.show_preview(self._graded_preview(self.result))
+
+    def _tab_changed(self, _index: int) -> None:
+        # Draw the effects preview when its tab comes forward, so it reflects the
+        # latest result and settings even if nothing changed while it was hidden.
+        if self.tabs.currentWidget() is self.effects_page:
+            self._update_effects_preview()
 
     def _video_fps(self) -> float:
         info = self.video_page.info
@@ -2740,6 +4511,10 @@ class MainWindow(QMainWindow):
         page.bar.setValue(0)
         total = limit if limit is not None else (page.info.frames if page.info else 0)
         page.bar.setMaximum(total or 0)
+        # Fresh clock per run: the ETA is built from steady-state frame timings,
+        # not from whatever the last conversion left behind.
+        self._video_eta = _EtaTracker()
+        self._video_eta.start()
 
         self._video_thread = QThread(self)
         self._video_worker = VideoWorker(
@@ -2763,7 +4538,16 @@ class MainWindow(QMainWindow):
         page = self.video_page
         if update.stage == "converting":
             page.bar.setValue(update.index)
-            page.bar.setFormat("%v of %m frames")
+            # ETA rides on the bar text: it is the number people watch, and a
+            # long conversion the user has walked away from is exactly when
+            # "how much longer" matters. Withheld for the first frame or two,
+            # while the estimate is still just the harness start-up.
+            self._video_eta.tick()
+            left = self._video_eta.remaining((update.total - update.index) if update.total else 0)
+            if left is not None:
+                page.bar.setFormat(f"%v of %m frames — ~{_format_duration(left)} left")
+            else:
+                page.bar.setFormat("%v of %m frames")
             # Every few frames, not every frame: repainting a preview per frame
             # on a fast clip is wasted work.
             if update.index % 3 == 0 or update.index == update.total:
@@ -2907,6 +4691,7 @@ class MainWindow(QMainWindow):
         try:
             first = contract.fit_to_budget(contract.load_image(Path(chosen)), _PREVIEW_EDGE)
             self.sequence_page.preview.set_image(first, Path(chosen).name)
+            self.sequence_page.stack.setCurrentWidget(self.sequence_page.preview)
         except Exception:  # noqa: BLE001 - a preview is not worth failing over
             pass
         self._check_depth_pairing()
@@ -2996,6 +4781,7 @@ class MainWindow(QMainWindow):
         page.bar.setValue(frame.index + 1)
         page.bar.setFormat(f"%v of %m — {frame.source.name}")
         page.preview.set_image(_downscale_for_preview(frame.image), frame.output.name)
+        page.stack.setCurrentWidget(page.preview)
 
     def _sequence_teardown(self) -> None:
         if self._seq_thread is not None:
@@ -3036,6 +4822,163 @@ class MainWindow(QMainWindow):
 
     # -- first run -----------------------------------------------------------
 
+    def _start_initial_setup(self) -> None:
+        """Finish the required downloads, then offer onboarding on new installs.
+
+        PyTorch is handled before the main window is constructed. The depth
+        model is the last required download, so this callback is the first point
+        where the complete first-run sequence can safely continue.
+        """
+        self.ensure_model_downloaded()
+        if self.settings.onboarding_version >= ONBOARDING_VERSION:
+            return
+        if not DepthEngine.is_downloaded(self.settings.depth.model_id):
+            # The download dialog already explained the failure. Leave the
+            # version at zero so a later successful launch can resume.
+            return
+        self._run_first_onboarding()
+
+    def _run_first_onboarding(self) -> None:
+        """Find the user's runtime, then introduce the app.
+
+        The live DLSS check runs in the *background* rather than gating the
+        tour. It initialises DLSS on the GPU, and on some driver/runtime combos
+        that wedges - which is exactly the freeze that used to trap first-run
+        behind an unclosable "Checking DLSS 5" box. Decoupling it means the app
+        is always usable, the tour always reachable, and onboarding always
+        completes, so a hung check can never loop the user back into it.
+        """
+        try:
+            status = runtime.detect(self.settings.runtime_dir or None)
+        except Exception:  # noqa: BLE001 - the finder is the recovery path
+            status = None
+
+        if status is None or not status.ready:
+            finder = FindFilesDialog(self, onboarding_mode=True)
+            QTimer.singleShot(0, finder.start_scan)
+            finder.exec()
+            try:
+                status = runtime.detect(self.settings.runtime_dir or None)
+            except Exception:  # noqa: BLE001 - tutorial remains useful offline
+                status = None
+
+        if status is not None and status.ready and status.harness is not None:
+            self._begin_background_probe(status.harness)
+
+        self._show_first_conversion_intro()
+
+    def _begin_background_probe(self, harness: Path) -> None:
+        """Confirm the neural path loads, off the UI thread, without blocking.
+
+        The tour and the whole app stay usable while this runs; the status bar
+        reports the result when it lands, and the watchdog inside RuntimeProbe
+        gives up on a runtime that hangs instead of freezing the window.
+        """
+        if self._runtime_probe is not None:
+            return
+        self.statusBar().showMessage("Checking DLSS 5 in the background…")
+        probe = RuntimeProbe(harness, parent=self)
+        self._runtime_probe = probe
+        probe.done.connect(self._background_probe_done)
+        probe.start()
+
+    def _background_probe_done(self, ok: bool, report: str) -> None:
+        self._runtime_probe = None
+        self.statusBar().showMessage(
+            "DLSS 5 verified — the neural pass is live." if ok
+            else "Could not confirm the neural pass — Settings → Check runtime for details."
+        )
+
+    def _show_first_conversion_intro(self) -> None:
+        palette = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])
+        dialog = onboarding.FirstConversionDialog(
+            paths.onboarding_image(), self, palette=palette
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._complete_onboarding()
+            return
+
+        chosen = self.browse()
+        if chosen is None:
+            # Cancelling the file picker is not the same as skipping. Offer the
+            # introduction again next launch rather than silently completing it.
+            return
+        QTimer.singleShot(150, self.start_tutorial)
+
+    def replay_onboarding(self) -> None:
+        """Settings entry point for people who skipped or want a refresher."""
+        self._show_first_conversion_intro()
+
+    def start_tutorial(self) -> None:
+        """Spotlight the real controls in the same order as the first workflow."""
+        if self._tour_overlay is not None and self._tour_overlay.isVisible():
+            return
+        self.tabs.setCurrentWidget(self.single_page)
+        self.show_view("photo")
+        self.single_scroller.ensureWidgetVisible(self.neural_card)
+
+        steps = [
+            onboarding.TourStep(
+                "Your image",
+                "Your image is loaded here now — drop or paste another anytime. "
+                "After a conversion, drag the divider to compare source and "
+                "result; the mouse wheel zooms and right-drag pans.",
+                self.stack,
+            ),
+            onboarding.TourStep(
+                "What you convert",
+                "Single image is the main workflow. Video keeps the clip's audio; "
+                "Image sequence handles rendered frames and optional depth passes; "
+                "Effects adds the finishing look. Apply to folder repeats your "
+                "current settings across many images.",
+                self.tabs.tabBar(),
+            ),
+            onboarding.TourStep(
+                "DLSS 5 preferences",
+                "Intensity sets the overall neural effect. Skin, Local tone and "
+                "Structure shape faces, relighting and material detail. Start near "
+                "1.0, lower Skin for portraits, and compare Natural with Cinematic.",
+                self.neural_card,
+            ),
+            onboarding.TourStep(
+                "Detail",
+                "Preserve restores the source's real fine texture after DLSS. Boost "
+                "instead runs DLSS at the selected 2×, 4× or 8× supersample size, "
+                "then downscales — sharper, but much slower and limited by the "
+                "GPU's currently available VRAM.",
+                self.detail_card,
+            ),
+            onboarding.TourStep(
+                "Convert",
+                "Convert runs the neural pass with the settings above. Inspect the "
+                "Result, Depth mask and Difference views, then Save result — that "
+                "is the whole single-image loop.",
+                self.convert_button,
+            ),
+        ]
+        palette = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])
+        overlay = onboarding.SpotlightOverlay(self, steps, palette=palette)
+        self._tour_overlay = overlay
+        overlay.step_changed.connect(self._tutorial_step_changed)
+        overlay.finished.connect(self._complete_onboarding)
+        overlay.skipped.connect(self._complete_onboarding)
+        overlay.start()
+
+    def _tutorial_step_changed(self, index: int) -> None:
+        """Bring sidebar targets into view before the overlay measures them."""
+        if index == 2:
+            self.single_scroller.ensureWidgetVisible(self.neural_card, 0, 12)
+        elif index == 3:
+            self.single_scroller.ensureWidgetVisible(self.detail_card, 0, 12)
+        if self._tour_overlay is not None:
+            QTimer.singleShot(0, self._tour_overlay.refresh_target)
+
+    def _complete_onboarding(self) -> None:
+        self.settings.onboarding_version = ONBOARDING_VERSION
+        self.settings.save(paths.settings_path())
+        self._tour_overlay = None
+        self.statusBar().showMessage("Introduction complete — open Settings to replay it.")
+
     def ensure_model_downloaded(self, model_id: str | None = None) -> None:
         """Fetch the depth model if it is missing, behind a progress dialog.
 
@@ -3053,8 +4996,8 @@ class MainWindow(QMainWindow):
 
         label = next((k for k, v in MODELS.items() if v == model_id), model_id)
         self._download_dialog = DownloadDialog(
-            "Getting the depth model",
-            f"{label}\n\nThis is a one-time download, kept in the models folder "
+            "Finishing setup — just this once.",
+            f"FIRST RUN · STEP 1 OF 3\n\n{label}\n\nThis is a one-time download, kept in the models folder "
             f"beside the app. Nothing is bundled with the release.",
             self,
         )
@@ -3110,7 +5053,7 @@ class MainWindow(QMainWindow):
             self.open_image(path)
             event.acceptProposedAction()
 
-    def browse(self) -> None:
+    def browse(self) -> Path | None:
         chosen, _ = QFileDialog.getOpenFileName(
             self,
             "Choose an image",
@@ -3118,7 +5061,10 @@ class MainWindow(QMainWindow):
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.exr *.hdr *.jxr *.wdp *.hdp)",
         )
         if chosen:
-            self.open_image(Path(chosen))
+            path = Path(chosen)
+            self.open_image(path)
+            return path
+        return None
 
     def paste(self) -> None:
         """Open whatever is on the clipboard: a copied file, or raw pixels.
@@ -3152,9 +5098,12 @@ class MainWindow(QMainWindow):
 
     def refresh_runtime_status(self) -> None:
         try:
-            message = runtime.describe(runtime.detect(self.settings.runtime_dir))
+            status = runtime.detect(self.settings.runtime_dir)
+            message = runtime.describe(status)
+            self._set_runtime_pill(status.ready)
         except Exception as error:  # noqa: BLE001 - status must never raise
             message = f"Could not check the DLSS runtime: {error}"
+            self._set_runtime_pill(False)
         self.statusBar().showMessage(message)
 
     def open_find_files(self) -> None:
@@ -3177,6 +5126,23 @@ class MainWindow(QMainWindow):
             return
         self._batch_dialog = BatchDialog(self)
         self._batch_dialog.show()
+
+    def open_video_queue(self) -> None:
+        """The video queue dialog, created on demand and kept while open.
+
+        Gated on PyAV like the single-clip path: with no video component there
+        is nothing to convert, so fetch it first and reopen the queue after.
+        """
+        if not video.is_available():
+            self._download_video_support(then=self.open_video_queue)
+            return
+        existing = getattr(self, "_video_queue_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._video_queue_dialog = VideoQueueDialog(self)
+        self._video_queue_dialog.show()
 
     def use_result_as_input(self) -> None:
         """Feed the result back in, for a second pass.
@@ -3206,6 +5172,11 @@ class MainWindow(QMainWindow):
         is_hdr = self.result.hdr
         target = paths.scratch_dir() / f"{stem}_pass{passes}.{'jxr' if is_hdr else 'png'}"
         try:
+            # The grade is baked in (it is what is on screen), but the effects
+            # stack is deliberately not: feeding grain, scanlines or a LUT back
+            # into another DLSS pass would have the neural model chase those
+            # artefacts as if they were detail. Effects stay a final-stage look,
+            # re-applied after this next pass, not fed into it.
             if is_hdr:
                 assert self.result.enhanced_linear is not None
                 payload = grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
@@ -3486,6 +5457,9 @@ class MainWindow(QMainWindow):
                 np.clip(self._preview_after, 0.0, 1.0).astype(np.float32)
             )
         self._render_result(fast=False, new=True)
+        # Keep the effects tab's preview in step with the freshly converted
+        # image, whether or not that tab is the one on screen right now.
+        self._update_effects_preview()
         self.save_button.setEnabled(True)
         self.feedback_button.setEnabled(True)
         self.show_view("result")
@@ -3552,9 +5526,21 @@ class MainWindow(QMainWindow):
             if is_hdr:
                 assert self.result.enhanced_linear is not None
                 image = grade.apply_linear(self.result.enhanced_linear, self.settings.grade)
+                # Effects at native, before the export resize — the same order
+                # the full-resolution preview uses, so a native-size save is
+                # pixel-for-pixel what was on screen. Range is kept for the .jxr.
+                image = self._hdr_linear_with_effects(image)
                 image = resample.resize_linear(image, *target)
             else:
                 image = grade.apply(self.result.enhanced, self.settings.grade)
+                # Preserve and effects at native, before the export resize — the
+                # same order the full-resolution preview uses, so a native-size
+                # save is pixel-for-pixel what was on screen.
+                image = self._apply_preserve(
+                    image, np.clip(self.result.original, 0.0, 1.0).astype(np.float32)
+                )
+                if self._effects_active():
+                    image = effects.apply(image, self.settings.effects, paths.luts_dir())
                 image = resample.resize(image, *target)
             pipeline.save_image(image, chosen, linear=is_hdr)
         except (OSError, ValueError, RuntimeError) as error:
@@ -3580,9 +5566,44 @@ class MainWindow(QMainWindow):
         if status.problems:
             lines.append("")
             lines += status.problems
-        elif status.harness is not None:
-            lines.append("")
-            lines.append(evaluator.probe(status.harness))
+            self._show_runtime_report(lines, bool(status.problems))
+            return
+        if status.harness is None:
+            self._show_runtime_report(lines, bool(status.problems))
+            return
+
+        # The live check goes through the watchdog-guarded probe behind a
+        # cancellable box, never the UI thread: a runtime that wedges DLSS must
+        # not freeze this window the way a plain subprocess.run here once did.
+        dialog = DownloadDialog(
+            "Checking DLSS 5",
+            "One live test confirms that DLSS, ReShade, RenoDX and the neural "
+            "renderer all load together on this GPU.",
+            self,
+        )
+        dialog.setStyleSheet(STYLE)
+        dialog.set_status("Starting the native runtime…")
+        dialog.set_busy()
+        dialog.enable_cancel("Skip this check")
+
+        probe = RuntimeProbe(status.harness, parent=self)
+        outcome: dict[str, str] = {}
+
+        def done(_ok: bool, report: str) -> None:
+            outcome["report"] = report
+            dialog.accept()
+
+        probe.done.connect(done)
+        dialog.cancelled.connect(probe.skip)
+        probe.start()
+        dialog.exec()
+
+        report = outcome.get("report", "")
+        self._show_runtime_report(
+            lines + (["", report] if report else []), bool(status.problems)
+        )
+
+    def _show_runtime_report(self, lines: list[str], has_problems: bool) -> None:
         box = QMessageBox(
             QMessageBox.Icon.Information, "DLSS 5 runtime",
             "\n".join(lines), parent=self,
@@ -3591,7 +5612,7 @@ class MainWindow(QMainWindow):
         # Only when something is wrong. A clean report needs no reading.
         guide = (
             box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
-            if status.problems
+            if has_problems
             else None
         )
         box.exec()
@@ -3602,6 +5623,16 @@ class MainWindow(QMainWindow):
         self.settings.save(paths.settings_path())
         self._preview_timer.stop()
         self._preview_pending = False
+
+        # End a background DLSS check if one is still running, so a probe that
+        # wedged the GPU is killed with the window rather than orphaned holding
+        # the device. Best-effort - never let shutdown raise.
+        try:
+            if self._runtime_probe is not None:
+                self._runtime_probe.skip()
+            evaluator.cancel_probe()
+        except Exception:  # noqa: BLE001 - shutdown must survive anything
+            pass
 
         # Order matters. Killing the harness first makes the worker's blocking
         # readline() return immediately, so the thread below finishes instead of
@@ -3651,9 +5682,54 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def apply_app_theme(app: QApplication, name: str) -> None:
+    """Point the whole app at one palette: stylesheet, Fusion base, QPalette.
+
+    Fusion is the one built-in style that honours a custom palette across
+    platforms, which matters because the image canvases paint their own
+    background from ``palette().window()`` — without it the app would be dark
+    where the stylesheet reaches and light where it does not. ``STYLE`` is a
+    module global so a dialog created after a switch picks up the new look.
+    """
+    global STYLE
+    STYLE = _style_for(name)
+    app.setStyle("Fusion")
+    app.setPalette(_qpalette_for(name))
+
+
+def _load_bundled_fonts(app: QApplication) -> None:
+    """Register Archivo + IBM Plex so the QSS font-family names resolve.
+
+    The whole reason the app looked like a stock Windows form was the font:
+    Segoe UI where the design calls for Archivo and IBM Plex. QSS cannot fetch a
+    web font, so the TTFs ship in the bundle and are registered here, before the
+    stylesheet is applied. If they are missing the QSS fallbacks (system-ui) keep
+    the app readable — a missing font must never be fatal.
+    """
+    from PySide6.QtGui import QFont, QFontDatabase
+
+    try:
+        for ttf in sorted(paths.fonts_dir().glob("*.ttf")):
+            QFontDatabase.addApplicationFont(str(ttf))
+        # IBM Plex Sans as the base face, so every widget that does not name a
+        # family inherits it rather than Segoe UI.
+        if "IBM Plex Sans" in QFontDatabase.families():
+            base = QFont("IBM Plex Sans")
+            base.setPointSize(app.font().pointSize())
+            app.setFont(base)
+    except Exception:  # noqa: BLE001 - styling is never worth a failed launch
+        pass
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DLSS 5 Image & Video Converter")
+    _load_bundled_fonts(app)
+    try:
+        theme = AppSettings.load(paths.settings_path()).theme
+    except Exception:  # noqa: BLE001 - a bad settings file must not block launch
+        theme = DEFAULT_THEME
+    apply_app_theme(app, theme)
     # Before the window: nothing in it works without a depth model, and the
     # model needs torch. A release ships neither.
     if not ensure_runtime_ready():
