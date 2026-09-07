@@ -47,6 +47,20 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Root "engine") | Out-Null
 Copy-Item -LiteralPath (Join-Path $Release "engine\dlss5_eval.exe") `
           -Destination (Join-Path $Root "engine")
 
+# A note so nobody hand-copies files here. This is the folder people get told,
+# wrongly, to fill in as well as dlss_files - it is managed by the app.
+Set-Content -Path (Join-Path $Root "engine\READ ME.txt") -Encoding utf8 -Value @'
+You do not put anything in this folder yourself.
+
+dlss5_eval.exe (the DLSS harness) ships here and stays here. On first run the app
+copies your DLSS files from dlss_files\ to right next to it, because that is the
+only place NVIDIA's NGX and ReShade load their DLLs from. On the same drive that
+copy is a hard link, so it costs no extra space.
+
+Put your own files in dlss_files\ - only there. Do not copy dlss5_eval.exe into
+dlss_files\, and do not hand-copy your DLLs here.
+'@
+
 # The four folders the app expects, each carrying only its placeholder. These
 # are what tell a new user where their own files go.
 foreach ($folder in @("dlss_files", "models", "output", "pytorch")) {
@@ -59,6 +73,26 @@ foreach ($folder in @("dlss_files", "models", "output", "pytorch")) {
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") -Destination (Join-Path $Root "LICENSE.txt")
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "TROUBLESHOOTING.md") `
           -Destination (Join-Path $Root "TROUBLESHOOTING.txt")
+
+# Drop the dist-info license trees before zipping. torch's nests a dozen
+# third-party sub-licenses deep (kineto -> dynolog -> prometheus -> civetweb ->
+# duktape), which pushes single entries past Windows' 260-character MAX_PATH -
+# and the built-in Explorer unzip then dies with "Error 0x80010135: Path too
+# long" partway through, which is what testers hit. Only the dist-info METADATA
+# is read at runtime, never these, so dropping them makes the zip extract to an
+# ordinary folder with the built-in unzip. Deleted through \\?\ because the
+# trees are themselves too deep for a plain Remove-Item to walk.
+Write-Host "Trimming over-long dist-info license trees (Explorer unzip chokes on them)..." -ForegroundColor Cyan
+$internal = Join-Path $Root "_internal"
+if (Test-Path -LiteralPath $internal) {
+    Get-ChildItem -LiteralPath $internal -Directory -Filter "*.dist-info" -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $licenses = Join-Path $_.FullName "licenses"
+            if (Test-Path -LiteralPath $licenses) {
+                try { [System.IO.Directory]::Delete("\\?\$licenses", $true) } catch {}
+            }
+        }
+}
 
 # The refusal. Checked against what is actually staged rather than against
 # what was intended to be staged, because those are different things and only
