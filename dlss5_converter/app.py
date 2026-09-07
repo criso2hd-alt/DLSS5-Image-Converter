@@ -241,6 +241,15 @@ QComboBox { background: $base; color: $ink; border: 1px solid $line; border-radi
 QComboBox:hover { border-color: $signal_deep; }
 QComboBox:disabled { color: $ink_faint; border-color: $line_soft; }
 QComboBox::drop-down { border: none; width: 22px; }
+/* A visible chevron, drawn from borders so it needs no bundled image. Without
+   it the dropdown read as a plain box and people typed values in by hand. */
+QComboBox::down-arrow {
+    width: 0; height: 0; margin-right: 8px;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid $ink_dim;
+}
+QComboBox::down-arrow:hover { border-top-color: $signal; }
+QComboBox::down-arrow:disabled { border-top-color: $line; }
 QComboBox QAbstractItemView {
     background: $panel_lo; color: $ink; border: 1px solid $line;
     selection-background-color: $line; outline: none; padding: 4px;
@@ -3861,6 +3870,40 @@ class MainWindow(QMainWindow):
         for group in self._chip_groups:
             group.set_mode(mode)
 
+    def _hdr_card(self) -> QWidget:
+        """The add-on's HDR / display controls, kept in the main workflow.
+
+        They sit in the sidebar with the neural controls rather than buried in
+        Settings: they change the neural result, and people went straight here
+        looking for them. Defaults match the add-on's own.
+        """
+        s = self.settings.neural
+        hdr = ModuleCard("HDR / display")
+        hdr.setToolTip(
+            "The add-on's HDR controls. This pipeline is SDR end to end, but "
+            "these still change the result — the neural pass reasons about light "
+            "before anything is tonemapped back. Defaults match the add-on's own."
+        )
+        hdr.add(SliderRow(
+            "Paper white", s.paper_white, self._neural_setter("paper_white"),
+            "The luminance the model treats as diffuse white. On an HDR or OLED "
+            "display this decides how hard highlights are pushed. The add-on "
+            "defaults to 1; shipping game configs use 16, where it stops changing.",
+            maximum=NR_PAPER_WHITE_MAX,
+        ))
+        hdr.add(SliderRow(
+            "HDR transfer", s.transfer_strength, self._neural_setter("transfer_strength"),
+            "Strength of the transfer curve the pass works through. Range 0..1.",
+            maximum=NR_TRANSFER_MAX,
+        ))
+        hdr.add(SliderRow(
+            "Colour strength", s.color_strength, self._neural_setter("color_strength"),
+            "How much of the model's colour change is kept. At 0 the source colour "
+            "survives and only structure changes. Range 0..1.",
+            maximum=NR_COLOR_MAX,
+        ))
+        return hdr
+
     def _settings_page(self) -> QWidget:
         """The Settings tab — a home for everything that is configured once and
         then left alone, so the sidebar can hold only per-image controls.
@@ -3881,7 +3924,6 @@ class MainWindow(QMainWindow):
         left.setSpacing(14)
         right = QVBoxLayout()
         right.setSpacing(14)
-        s = self.settings.neural
 
         # -- Appearance --
         appearance = ModuleCard("Appearance")
@@ -3937,31 +3979,8 @@ class MainWindow(QMainWindow):
         r_buttons.addStretch(1)
         runtime_grp.add_layout(r_buttons)
 
-        # -- Advanced: HDR / display --
-        hdr = ModuleCard("HDR / display")
-        hdr.setToolTip(
-            "The add-on's HDR controls. This pipeline is SDR end to end, but "
-            "these still change the result — the neural pass reasons about light "
-            "before anything is tonemapped back. Defaults match the add-on's own."
-        )
-        hdr.add(SliderRow(
-            "Paper white", s.paper_white, self._neural_setter("paper_white"),
-            "The luminance the model treats as diffuse white. On an HDR or OLED "
-            "display this decides how hard highlights are pushed. The add-on "
-            "defaults to 1; shipping game configs use 16, where it stops changing.",
-            maximum=NR_PAPER_WHITE_MAX,
-        ))
-        hdr.add(SliderRow(
-            "HDR transfer", s.transfer_strength, self._neural_setter("transfer_strength"),
-            "Strength of the transfer curve the pass works through. Range 0..1.",
-            maximum=NR_TRANSFER_MAX,
-        ))
-        hdr.add(SliderRow(
-            "Colour strength", s.color_strength, self._neural_setter("color_strength"),
-            "How much of the model's colour change is kept. At 0 the source colour "
-            "survives and only structure changes. Range 0..1.",
-            maximum=NR_COLOR_MAX,
-        ))
+        # HDR / display lives in the single-image sidebar now (see _hdr_card),
+        # not here — people went looking for it in the workflow, not in Settings.
 
         # -- Advanced: Depth --
         depth = ModuleCard("Depth")
@@ -4001,7 +4020,6 @@ class MainWindow(QMainWindow):
         # Two balanced columns, so nothing — a slider especially — sprawls the
         # full width of the window.
         left.addWidget(appearance)
-        left.addWidget(hdr)
         left.addStretch(1)
         right.addWidget(runtime_grp)
         right.addWidget(depth)
@@ -4160,6 +4178,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(evaluation)
 
         layout.addWidget(self._detail_group())
+        layout.addWidget(self._hdr_card())
         layout.addStretch(1)
         return panel
 

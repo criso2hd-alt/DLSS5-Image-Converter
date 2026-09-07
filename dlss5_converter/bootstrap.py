@@ -245,6 +245,28 @@ def _safe_parts(name: str) -> list[str]:
     return [part for part in name.split("/") if part not in ("", ".", "..")]
 
 
+def _os_path(path: Path) -> str:
+    r"""A path string safe to open on Windows however long it is.
+
+    A modern CUDA torch tree nests well past the classic 260-character MAX_PATH
+    - ``torch/include/...`` headers and long cuDNN/cuBLAS names - and on a machine
+    that has not enabled long-path support the extract fails part way through,
+    which is the "crashes/freezes at the end of the download" people hit. The
+    ``\\?\`` extended-length prefix opts a single path out of MAX_PATH with no
+    system setting and no admin, so the app fixes this itself rather than telling
+    users to edit the registry. Non-Windows is returned untouched.
+    """
+    if os.name != "nt":
+        return str(path)
+    full = os.path.abspath(str(path))
+    if full.startswith("\\\\?\\"):
+        return full
+    if full.startswith("\\\\"):
+        # UNC (\\server\share) becomes \\?\UNC\server\share.
+        return "\\\\?\\UNC\\" + full[2:]
+    return "\\\\?\\" + full
+
+
 def _extract(
     archive: Path,
     target: Path,
@@ -257,33 +279,32 @@ def _extract(
         total = sum(member.file_size for member in members) or 1
         done = 0
         for member in members:
+            parts = _safe_parts(member.filename)
             if member.is_dir():
-                target.joinpath(*_safe_parts(member.filename)).mkdir(
-                    parents=True, exist_ok=True
-                )
+                os.makedirs(_os_path(target.joinpath(*parts)), exist_ok=True)
+                continue
+            if not parts:
                 continue
 
-            if member.file_size >= _STREAM_ABOVE:
-                # Named and streamed. The name turns a stall into "it is on this
-                # big file", not a dead bar, and the per-chunk update keeps the
-                # bar alive even when one file is a slow, antivirus-scanned GB.
-                if on_text:
-                    size_mb = member.file_size / 1_048_576
-                    on_text(f"Unpacking {Path(member.filename).name} ({size_mb:.0f} MB)…")
-                dest = target.joinpath(*_safe_parts(member.filename))
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                with bundle.open(member) as source, open(dest, "wb") as sink:
-                    while True:
-                        chunk = source.read(_CHUNK)
-                        if not chunk:
-                            break
-                        sink.write(chunk)
-                        done += len(chunk)
-                        report(done, total)
-            else:
-                bundle.extract(member, target)
-                done += member.file_size
-                report(done, total)
+            # Every file is written through _os_path, not just the big ones and
+            # not via ZipFile.extract, so the long-path prefix covers the whole
+            # tree - the deep header paths that overflow MAX_PATH are ordinary
+            # small files, and those were the ones ZipFile.extract used to fail
+            # on. Big files are still named up front so a slow, antivirus-scanned
+            # gigabyte reads as progress rather than a hang.
+            if member.file_size >= _STREAM_ABOVE and on_text:
+                size_mb = member.file_size / 1_048_576
+                on_text(f"Unpacking {Path(member.filename).name} ({size_mb:.0f} MB)…")
+            dest = target.joinpath(*parts)
+            os.makedirs(_os_path(dest.parent), exist_ok=True)
+            with bundle.open(member) as source, open(_os_path(dest), "wb") as sink:
+                while True:
+                    chunk = source.read(_CHUNK)
+                    if not chunk:
+                        break
+                    sink.write(chunk)
+                    done += len(chunk)
+                    report(done, total)
         report(done, total, force=True)  # land the bar exactly on the total
 
 
@@ -305,7 +326,7 @@ def install(
     # left alone so a retry resumes it: throwing away 1.8 GB because the
     # *unpack* failed is a punishing way to handle a recoverable error.
     if staging.is_dir():
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(_os_path(staging), ignore_errors=True)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -325,13 +346,13 @@ def install(
             raise OSError("The downloaded runtime is missing its torch package.")
 
         if target.is_dir():
-            shutil.rmtree(target, ignore_errors=True)
+            shutil.rmtree(_os_path(target), ignore_errors=True)
         staging.rename(target)
     except BaseException:
         # Keep the archive for the next attempt; drop only the half-unpacked
         # tree, which is the part that would confuse is_ready().
         if staging.is_dir():
-            shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(_os_path(staging), ignore_errors=True)
         raise
 
     # Success: the archive has done its job and is 1.8 GB of dead weight.
@@ -421,7 +442,7 @@ def install_av(
     staging = target.with_name(target.name + ".partial")
     archive = target.with_name(target.name + ".whl.part")
     if staging.is_dir():
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(_os_path(staging), ignore_errors=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         if on_text:
@@ -436,9 +457,9 @@ def install_av(
         if not (staging / "av" / "__init__.py").is_file():
             raise OSError("The downloaded video component is missing its av package.")
         if target.is_dir():
-            shutil.rmtree(target, ignore_errors=True)
+            shutil.rmtree(_os_path(target), ignore_errors=True)
         staging.rename(target)
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(_os_path(staging), ignore_errors=True)
     archive.unlink(missing_ok=True)
     activate_av()

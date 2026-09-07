@@ -162,6 +162,9 @@ $env:Path = (($env:Path -split ";") | Where-Object {
     --collect-all PySide6.QtMultimedia `
     --collect-all PySide6.QtMultimediaWidgets `
     --collect-all transformers `
+    --collect-submodules transformers `
+    --hidden-import transformers.models.auto.image_processing_auto `
+    --hidden-import transformers.models.auto.modeling_auto `
     --collect-all tokenizers `
     --collect-data safetensors `
     --copy-metadata transformers `
@@ -242,6 +245,13 @@ Copy-Item -LiteralPath $Harness -Destination $Engine -Force
 # The one thing a new user has to do, written where they will look for it.
 $Readme = @'
 Put your own DLSS 5 files in this folder.
+
+THIS IS THE ONLY FOLDER YOU TOUCH. You do not copy anything into engine\.
+The app copies what it needs from here into engine\ (next to dlss5_eval.exe)
+automatically on first run, because that is where NVIDIA's NGX and ReShade load
+their DLLs from. On the same drive the copy is a hard link, so it costs no extra
+space. Never put dlss5_eval.exe in this folder - it ships in engine\ and stays
+there. Anyone telling you to place files in both folders by hand is mistaken.
 
 None of these ship with the app and it will not help you obtain them.
 

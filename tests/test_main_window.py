@@ -153,6 +153,19 @@ def test_the_view_controls_live_on_the_floating_bar(window):
     assert window.view_grade.parent() is window.stage_host._bar
 
 
+def test_hdr_controls_are_in_the_single_image_workflow(window):
+    """Regression: HDR / display was buried in Settings and people could not
+    find it. It belongs in the single-image sidebar, next to the neural look."""
+    from PySide6.QtWidgets import QLabel
+
+    labels = {
+        label.text()
+        for label in window.single_page.findChildren(QLabel)
+    }
+    assert "Paper white" in labels
+    assert "Colour strength" in labels
+
+
 # -- the DLSS check can never hang the app -----------------------------------
 #
 # The old "Checking DLSS 5" step ran the native probe on a path the user could
