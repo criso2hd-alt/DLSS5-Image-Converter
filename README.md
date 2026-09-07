@@ -310,6 +310,32 @@ rather than H.264, because OpenCV ships no H.264 encoder — the frames are alwa
 written, so re-encode them with anything you prefer. All frames must be the same
 size: one harness means one set of NGX buffers.
 
+### Detail recovery and Boost
+
+**Preserve** restores the source image's real high-frequency texture after the
+neural pass. **Boost** instead enlarges the source, sharpens it, runs DLSS at that
+working resolution, then downsamples to the native size. The selectable factors
+are 2×, 4× and 8×; they process 4, 16 and 64 times as many pixels respectively.
+
+Boost has no arbitrary 8K cap and never silently substitutes a lower factor. It
+checks the NVIDIA GPU's currently free VRAM after depth estimation, keeps a small
+safety reserve, and refuses a run that is likely to exhaust it with a message that
+shows the requested working size and available memory. If the driver query is not
+available, D3D12 remains the authority and the conversion is allowed to try.
+
+There is one hardware-API limit: a D3D12 texture can be at most 16,384 pixels on
+either side. Consequently a 3840 px source can use 4× (15,360 px) but not 8×;
+8× is available for sources whose longest edge is at most 2048 px. Lower **Max
+size** first when you deliberately want a higher Boost multiplier.
+
+The installed DLSS runtime can impose a lower feature limit. On the reference
+runtime, 8× at a 960 px source succeeds at a 7680 px working edge, while a
+10,240 px request is rejected by NGX as an invalid feature parameter despite
+ample VRAM. The app lets the runtime make that decision and reports the exact
+attempted size; it never hides the rejection by falling back to another factor.
+In the matched architectural test, 8× was clean and closer to the source, but
+softer than 4×—treat it as an advanced alternative, not an automatic quality tier.
+
 ### Working above 4K
 
 **Max size** under Evaluation is the longest edge sent to DLSS — the resolution

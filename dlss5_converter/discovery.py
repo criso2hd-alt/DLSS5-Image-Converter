@@ -30,6 +30,12 @@ ADDON = "renodx-dlss5.addon64"
 RESHADE = "dxgi.dll"
 WANTED = (NEURAL_DLL, DLSS_DLL, ADDON, RESHADE)
 
+#: The add-on is matched by suffix, not name: RenoDX renames it between releases
+#: (renodx-dlss5.addon64, dlss.addon64, …). Any file ending in this counts as the
+#: add-on, and is copied in under the canonical ADDON name — ReShade loads any
+#: .addon64 beside it regardless of what it is called.
+ADDON_SUFFIX = ".addon64"
+
 #: The real neural model is ~158 MB. Anything far smaller is a stub, a
 #: placeholder, or an error page saved with a .dll name.
 _MIN_NEURAL_BYTES = 100 * 1024 * 1024
@@ -244,9 +250,15 @@ def scan(
                 on_progress(f"Searching… {scanned} folders, {len(by_folder)} hit(s)")
 
             for filename in filenames:
-                canonical = wanted_lower.get(filename.lower())
+                low = filename.lower()
+                canonical = wanted_lower.get(low)
                 if canonical is None:
-                    continue
+                    # A RenoDX rename: any .addon64 stands in for the add-on and
+                    # is copied in under the canonical name.
+                    if low.endswith(ADDON_SUFFIX):
+                        canonical = ADDON
+                    else:
+                        continue
                 path = here / filename
                 if not accepts(canonical, path):
                     continue

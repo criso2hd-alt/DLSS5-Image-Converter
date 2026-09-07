@@ -190,7 +190,7 @@ def test_the_video_tab_sits_between_single_image_and_sequence(qt_app):
 
     w = MainWindow()
     order = [w.tabs.tabText(i) for i in range(w.tabs.count())]
-    assert order == ["Single image", "Video", "Image sequence"]
+    assert order == ["Single image", "Video", "Image sequence", "Effects", "Settings"]
     w.deleteLater()
 
 

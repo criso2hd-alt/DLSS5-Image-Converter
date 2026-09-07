@@ -21,13 +21,63 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import socket
+import ssl
 import sys
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+#: What actually goes wrong on first run is almost never a dead connection — it
+#: is something sitting between the app and the download. Said plainly so a
+#: stuck user has a checklist instead of a spinning bar. Ordered by how often
+#: each is the culprit in the wild (a VPN, then filtered DNS, then AV/proxy).
+NETWORK_HELP = (
+    "This is almost always something between the app and the download rather "
+    "than a real outage:\n"
+    "  • Turn off any VPN — this is the most common cause.\n"
+    "  • Switch your DNS to 1.1.1.1 (Cloudflare) or 8.8.8.8 (Google).\n"
+    "  • Disable a proxy, or pause antivirus HTTPS/SSL scanning.\n"
+    "Then start it again — the download resumes where it stopped, so nothing is "
+    "lost."
+)
+
+#: Network exceptions we translate into NETWORK_HELP rather than a raw trace.
+_NETWORK_ERRORS = (URLError, TimeoutError, socket.timeout, ConnectionError, ssl.SSLError)
+
 from . import paths
+
+#: Progress is reported to the UI over queued cross-thread signals, and each one
+#: makes the GUI thread take the GIL to run its slot. Fire them per chunk (many
+#: hundreds a second at download and unpack speeds) and the GUI thread spends its
+#: time blocked on that handoff instead of pumping Windows messages — the window
+#: goes "Not Responding" even though the work is progressing fine on the worker.
+#: Coalescing to ~20 updates a second keeps the bar smooth and the window alive.
+_PROGRESS_INTERVAL = 0.05
+
+
+class _Throttle:
+    """Rate-limit progress callbacks to at most one per interval.
+
+    ``force=True`` always fires — used for the final update so the bar lands
+    exactly on the total rather than a beat short.
+    """
+
+    def __init__(self, on_bytes: "BytesProgress | None", interval: float = _PROGRESS_INTERVAL) -> None:
+        self._on_bytes = on_bytes
+        self._interval = interval
+        self._last = 0.0
+
+    def __call__(self, done: int, total: int, force: bool = False) -> None:
+        if self._on_bytes is None:
+            return
+        now = time.monotonic()
+        if force or now - self._last >= self._interval:
+            self._on_bytes(done, total)
+            self._last = now
 
 #: Pinned exactly. A wheel is tied to both the Python version (cp312) and the
 #: CUDA build, and "latest" would eventually hand a frozen cp312 app a wheel it
@@ -103,9 +153,19 @@ def is_ready() -> bool:
 
 
 def _remote_size(url: str) -> int:
+    """The download's size, or 0 if the server won't say.
+
+    Never raises: a HEAD blocked by a VPN or filtered DNS must not be the thing
+    that fails first with an opaque error. Returning 0 lets the real download in
+    _download attempt the transfer and surface the friendly NETWORK_HELP message
+    (or resume) rather than dying on a size probe.
+    """
     request = Request(url, headers={"User-Agent": "dlss5-converter"}, method="HEAD")
-    with urlopen(request, timeout=30) as response:
-        return int(response.headers.get("Content-Length") or 0)
+    try:
+        with urlopen(request, timeout=30) as response:
+            return int(response.headers.get("Content-Length") or 0)
+    except (*_NETWORK_ERRORS, ValueError):
+        return 0
 
 
 def _download(url: str, destination: Path, on_bytes: BytesProgress | None) -> None:
@@ -132,41 +192,99 @@ def _download(url: str, destination: Path, on_bytes: BytesProgress | None) -> No
         headers["Range"] = f"bytes={have}-"
 
     request = Request(url, headers=headers)
-    with urlopen(request, timeout=60) as response:
-        resuming = response.status == 206
-        if not resuming:
-            have = 0
-        total = expected or (
-            int(response.headers.get("Content-Length") or TORCH_APPROX_BYTES) + have
-        )
-        done = have
-        with open(destination, "ab" if resuming else "wb") as handle:
-            while True:
-                chunk = response.read(1024 * 512)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                done += len(chunk)
-                if on_bytes:
-                    on_bytes(done, total)
+    # A 30 s socket timeout so a connection that goes silent mid-transfer — the
+    # classic VPN/DNS stall that used to look like a frozen app — raises within
+    # half a minute instead of hanging until the user gives up and kills it.
+    try:
+        with urlopen(request, timeout=30) as response:
+            resuming = response.status == 206
+            if not resuming:
+                have = 0
+            total = expected or (
+                int(response.headers.get("Content-Length") or TORCH_APPROX_BYTES) + have
+            )
+            done = have
+            report = _Throttle(on_bytes)
+            with open(destination, "ab" if resuming else "wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 512)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    done += len(chunk)
+                    report(done, total)
+            report(done, total, force=True)
+    except _NETWORK_ERRORS as error:
+        raise OSError(
+            f"The download stalled after {have // 1_048_576} MB.\n\n{NETWORK_HELP}"
+        ) from error
 
     if done < total * 0.99:
         raise OSError(
-            f"Download stopped early: {done} of {total} bytes. "
-            "Check the connection and try again."
+            f"The download stopped early ({done // 1_048_576} of "
+            f"{total // 1_048_576} MB).\n\n{NETWORK_HELP}"
         )
 
 
-def _extract(archive: Path, target: Path, on_bytes: BytesProgress | None) -> None:
+#: Files at or above this are streamed in chunks rather than extracted in one
+#: opaque call, so the bar keeps moving *through* them. It is the CUDA DLLs this
+#: matters for — cuDNN and cuBLAS in a modern torch wheel are hundreds of MB to
+#: over a gigabyte each, and extracting one with no feedback (plus the antivirus
+#: scan Windows runs as it is written) is exactly what looks like a frozen app.
+_STREAM_ABOVE = 16 * 1024 * 1024
+_CHUNK = 4 * 1024 * 1024
+
+
+def _safe_parts(name: str) -> list[str]:
+    """The path components of a zip entry, with traversal segments dropped.
+
+    zip entries always use forward slashes; ``''``, ``.`` and ``..`` are removed
+    so a crafted name can never escape the target, matching what ZipFile.extract
+    does for the members it handles.
+    """
+    return [part for part in name.split("/") if part not in ("", ".", "..")]
+
+
+def _extract(
+    archive: Path,
+    target: Path,
+    on_bytes: BytesProgress | None,
+    on_text: TextProgress | None = None,
+) -> None:
+    report = _Throttle(on_bytes)
     with zipfile.ZipFile(archive) as bundle:
         members = bundle.infolist()
-        total = sum(member.file_size for member in members)
+        total = sum(member.file_size for member in members) or 1
         done = 0
         for member in members:
-            bundle.extract(member, target)
-            done += member.file_size
-            if on_bytes:
-                on_bytes(done, total)
+            if member.is_dir():
+                target.joinpath(*_safe_parts(member.filename)).mkdir(
+                    parents=True, exist_ok=True
+                )
+                continue
+
+            if member.file_size >= _STREAM_ABOVE:
+                # Named and streamed. The name turns a stall into "it is on this
+                # big file", not a dead bar, and the per-chunk update keeps the
+                # bar alive even when one file is a slow, antivirus-scanned GB.
+                if on_text:
+                    size_mb = member.file_size / 1_048_576
+                    on_text(f"Unpacking {Path(member.filename).name} ({size_mb:.0f} MB)…")
+                dest = target.joinpath(*_safe_parts(member.filename))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(member) as source, open(dest, "wb") as sink:
+                    while True:
+                        chunk = source.read(_CHUNK)
+                        if not chunk:
+                            break
+                        sink.write(chunk)
+                        done += len(chunk)
+                        report(done, total)
+            else:
+                bundle.extract(member, target)
+                done += member.file_size
+                report(done, total)
+        report(done, total, force=True)  # land the bar exactly on the total
 
 
 def install(
@@ -196,8 +314,12 @@ def install(
         _download(TORCH_WHEEL_URL, archive, on_bytes)
 
         if on_text:
-            on_text("Unpacking...")
-        _extract(archive, staging, on_bytes)
+            # Said up front because the unpack is slow for a reason the bar
+            # cannot show: Windows scans each large DLL as it is written, and a
+            # 2.7 GB CUDA tree has several. Naming that here is what stops people
+            # killing a run that is working, just quietly.
+            on_text("Unpacking… large files can take a few minutes while Windows scans them.")
+        _extract(archive, staging, on_bytes, on_text)
 
         if not (staging / "torch" / "__init__.py").is_file():
             raise OSError("The downloaded runtime is missing its torch package.")
@@ -309,8 +431,8 @@ def install_av(
             on_text(f"Downloading video support (PyAV {AV_VERSION})...")
         _download(url, archive, on_bytes)
         if on_text:
-            on_text("Unpacking...")
-        _extract(archive, staging, on_bytes)
+            on_text("Unpacking…")
+        _extract(archive, staging, on_bytes, on_text)
         if not (staging / "av" / "__init__.py").is_file():
             raise OSError("The downloaded video component is missing its av package.")
         if target.is_dir():

@@ -14,9 +14,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import contract, evaluator, grade, hdr, paths, runtime, sequence, wic
+from . import (
+    contract,
+    detail,
+    effects,
+    evaluator,
+    grade,
+    hardware,
+    hdr,
+    paths,
+    runtime,
+    sequence,
+    wic,
+)
 from .depth_engine import DepthEngine
-from .settings import AppSettings
+from .settings import DETAIL_BOOST_FACTORS, AppSettings
 
 Progress = Callable[[str], None]
 
@@ -105,6 +117,66 @@ def prepare(
     )
 
 
+#: A D3D12 2D texture cannot exceed this in either dimension. Unlike the old
+#: 8192 policy ceiling this is an API limit, independent of VRAM capacity.
+D3D12_MAX_TEXTURE_DIMENSION = 16384
+
+#: Conservative working-set estimate for the four harness textures, NGX feature
+#: state and driver overhead. This is a preflight, not an allocator: D3D12 still
+#: makes the authoritative decision. The fixed part reflects measured NGX/add-on
+#: startup cost; the per-pixel part is deliberately above the harness's visible
+#: 24 B/px texture floor so hidden feature resources have room.
+_BOOST_FIXED_VRAM = int(1.25 * 1024**3)
+_BOOST_VRAM_PER_PIXEL = 32
+_BOOST_USABLE_FREE_FRACTION = 0.90
+
+
+def _boost_target(factor: int, width: int, height: int) -> tuple[int, int]:
+    """Return the requested Boost dimensions, refusing only hard API limits."""
+    factor = max(1, int(factor))
+    target = (width * factor, height * factor)
+    if max(target) > D3D12_MAX_TEXTURE_DIMENSION:
+        largest = max(
+            candidate for candidate in (1, *DETAIL_BOOST_FACTORS)
+            if width * candidate <= D3D12_MAX_TEXTURE_DIMENSION
+            and height * candidate <= D3D12_MAX_TEXTURE_DIMENSION
+        )
+        raise RuntimeError(
+            f"Boost {factor}× would process at {target[0]}×{target[1]}, but "
+            f"D3D12 textures stop at {D3D12_MAX_TEXTURE_DIMENSION} pixels per "
+            f"side. Use {largest}× or lower, or reduce Max size first."
+        )
+    return target
+
+
+def _boost_vram_estimate(width: int, height: int) -> int:
+    """Estimated bytes needed by the native harness at one working size."""
+    return _BOOST_FIXED_VRAM + width * height * _BOOST_VRAM_PER_PIXEL
+
+
+def _preflight_boost_vram(width: int, height: int, say: Progress | None = None) -> None:
+    """Refuse a likely OOM from current free VRAM; unknown hardware may try."""
+    info = hardware.query_nvidia_vram()
+    if info is None:
+        if say:
+            say("VRAM availability unavailable — letting D3D12 decide…")
+        return
+    estimated = _boost_vram_estimate(width, height)
+    usable = int(info.free_bytes * _BOOST_USABLE_FREE_FRACTION)
+    if say:
+        say(
+            f"VRAM preflight: about {estimated / 1024**3:.1f} GB needed, "
+            f"{usable / 1024**3:.1f} GB currently usable…"
+        )
+    if estimated > usable:
+        raise RuntimeError(
+            f"Boost at {width}×{height} is estimated to need about "
+            f"{estimated / 1024**3:.1f} GB of VRAM, but {info.name} has "
+            f"{info.free_bytes / 1024**3:.1f} GB free right now. Choose a lower "
+            "Boost factor or Max size, or close other GPU applications."
+        )
+
+
 def depth_preview(inverse_depth: np.ndarray) -> np.ndarray:
     depth_u8 = np.round(np.clip(inverse_depth, 0.0, 1.0) * 255).astype(np.uint8)
     coloured = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
@@ -149,6 +221,33 @@ def convert(
     if linear is None:
         linear = contract.srgb_to_linear(np.clip(source, 0.0, 1.0))
 
+    # Boost: supersample the input so DLAA's fixed-size softening covers far less
+    # of each real detail, then deliver at the native size. Proven to keep brick
+    # and mesh crisp on renders. The crispen is done in display space (where an
+    # unsharp mask is defined) and taken back to linear for DLSS; depth rides
+    # along at the same scale. `source` and the native depth are kept for the
+    # Result, so the before/after and the depth mask stay native-sized.
+    boost_factor = 1
+    target_wh = (width, height)
+    native_inverse_depth = inverse_depth
+    if settings.detail.mode == "boost":
+        boost_factor = max(1, int(settings.detail.supersample))
+        if boost_factor > 1:
+            say(f"Detail boost: supersampling ×{boost_factor}…")
+            big_w, big_h = _boost_target(boost_factor, width, height)
+            _preflight_boost_vram(big_w, big_h, say)
+            big_srgb = cv2.resize(source, (big_w, big_h), interpolation=cv2.INTER_LANCZOS4)
+            big_srgb = detail.sharpen(
+                np.clip(big_srgb, 0.0, 1.0).astype(np.float32),
+                amount=settings.detail.amount * 2.0,
+                radius=settings.detail.radius,
+            )
+            linear = contract.srgb_to_linear(np.clip(big_srgb, 0.0, 1.0))
+            inverse_depth = cv2.resize(
+                inverse_depth, (big_w, big_h), interpolation=cv2.INTER_LINEAR
+            )
+            height, width = big_h, big_w
+
     say("Building the DLAA contract…")
     plan = contract.build(
         linear,
@@ -170,24 +269,53 @@ def convert(
         plane[..., 3] = np.float16(1.0)
         plane.tofile(path)
 
-    evaluator.run_frames(
-        status.harness,
-        width=width,
-        height=height,
-        depth_path=plane_paths["depth"],
-        motion_path=plane_paths["motion"],
-        colour_path=colour_path,
-        out_path=out_path,
-        neural=settings.neural,
-        jitter=plan.jitter,
-        write_colour=write_colour,
-        progress=progress,
-    )
+    try:
+        evaluator.run_frames(
+            status.harness,
+            width=width,
+            height=height,
+            depth_path=plane_paths["depth"],
+            motion_path=plane_paths["motion"],
+            colour_path=colour_path,
+            out_path=out_path,
+            neural=settings.neural,
+            jitter=plan.jitter,
+            write_colour=write_colour,
+            progress=progress,
+        )
+    except evaluator.HarnessError as error:
+        # Current DLSS builds can reject a feature above their supported working
+        # resolution with InvalidParameter even when D3D12 and VRAM both allow
+        # the textures. Do not silently reduce Boost; name the actual attempted
+        # size and let a future runtime with a higher limit try the same request.
+        if (
+            boost_factor > 1
+            and "CREATE_DLSS" in str(error)
+            and "InvalidParameter" in str(error)
+        ):
+            raise RuntimeError(
+                f"DLSS rejected the requested {width}×{height} Boost working "
+                "size even though it passed the VRAM and D3D12 checks. This "
+                "is a runtime feature limit rather than an out-of-memory error "
+                "(reference testing succeeds at 7680 pixels and rejects 10240). "
+                "Choose a lower Boost factor or Max size. The app did not "
+                "silently substitute a smaller factor."
+            ) from error
+        raise
 
     say("Encoding…")
     enhanced_linear = contract.read_output(out_path, width, height)
 
-    notes = f"{width}x{height}, {settings.evaluation.frames} DLSS passes"
+    if boost_factor > 1:
+        # Concentrate the supersampled result back to the native size. Area
+        # averaging in linear light is the clean downsample — this is the step
+        # that turns "processed at 4x" into crisp native detail.
+        enhanced_linear = cv2.resize(enhanced_linear, target_wh, interpolation=cv2.INTER_AREA)
+        width, height = target_wh
+        inverse_depth = native_inverse_depth
+
+    boost_note = f", boost ×{boost_factor}" if boost_factor > 1 else ""
+    notes = f"{width}x{height}, {settings.evaluation.frames} DLSS passes{boost_note}"
     if prepared.hdr:
         # Tone map with the source's white point, not one measured on this
         # image: the two are shown side by side under a wipe, and a different
@@ -238,24 +366,55 @@ def _finish(
     is_hdr: bool,
     grade_settings,
     white: float,
+    effects_settings=None,
+    luts_dir: Path | None = None,
+    detail_settings=None,
+    source_srgb: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool, np.ndarray]:
-    """Grade and encode one result. Returns (payload, linear, preview).
+    """Grade, apply effects, and encode one result. Returns (payload, linear, preview).
 
     `payload` is what gets written and `linear` says which space it is in;
     `preview` is always display-referred, because the UI shows a thumbnail of
     every frame and cannot show linear light.
+
+    Effects run after the grade, in display-referred sRGB — the space they are
+    defined in. On the HDR path that means a round trip through the (range-
+    preserving) sRGB transfer either side, so an HDR export keeps its highlights
+    instead of having them clamped by the effect stack; see effects.apply.
     """
+    active = effects_settings is not None and not effects_settings.is_neutral
+
     if is_hdr:
         graded = (
             enhanced_linear
             if grade_settings is None
             else grade.apply_linear(enhanced_linear, grade_settings)
         )
+        if active:
+            # linear -> extended sRGB -> effects (range kept) -> linear. The
+            # transfer curve is monotonic above 1.0, so highlights survive the
+            # round trip; effects.apply(preserve_range) never clamps them.
+            srgb = contract.linear_to_srgb(graded)
+            srgb = effects.apply(srgb, effects_settings, luts_dir, preserve_range=True)
+            graded = contract.srgb_to_linear(srgb)
         return graded, True, hdr.tonemap(graded, white)
 
     enhanced = np.clip(contract.linear_to_srgb(enhanced_linear), 0.0, 1.0)
     if grade_settings is not None:
         enhanced = grade.apply(enhanced, grade_settings)
+    # Detail (Preserve) before effects, matching the app's display order, and
+    # only when a same-size source is on hand to lift the real detail from.
+    if (
+        detail_settings is not None
+        and detail_settings.mode == "preserve"
+        and source_srgb is not None
+        and source_srgb.shape == enhanced.shape
+    ):
+        enhanced = detail.preserve_detail(
+            enhanced, source_srgb, amount=detail_settings.amount, radius=detail_settings.radius
+        )
+    if active:
+        enhanced = effects.apply(enhanced, effects_settings, luts_dir)
     return enhanced, False, enhanced
 
 
@@ -318,6 +477,7 @@ def convert_sequence(
 
     destination.mkdir(parents=True, exist_ok=True)
     scratch = paths.scratch_dir()
+    luts_dir = paths.luts_dir()  # resolved once; _finish uses it only if a LUT is on
     colour_path = scratch / "seq_colour.bin"
     depth_path = scratch / "seq_depth.bin"
     motion_path = scratch / "seq_motion.bin"
@@ -350,7 +510,12 @@ def convert_sequence(
         motion_path=motion_path,
         neural=settings.neural,
         frames=settings.evaluation.frames,
+        use_shmem=True,  # throughput path; falls back to files on an old harness
     ) as harness:
+        # One colour buffer for the whole sequence — the mapping itself when
+        # shared memory is live — rewritten in place each pass.
+        colour_plane = harness.colour_buffer((height, width, 4))
+        colour_plane[..., 3] = np.float16(1.0)
         for index, frame_path in enumerate(frames):
             if should_stop is not None and should_stop():
                 say("Stopped.")
@@ -386,11 +551,8 @@ def convert_sequence(
             harness.reset_history()
             for offset in offsets:
                 shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-                plane = np.empty((height, width, 4), np.float16)
-                plane[..., :3] = shifted.astype(np.float16)
-                plane[..., 3] = np.float16(1.0)
-                plane.tofile(colour_path)
-                harness.frame(colour_path, offset)
+                colour_plane[..., :3] = shifted.astype(np.float16)
+                harness.commit_colour(colour_plane, colour_path, offset)
 
             harness.write(out_path)
             payload, is_linear, preview = _finish(
@@ -398,6 +560,10 @@ def convert_sequence(
                 is_hdr=is_hdr,
                 grade_settings=grade_settings,
                 white=white,
+                effects_settings=settings.effects,
+                luts_dir=luts_dir,
+                detail_settings=settings.detail,
+                source_srgb=source,
             )
             output = hdr_output_path(destination, frame_path.stem, frame_path)
             save_image(payload, output, linear=is_linear)
@@ -492,6 +658,7 @@ def convert_video(
         offsets = [(0.0, 0.0)] * len(offsets)
 
     scratch = paths.scratch_dir()
+    luts_dir = paths.luts_dir()
     colour_path = scratch / "vid_colour.bin"
     depth_path = scratch / "vid_depth.bin"
     motion_path = scratch / "vid_motion.bin"
@@ -521,10 +688,21 @@ def convert_video(
                     status.harness, width=width, height=height,
                     depth_path=depth_path, motion_path=motion_path,
                     neural=settings.neural, frames=settings.evaluation.frames,
+                    # Video is the throughput case: shared memory skips a 66 MB
+                    # file write and read on every pass of every frame. Falls
+                    # back to the file path automatically on an older harness.
+                    use_shmem=True,
                 )
                 harness.__enter__()
                 size = (width, height)
                 writer = video.VideoWriter(video_only, codec, info.fps, size)
+                # The colour plane is 66 MB at 4K and identical in shape every
+                # pass of every frame, so it is allocated once and rewritten in
+                # place. With shared memory this buffer *is* the mapping the
+                # harness reads, so writing into it is the whole transport; the
+                # alpha row, always 1.0, is filled here and never touched again.
+                colour_plane = harness.colour_buffer((height, width, 4))
+                colour_plane[..., 3] = np.float16(1.0)
             elif (width, height) != size:
                 # A source whose frames change size mid-stream is degenerate;
                 # refuse rather than silently rescaling to the first frame.
@@ -546,11 +724,11 @@ def convert_video(
             harness.reset_history()
             for offset in offsets:
                 shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-                plane = np.empty((height, width, 4), np.float16)
-                plane[..., :3] = shifted.astype(np.float16)
-                plane[..., 3] = np.float16(1.0)
-                plane.tofile(colour_path)
-                harness.frame(colour_path, offset)
+                # Reused buffer: only the colour channels change per pass; alpha
+                # was set to 1.0 when it was allocated. commit_colour sends it
+                # through shared memory or the file, whichever is live.
+                colour_plane[..., :3] = shifted.astype(np.float16)
+                harness.commit_colour(colour_plane, colour_path, offset)
             harness.write(out_path)
 
             enhanced = np.clip(
@@ -559,6 +737,16 @@ def convert_video(
             )
             if grade_settings is not None:
                 enhanced = grade.apply(enhanced, grade_settings)
+            # Detail (Preserve) before effects, lifting the fine texture back
+            # from this frame's own source (fitted is display sRGB at this size).
+            if settings.detail.mode == "preserve" and fitted.shape == enhanced.shape:
+                enhanced = detail.preserve_detail(
+                    enhanced, np.clip(fitted, 0.0, 1.0).astype(np.float32),
+                    amount=settings.detail.amount, radius=settings.detail.radius,
+                )
+            # Video frames are display-referred (the codecs are 8-bit SDR), so
+            # the plain sRGB effect path — the same one the photo save uses.
+            enhanced = effects.apply(enhanced, settings.effects, luts_dir)
             assert writer is not None
             writer.write(enhanced)
             done += 1
@@ -643,6 +831,7 @@ def convert_batch(
 
     destination.mkdir(parents=True, exist_ok=True)
     scratch = paths.scratch_dir()
+    luts_dir = paths.luts_dir()
     colour_path = scratch / "batch_colour.bin"
     depth_path = scratch / "batch_depth.bin"
     motion_path = scratch / "batch_motion.bin"
@@ -693,9 +882,14 @@ def convert_batch(
                         motion_path=motion_path,
                         neural=settings.neural,
                         frames=settings.evaluation.frames,
+                        use_shmem=True,  # falls back to files on an old harness
                     )
                     harness.__enter__()
                     harness_size = (width, height)
+                    # Re-fetched with every (re)created harness, since the buffer
+                    # is sized to the frame and the mapping changes with it.
+                    colour_plane = harness.colour_buffer((height, width, 4))
+                    colour_plane[..., 3] = np.float16(1.0)
 
                 inverse_depth = engine.infer(
                     (np.clip(source, 0.0, 1.0) * 255).astype(np.uint8),
@@ -709,11 +903,8 @@ def convert_batch(
                 harness.reset_history()
                 for offset in offsets:
                     shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-                    plane = np.empty((height, width, 4), np.float16)
-                    plane[..., :3] = shifted.astype(np.float16)
-                    plane[..., 3] = np.float16(1.0)
-                    plane.tofile(colour_path)
-                    harness.frame(colour_path, offset)
+                    colour_plane[..., :3] = shifted.astype(np.float16)
+                    harness.commit_colour(colour_plane, colour_path, offset)
 
                 harness.write(out_path)
                 payload, is_linear, preview = _finish(
@@ -721,6 +912,10 @@ def convert_batch(
                     is_hdr=is_hdr,
                     grade_settings=grade_settings,
                     white=white,
+                    effects_settings=settings.effects,
+                    luts_dir=luts_dir,
+                    detail_settings=settings.detail,
+                    source_srgb=source,
                 )
                 save_image(payload, output, linear=is_linear)
                 yield BatchItem(index, len(images), path, output, image=preview)

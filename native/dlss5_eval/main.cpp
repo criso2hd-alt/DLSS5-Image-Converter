@@ -72,6 +72,13 @@ struct Options {
     float local_tone = 0.40f;
     float structure = 0.50f;
     bool probe = false;
+    // Optional shared-memory colour transport. When the parent passes a named
+    // mapping here, the colour plane arrives in memory instead of through a file
+    // rewritten every pass — no per-frame open, no per-frame 66 MB allocation.
+    // Absent (the default) leaves the file path in FRAME exactly as before, so
+    // an older parent that knows nothing of this loses nothing.
+    std::wstring colour_shmem_name;
+    size_t colour_shmem_bytes = 0;
 };
 
 void Emit(const std::string& line) {
@@ -186,11 +193,18 @@ public:
     void ProbeWarmUp();
     std::string Probe();
     void Shutdown();
+    //: Map the named colour buffer if the parent asked for one. Never fatal:
+    //: if the mapping is absent or fails, the harness silently keeps using the
+    //: file path in FRAME, and ColourShmemActive() reports which route is live
+    //: so the parent can be told in the READY line.
+    void MapColourShmem();
+    bool ColourShmemActive() const { return colour_shmem_active_; }
 
 private:
     Texture CreateTexture(DXGI_FORMAT format, UINT bytes_per_pixel, D3D12_RESOURCE_FLAGS flags,
                           D3D12_RESOURCE_STATES state);
     void UploadTexture(Texture& texture, const std::vector<uint8_t>& data);
+    void UploadTextureBytes(Texture& texture, const uint8_t* data, size_t size);
     void Execute();
     void CreateHiddenWindow();
 
@@ -208,6 +222,14 @@ private:
     Texture colour_, depth_, motion_, output_;
     ComPtr<ID3D12Resource> readback_;
     UINT readback_row_pitch_ = 0;
+
+    //: The colour plane's shared-memory view, when the parent supplied one.
+    //: Read-only and mapped once for the whole session; the synchronous FRAME
+    //: protocol means the parent has finished writing before we ever read.
+    HANDLE colour_shmem_handle_ = nullptr;
+    const uint8_t* colour_shmem_ = nullptr;
+    size_t colour_shmem_size_ = 0;
+    bool colour_shmem_active_ = false;
 
     //: The adapter the device was actually created on, so diagnostics report
     //: the GPU in use rather than the one that happened to enumerate first.
@@ -292,11 +314,21 @@ Texture Harness::CreateTexture(DXGI_FORMAT format, UINT bytes_per_pixel,
 }
 
 void Harness::UploadTexture(Texture& texture, const std::vector<uint8_t>& data) {
+    UploadTextureBytes(texture, data.data(), data.size());
+}
+
+void Harness::UploadTextureBytes(Texture& texture, const uint8_t* data, size_t size) {
     D3D12_RESOURCE_DESC desc = texture.resource->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT rows = 0;
     UINT64 row_bytes = 0, total = 0;
     device_->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total);
+
+    // The source must hold every tightly packed row we are about to read. A
+    // short buffer here would read past its end, so refuse rather than risk it.
+    if (size < static_cast<size_t>(row_bytes) * rows) {
+        Fail("A source plane is smaller than the texture it must fill.");
+    }
 
     uint8_t* mapped = nullptr;
     D3D12_RANGE none{0, 0};
@@ -305,7 +337,7 @@ void Harness::UploadTexture(Texture& texture, const std::vector<uint8_t>& data) 
     // tightly packed source shears the image diagonally.
     for (UINT y = 0; y < rows; ++y) {
         std::memcpy(mapped + footprint.Footprint.RowPitch * y,
-                    data.data() + row_bytes * y, static_cast<size_t>(row_bytes));
+                    data + row_bytes * y, static_cast<size_t>(row_bytes));
     }
     texture.upload->Unmap(0, nullptr);
 
@@ -559,7 +591,32 @@ void Harness::Initialise(const Options& options) {
 
 void Harness::UploadColour(const std::wstring& path) {
     const size_t pixels = static_cast<size_t>(options_.width) * options_.height;
-    UploadTexture(colour_, ReadFile(path, pixels * 8));
+    const size_t expected = pixels * 8;
+    // "@shmem" is the parent's shorthand for "it's already in the shared
+    // buffer". Only trusted when a mapping is actually live; otherwise, and for
+    // any real path, the plane is read from the file exactly as before.
+    if (colour_shmem_active_ && path == L"@shmem") {
+        UploadTextureBytes(colour_, colour_shmem_, colour_shmem_size_);
+        return;
+    }
+    UploadTexture(colour_, ReadFile(path, expected));
+}
+
+void Harness::MapColourShmem() {
+    if (options_.colour_shmem_name.empty()) return;
+    colour_shmem_handle_ = OpenFileMappingW(
+        FILE_MAP_READ, FALSE, options_.colour_shmem_name.c_str());
+    if (!colour_shmem_handle_) return;  // parent's mapping not found — use files
+    void* view = MapViewOfFile(
+        colour_shmem_handle_, FILE_MAP_READ, 0, 0, options_.colour_shmem_bytes);
+    if (!view) {
+        CloseHandle(colour_shmem_handle_);
+        colour_shmem_handle_ = nullptr;
+        return;
+    }
+    colour_shmem_ = static_cast<const uint8_t*>(view);
+    colour_shmem_size_ = options_.colour_shmem_bytes;
+    colour_shmem_active_ = true;
 }
 
 void Harness::UploadDepth(const std::wstring& path) {
@@ -803,6 +860,14 @@ void Harness::Shutdown() {
         NVSDK_NGX_D3D12_Shutdown1(device_.Get());
         ngx_ready_ = false;
     }
+    if (colour_shmem_) {
+        UnmapViewOfFile(colour_shmem_);
+        colour_shmem_ = nullptr;
+    }
+    if (colour_shmem_handle_) {
+        CloseHandle(colour_shmem_handle_);
+        colour_shmem_handle_ = nullptr;
+    }
     if (fence_event_) CloseHandle(fence_event_);
     if (window_) DestroyWindow(window_);
 }
@@ -826,6 +891,10 @@ Options Parse(int argc, char** argv) {
         else if (flag == "--local-tone") options.local_tone = std::stof(next(i));
         else if (flag == "--structure") options.structure = std::stof(next(i));
         else if (flag == "--probe") options.probe = true;
+        else if (flag == "--colour-shmem") {
+            options.colour_shmem_name = Widen(next(i));
+            options.colour_shmem_bytes = static_cast<size_t>(std::stoull(next(i)));
+        }
         else Fail("Unknown argument: " + flag);
     }
     if (!options.probe && (options.width <= 0 || options.height <= 0)) {
@@ -850,7 +919,15 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    Emit("READY DLSS feature created in DLAA mode");
+    // After Initialise so the frame size (and thus the buffer size) is fixed.
+    harness.MapColourShmem();
+    std::string ready = "READY DLSS feature created in DLAA mode";
+    // The parent reads this token to decide whether to send @shmem or a real
+    // path. Advertising it only when the mapping is genuinely live is the whole
+    // handshake: a parent that asked for shared memory but does not see the
+    // token falls back to files, and so does one that never asked.
+    if (harness.ColourShmemActive()) ready += " shmem:colour";
+    Emit(ready);
 
     std::string line;
     int evaluated = 0;

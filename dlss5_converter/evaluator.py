@@ -28,12 +28,16 @@ harness has far more context about an NGX failure than we do.
 from __future__ import annotations
 
 import atexit
+import mmap
+import os
 import subprocess
 import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import TracebackType
+
+import numpy as np
 
 from .settings import NeuralSettings
 
@@ -129,6 +133,7 @@ class Harness(AbstractContextManager["Harness"]):
         motion_path: Path,
         neural: NeuralSettings,
         frames: int,
+        use_shmem: bool = False,
     ) -> None:
         self._exe = exe
         self._width = width
@@ -152,10 +157,58 @@ class Harness(AbstractContextManager["Harness"]):
         self._process: subprocess.Popen[str] | None = None
         self.notes = ""
 
+        # Shared-memory colour transport. Only worth setting up for the
+        # throughput paths (video, sequence, batch), where the same 66 MB plane
+        # is otherwise written to and read from a file every pass of every
+        # frame. A single-image conversion pays the harness start-up once and
+        # gains nothing, so it leaves this off.
+        self._want_shmem = use_shmem
+        self._colour_bytes = width * height * 8  # RGBA16F, 8 bytes/pixel
+        self._shmem: mmap.mmap | None = None
+        #: A numpy view over the mapping. Held so the mapping is written through
+        #: it in place; must be dropped before the mmap is closed, or close()
+        #: raises BufferError because an export is still outstanding.
+        self._shmem_np: np.ndarray | None = None
+        self._shmem_active = False
+
     def __enter__(self) -> Harness:
+        command = list(self._command)
+        # Create the shared mapping and ask the harness to use it. Best-effort:
+        # if the mapping cannot be made, drop straight back to the file path.
+        if self._want_shmem:
+            try:
+                name = f"dlss5_colour_{os.getpid()}_{id(self) & 0xFFFFFFFF}"
+                self._shmem = mmap.mmap(-1, self._colour_bytes, tagname=name)
+                command += ["--colour-shmem", name, str(self._colour_bytes)]
+            except (OSError, ValueError):
+                self._shmem = None
+
+        try:
+            self._spawn(command)
+        except HarnessError:
+            # A harness that rejected the mapping flag is almost certainly an
+            # older build that predates it (it Fails on an unknown argument). The
+            # feature is meant to be invisible, so fall back to the file path and
+            # try once more, rather than making an old exe unusable.
+            if "--colour-shmem" in command:
+                self._teardown_shmem()
+                self._spawn(list(self._command))
+            else:
+                raise
+
+        # The harness only advertises the token when its own mapping succeeded,
+        # so this is the authority on whether shared memory is really live. If we
+        # asked but it did not take, drop the unused mapping and use files.
+        self._shmem_active = self._shmem is not None and "shmem:colour" in self.notes
+        if not self._shmem_active:
+            self._teardown_shmem()
+        return self
+
+    def _spawn(self, command: list[str]) -> None:
+        """Launch one harness process and wait for its READY line, or raise."""
         try:
             self._process = subprocess.Popen(
-                self._command,
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -175,7 +228,18 @@ class Harness(AbstractContextManager["Harness"]):
         if not line.startswith("READY"):
             raise HarnessError(f"Harness did not start cleanly: {line}")
         self.notes = line[len("READY") :].strip()
-        return self
+
+    def _teardown_shmem(self) -> None:
+        # The numpy view must go first: while it is alive it holds an export on
+        # the mmap and close() would raise BufferError.
+        self._shmem_np = None
+        if self._shmem is not None:
+            try:
+                self._shmem.close()
+            except (BufferError, OSError):
+                pass
+            self._shmem = None
+        self._shmem_active = False
 
     def __exit__(
         self,
@@ -186,6 +250,9 @@ class Harness(AbstractContextManager["Harness"]):
         process = self._process
         self._process = None
         if process is None:
+            # Only ever reached before a successful launch, but the mapping may
+            # have been created regardless, so still release it.
+            self._teardown_shmem()
             return
         try:
             if process.poll() is None and process.stdin is not None:
@@ -202,6 +269,9 @@ class Harness(AbstractContextManager["Harness"]):
                 except Exception:  # noqa: BLE001 - nothing left to salvage
                     pass
             _unregister(process)
+            # Only after the child is gone: it maps the same section, and
+            # unmapping while it might still read would be a use-after-free.
+            self._teardown_shmem()
 
     # -- protocol ------------------------------------------------------------
 
@@ -272,6 +342,38 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Unexpected reply to FRAME: {response}")
         self._index += 1
 
+    def colour_buffer(self, shape: tuple[int, int, int]) -> np.ndarray:
+        """A float16 buffer for the next colour plane, for throughput callers.
+
+        When shared memory is live this is a numpy view straight over the
+        mapping the harness reads, so writing into it is the transport — there
+        is no separate copy step and no file. Otherwise it is a plain array the
+        caller writes to its own scratch file, exactly as before. Either way the
+        caller allocates once and rewrites in place across frames.
+        """
+        count = int(shape[0]) * int(shape[1]) * int(shape[2])
+        if self._shmem_active and self._shmem is not None:
+            if self._shmem_np is None:
+                self._shmem_np = np.frombuffer(self._shmem, dtype=np.float16)
+            return self._shmem_np[:count].reshape(shape)
+        return np.empty(shape, np.float16)
+
+    def commit_colour(
+        self, plane: np.ndarray, colour_path: Path, jitter: tuple[float, float]
+    ) -> None:
+        """Deliver the staged colour plane and evaluate it.
+
+        With shared memory the plane is already in the mapping (it *is* the
+        mapping, via colour_buffer), so this only tells the harness to read it.
+        Without it, the plane is written to the scratch file and its path is
+        sent — the original path exactly.
+        """
+        if self._shmem_active and self._shmem is not None:
+            self.frame("@shmem", jitter)
+        else:
+            plane.tofile(colour_path)
+            self.frame(colour_path, jitter)
+
     def set_depth(self, depth_path: Path) -> None:
         """Replace the depth plane without restarting the harness.
 
@@ -303,27 +405,84 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Unexpected reply to WRITE: {response}")
 
 
-def probe(exe: Path) -> str:
+#: The probe currently in flight, so a stuck one can be cancelled. Guarded
+#: because probe() runs on a worker thread and cancel_probe() is called from the
+#: UI thread.
+_PROBE_LOCK = threading.Lock()
+_probe_process: subprocess.Popen | None = None
+
+#: How long to wait for the live check before giving up. A working probe is a
+#: few seconds (NGX + add-on warm-up); anything near this is a runtime that has
+#: wedged, and a shorter cap means a passive user recovers on their own instead
+#: of staring at a dialog that never returns.
+_PROBE_TIMEOUT = 40.0
+
+
+def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
     """Ask the harness what the installed DLSS runtime can actually do.
 
     Used by the settings panel and, more importantly, by hand during bring-up:
     it is the one command that answers "is the neural add-on loaded at all?"
     without going through the whole pipeline.
+
+    The process is tracked like a live harness so both app shutdown and an
+    explicit :func:`cancel_probe` can end it. This matters because a probe that
+    hangs inside DLSS initialisation holds a D3D12 device, and a held device is
+    what makes the whole app look frozen - the only way back is to kill the one
+    process holding it, which must not mean killing the app.
     """
+    global _probe_process
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [str(exe), "--probe"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=60,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(exe.parent),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except OSError as error:
         return f"Could not run the harness: {error}"
+
+    _register(process)
+    with _PROBE_LOCK:
+        _probe_process = process
+    try:
+        out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return "The harness did not respond within 60 seconds."
-    return (result.stdout or result.stderr or "").strip() or "No output."
+        process.kill()
+        try:
+            process.communicate(timeout=5)
+        except Exception:  # noqa: BLE001 - already giving up on this process
+            pass
+        return f"The harness did not respond within {int(timeout)} seconds."
+    finally:
+        _unregister(process)
+        with _PROBE_LOCK:
+            if _probe_process is process:
+                _probe_process = None
+    return (out or err or "").strip() or "No output."
+
+
+def cancel_probe() -> None:
+    """End a probe in flight - the setup dialog's Skip button.
+
+    A probe stuck initialising DLSS holds the GPU device, which is what makes
+    the app look hung. Killing that one process releases the device without
+    losing the app: the same recovery as force-quitting, except the app lives.
+    Best-effort; if the child has already gone this does nothing.
+    """
+    with _PROBE_LOCK:
+        process = _probe_process
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception:  # noqa: BLE001 - best effort; shutdown must not raise
+        pass
 
 
 def run_frames(

@@ -6,3 +6,6 @@
 # committed ahead of time so the button appears the moment approval lands,
 # rather than needing a second commit nobody remembers to make.
 github: [criso2hd-alt]
+# Buy Me a Coffee needs no approval, so this half of the Sponsor button works
+# immediately — the same link as the README badge and the in-app banner.
+buy_me_a_coffee: criso2hdj

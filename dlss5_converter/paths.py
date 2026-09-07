@@ -38,6 +38,12 @@ MODELS_DIR = "models"
 #: Default destination for converted images.
 OUTPUT_DIR = "output"
 
+#: Where the user drops .cube LUTs for the effects stack. A plain folder they
+#: fill themselves, like dlss_files - the app ships no LUTs, and any pack from
+#: the ReShade/film-emulation world works because .cube is the portable format
+#: those tools export.
+LUTS_DIR = "luts"
+
 #: The native harness, and at run time the staged NVIDIA binaries beside it.
 #: Deliberately *not* the release root: ReShade attaches to any process that
 #: finds a dxgi.dll next to it, and staging one beside the GUI executable would
@@ -54,6 +60,30 @@ def app_dir() -> Path:
 
 def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
+
+
+def resource_dir() -> Path:
+    """Root the bundled read-only assets live under.
+
+    Frozen, PyInstaller unpacks ``--add-data`` payloads under ``sys._MEIPASS``;
+    from source they sit beside this file's package. Kept separate from
+    ``app_dir`` because assets are read-only and travel *inside* the bundle,
+    unlike the user's models/output folders which sit next to the executable.
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return Path(base)
+    return Path(__file__).resolve().parents[1]
+
+
+def fonts_dir() -> Path:
+    """The bundled UI fonts (Archivo, IBM Plex Sans/Mono)."""
+    return resource_dir() / "dlss5_converter" / "assets" / "fonts"
+
+
+def onboarding_image() -> Path:
+    """The original architectural sample used by the first-run introduction."""
+    return resource_dir() / "dlss5_converter" / "assets" / "onboarding" / "architectural-detail.jpg"
 
 
 def _user_data_dir() -> Path:
@@ -108,6 +138,17 @@ def dlss_files_dir() -> Path:
     return data_dir() / DLSS_FILES_DIR
 
 
+def luts_dir() -> Path:
+    """The folder the user fills with .cube LUTs for the effects stack.
+
+    Created on demand so the Effects tab can always offer an "open folder"
+    button that lands somewhere real, even before any LUT has been added.
+    """
+    path = data_dir() / LUTS_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def settings_path() -> Path:
     return data_dir() / "settings.json"
 
@@ -149,7 +190,15 @@ RUNTIME_FILES = (
 )
 
 #: The ReShade add-on that hooks NGX evaluation and injects the neural pass.
+#:
+#: RenoDX has shipped this under more than one name — ``renodx-dlss5.addon64``
+#: originally, a shorter ``dlss*.addon64`` more recently — and may rename it
+#: again. ReShade loads *any* file ending in ``.addon64`` that sits beside it,
+#: so discovery matches the suffix (see ``find_addon``) rather than one exact
+#: name. ``ADDON_FILE`` stays the name shown in guidance and preferred when more
+#: than one candidate is present.
 ADDON_FILE = "renodx-dlss5.addon64"
+ADDON_SUFFIX = ".addon64"
 
 
 def runtime_search_roots() -> list[Path]:
@@ -224,6 +273,77 @@ def _find_deep(root: Path, wanted: str, depth: int = _MAX_RUNTIME_DEPTH) -> Path
         if found is not None:
             return found
     return None
+
+
+def _collect_deep(root: Path, matches, depth: int = _MAX_RUNTIME_DEPTH, out=None) -> list[Path]:
+    """Every file under `root` whose lowercased name satisfies `matches`."""
+    if out is None:
+        out = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return out
+    subdirectories: list[Path] = []
+    for entry in entries:
+        try:
+            if entry.is_file():
+                if matches(entry.name.lower()):
+                    out.append(entry)
+            elif entry.is_dir():
+                subdirectories.append(entry)
+        except OSError:
+            continue
+    if depth > 0:
+        for subdirectory in subdirectories:
+            _collect_deep(subdirectory, matches, depth - 1, out)
+    return out
+
+
+def _addon_rank(name: str) -> int:
+    """How good a `.addon64` filename looks as *the* DLSS add-on. Lower wins."""
+    low = name.lower()
+    if low == ADDON_FILE:      # the exact name we have always shipped guidance for
+        return 0
+    if "dlss" in low:          # renodx-dlss.addon64, dlss.addon64, a future dlss*…
+        return 1
+    if "renodx" in low:        # some other RenoDX add-on, still likely right here
+        return 2
+    return 3                   # any other ReShade add-on — last resort
+
+
+def find_addon(extra: Path | None = None) -> Path | None:
+    """The RenoDX DLSS add-on, matched by its ``.addon64`` suffix.
+
+    Deliberately not a fixed filename: RenoDX renames this file between releases,
+    and hard-coding one name turns a routine add-on update into "the neural pass
+    silently stopped working". Every ``.addon64`` in the runtime folders is a
+    candidate; the best is chosen by name (the known name, then anything that
+    looks like the DLSS add-on, then any add-on at all) and, within a rank, the
+    newest — because an out-of-date add-on is itself a confirmed cause of a green
+    setup that produces an unchanged image.
+    """
+    candidates: list[Path] = []
+    if extra is not None and extra.is_file() and extra.suffix.lower() == ADDON_SUFFIX:
+        candidates.append(extra)
+    roots = ([extra] if extra is not None and extra.is_dir() else []) + deep_search_roots()
+    seen: set[str] = {str(c).lower() for c in candidates}
+    for root in roots:
+        for found in _collect_deep(root, lambda n: n.endswith(ADDON_SUFFIX)):
+            key = str(found).lower()
+            if key not in seen:
+                seen.add(key)
+                candidates.append(found)
+    if not candidates:
+        return None
+
+    def sort_key(path: Path) -> tuple[int, float]:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (_addon_rank(path.name), -mtime)
+
+    return min(candidates, key=sort_key)
 
 
 def find_runtime_file(name: str, extra: Path | None = None) -> Path | None:

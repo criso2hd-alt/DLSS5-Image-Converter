@@ -151,6 +151,23 @@ cannot invent detail the neural pass did not produce. It is deliberately not a
 second AI upscaler: stacking one on the neural pass compounds the waxiness
 people already hit on a second pass.
 
+### Boost says the requested size will not fit
+
+Boost 2×/4×/8× runs the neural pass at 4/16/64 times the source pixel count. The
+app no longer caps this at 8K or quietly steps down to a smaller multiplier. It
+checks the VRAM currently free on the NVIDIA GPU and stops before allocation when
+the estimated working set would consume the usable budget. Close other GPU-heavy
+applications, lower **Max size**, or choose a lower Boost factor.
+
+D3D12 also has a hard 16,384-pixel texture limit on each side, regardless of how
+much VRAM the card has. At a 3840-pixel long edge, 4× fits at 15,360 pixels and 8×
+does not. At a 2048-pixel long edge, 8× reaches exactly 16,384 pixels.
+
+DLSS itself may reject a smaller size. The reference runtime succeeds at a
+7680-pixel working edge and returns `NVSDK_NGX_Result_FAIL_InvalidParameter` at
+10,240 pixels even with ample VRAM. That is a DLSS feature limit, not an OOM.
+Lower the factor or **Max size**; the error names the attempted dimensions.
+
 ---
 
 ## Sequence mode: the depth looks wrong

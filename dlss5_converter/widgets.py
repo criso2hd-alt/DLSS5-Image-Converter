@@ -7,12 +7,26 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPoint,
+    QPointF,
+    QProcess,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
     QImage,
     QLinearGradient,
     QMouseEvent,
@@ -22,18 +36,175 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QDialog,
     QFrame,
+    QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QProgressBar,
+    QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 SUPPORTED = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".exr",
              ".hdr", ".jxr", ".wdp", ".hdp"}
+
+#: The bundled type families (registered in app._load_bundled_fonts). Named here
+#: so the whole UI reaches for the same three faces the mockup uses.
+FONT_DISPLAY = "Archivo SemiBold"          # wordmark, card titles, Convert
+FONT_SANS = "IBM Plex Sans"                # body: labels, chips, buttons
+FONT_MONO = "IBM Plex Mono"                # small-caps tags, values, readouts
+
+
+def apply_font(
+    widget,
+    *,
+    family: str | None = None,
+    size: float | None = None,
+    weight=None,
+    spacing: float | None = None,
+    caps: bool = False,
+) -> None:
+    """Set face, size, weight, letter-spacing and caps on a widget in one call.
+
+    Letter-spacing is the reason this exists: Qt Style Sheets silently ignore the
+    ``letter-spacing`` property, so the mockup's spaced-out caps — the wordmark,
+    the card titles, the RUNTIME pill — can only be had by setting it on the
+    QFont here, per widget.
+    """
+    from PySide6.QtGui import QFont
+
+    font = widget.font()
+    if family:
+        font.setFamily(family)
+    if size is not None:
+        font.setPointSizeF(size)
+    if weight is not None:
+        font.setWeight(weight)
+    if spacing is not None:
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
+    if caps:
+        font.setCapitalization(QFont.Capitalization.AllUppercase)
+    widget.setFont(font)
+
+
+def stage_placeholder(icon: str, title: str, subtitle: str = "") -> QWidget:
+    """A centred icon + title + hint, for the empty state of a preview stage.
+
+    So the Video and Sequence tabs read as "your clip / frames appear here"
+    rather than a black void — the same welcoming empty state the single-image
+    drop zone gives, in the same visual language.
+    """
+    holder = QWidget()
+    box = QVBoxLayout(holder)
+    box.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    box.setSpacing(8)
+    glyph = QLabel(icon)
+    glyph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    apply_font(glyph, size=34)
+    head = QLabel(title)
+    head.setObjectName("phTitle")
+    head.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    box.addWidget(glyph)
+    box.addWidget(head)
+    if subtitle:
+        sub = QLabel(subtitle)
+        sub.setObjectName("hint")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.addWidget(sub)
+    return holder
+
+
+class ModuleCard(QFrame):
+    """A titled card: the title sits *inside* a header strip with a divider under
+    it, then a padded body — the mockup's ``.mod`` block, not a QGroupBox.
+
+    QGroupBox hangs its title on the border and cannot draw the divider or carry
+    a right-aligned tag, which is most of why the sidebar read as a plain form
+    rather than the mockup's instrument panel. The optional ``tag`` is the little
+    mono caption on the right of the header (RENODX · DLAA, NEW).
+    """
+
+    #: Emitted when a checkable card's header toggle changes.
+    toggled = Signal(bool)
+
+    def __init__(
+        self, title: str, tag: str = "", checkable: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("modCard")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        head = QFrame()
+        head.setObjectName("modHead")
+        head_row = QHBoxLayout(head)
+        head_row.setContentsMargins(16, 12, 16, 11)
+        head_row.setSpacing(9)
+
+        self._check: "QCheckBox | None" = None
+        if checkable:
+            # The title itself is the on/off control, like the old checkable
+            # group box — a checkbox whose label is the card title.
+            from PySide6.QtWidgets import QCheckBox
+
+            self._check = QCheckBox(title)
+            self._check.setObjectName("modTitle")
+            apply_font(self._check, family=FONT_DISPLAY, size=9.5, spacing=2.4, caps=True)
+            self._check.toggled.connect(self._on_toggle)
+            head_row.addWidget(self._check)
+            self.title_label = self._check
+        else:
+            self.title_label = QLabel(title)
+            self.title_label.setObjectName("modTitle")
+            apply_font(self.title_label, family=FONT_DISPLAY, size=9.5, spacing=2.4, caps=True)
+            head_row.addWidget(self.title_label)
+        head_row.addStretch(1)
+        if tag:
+            tag_label = QLabel(tag)
+            tag_label.setObjectName("modTag")
+            apply_font(tag_label, family=FONT_MONO, size=7.5, spacing=1.4, caps=True)
+            head_row.addWidget(tag_label)
+        outer.addWidget(head)
+
+        self._body_widget = QWidget()
+        self.body = QVBoxLayout(self._body_widget)
+        self.body.setContentsMargins(16, 14, 16, 15)
+        self.body.setSpacing(13)
+        outer.addWidget(self._body_widget)
+
+    def add(self, widget: QWidget) -> QWidget:
+        self.body.addWidget(widget)
+        return widget
+
+    def add_layout(self, layout) -> "object":
+        self.body.addLayout(layout)
+        return layout
+
+    # -- checkable proxy (so a card can stand in for a checkable QGroupBox) --
+
+    def _on_toggle(self, on: bool) -> None:
+        # Grey the body when off, exactly like a checkable group box.
+        self._body_widget.setEnabled(on)
+        self.toggled.emit(on)
+
+    def setChecked(self, on: bool) -> None:  # noqa: N802 - Qt-style name
+        if self._check is not None:
+            self._check.setChecked(on)
+            # Sync the body even when the state did not change (so an initial
+            # unchecked card greys its body without relying on a toggle signal).
+            self._body_widget.setEnabled(on)
+
+    def isChecked(self) -> bool:  # noqa: N802 - Qt-style name
+        return self._check.isChecked() if self._check is not None else True
 
 
 def to_qimage_u8(image_rgb: np.ndarray) -> QImage:
@@ -168,40 +339,173 @@ def paint_sweep(
         painter.drawLine(QPointF(rect.left(), line), QPointF(rect.right(), line))
 
 
-def _corner_label(
-    painter: QPainter, text: str, image: QRectF, widget: QWidget, align_left: bool
+# -- on-image overlays --------------------------------------------------------
+#
+# The prototype floats a thin instrument layer over the picture: SOURCE / DLSS
+# pills in the top corners, a glowing divider with a round grip, and a
+# resolution + zoom readout bottom-right. None of it is reachable from QSS - the
+# canvas views draw their own pixels - so it is reproduced here in the painter,
+# matching the mockup's mono caps, translucent plates and cyan accent.
+
+#: Overlay plate colours, straight from the mockup (--tag background, --line).
+_OVERLAY_PLATE = QColor(6, 10, 18, 190)
+_OVERLAY_LINE = QColor(35, 48, 74)
+_OVERLAY_INK = QColor(201, 213, 230)      # --ink-dim, the non-accent pill text
+_OVERLAY_READ = QColor(147, 162, 188)     # --ink-faint-ish, the readout text
+
+
+def _overlay_font(painter: QPainter, size: float, *, caps: bool = True) -> None:
+    """Set the painter to the mockup's overlay face: mono, spaced, small caps.
+
+    Explicitly mono rather than the widget's inherited face because these chips
+    are readouts - a resolution, a state - and the prototype sets them in IBM
+    Plex Mono so the digits line up and the caps read as instrument labels.
+    """
+    font = QFont(FONT_MONO)
+    font.setPointSizeF(size)
+    font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 118)
+    font.setCapitalization(
+        QFont.Capitalization.AllUppercase if caps else QFont.Capitalization.MixedCase
+    )
+    painter.setFont(font)
+
+
+def _draw_chip(
+    painter: QPainter, rect: QRectF, text: str, *, accent: bool, signal: QColor,
+    ink: QColor = _OVERLAY_INK, radius: float = 7.0,
 ) -> None:
-    """Draw `text` at a top corner of `image`, clamped inside `widget`.
+    """Fill one overlay chip: translucent plate, hairline border, centred text.
 
-    The anchor is the image's own corner, so at fit the labels sit on the
-    picture - top-left and top-right - wherever it is letterboxed. Clamping to
-    the widget is what makes them sticky: zoom in and the image corners leave
-    the screen, but the label holds at the visible edge rather than scrolling
-    away with the pixels it is describing.
+    The accent variant is the DLSS side - cyan text over a cyan-tinted border -
+    so the eye reads "this half is the neural result" without a legend.
+    """
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(_OVERLAY_PLATE)
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    if accent:
+        border = QColor(signal)
+        border.setAlpha(160)
+        painter.setPen(QPen(border, 1))
+    else:
+        painter.setPen(QPen(_OVERLAY_LINE, 1))
+    painter.drawRoundedRect(rect, radius, radius)
+    painter.setPen(signal if accent else ink)
+    painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
-    A soft shadow underneath keeps it legible over a blown-out sky or a white
-    wall, which a plain light label would disappear into.
+
+def _corner_label(
+    painter: QPainter, text: str, image: QRectF, widget: QWidget, align_left: bool,
+    *, accent: bool = False, signal: QColor | None = None,
+) -> None:
+    """Draw a pill at a top corner of `image`, clamped inside `widget`.
+
+    The anchor is the image's own corner, so at fit the pills sit on the picture
+    - top-left and top-right - wherever it is letterboxed. Clamping to the widget
+    is what makes them sticky: zoom in and the image corners leave the screen,
+    but the pill holds at the visible edge rather than scrolling away with the
+    pixels it is describing.
+
+    The translucent plate keeps mono caps legible over a blown-out sky or a
+    white wall, which a plain light label would disappear into.
     """
     if not text:
         return
-    margin = 10.0
+    if signal is None:
+        signal = widget.palette().highlight().color()
+    _overlay_font(painter, 8.5)
     metrics = painter.fontMetrics()
-    text_w = metrics.horizontalAdvance(text)
-    text_h = metrics.height()
+    pad_x, pad_y = 10.0, 5.0
+    chip_w = metrics.horizontalAdvance(text) + pad_x * 2
+    chip_h = metrics.height() + pad_y * 2
+    margin = 12.0
 
-    top = min(max(image.top() + margin, margin), widget.height() - text_h - margin)
+    top = min(max(image.top() + margin, margin), widget.height() - chip_h - margin)
     if align_left:
-        x = min(max(image.left() + margin, margin), widget.width() - text_w - margin)
+        x = min(max(image.left() + margin, margin), widget.width() - chip_w - margin)
     else:
-        x = max(min(image.right() - margin - text_w, widget.width() - text_w - margin), margin)
+        x = max(min(image.right() - margin - chip_w, widget.width() - chip_w - margin),
+                margin)
+    _draw_chip(painter, QRectF(x, top, chip_w, chip_h), text, accent=accent, signal=signal)
 
-    baseline = top + metrics.ascent()
-    shadow = QColor(0, 0, 0, 200)
-    for dx, dy in ((1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)):
-        painter.setPen(shadow)
-        painter.drawText(QPointF(x + dx, baseline + dy), text)
-    painter.setPen(QColor(245, 245, 245))
-    painter.drawText(QPointF(x, baseline), text)
+
+def _paint_divider(
+    painter: QPainter, x: float, top: float, bottom: float, signal: QColor,
+) -> None:
+    """The prototype's glowing seam: a vertical gradient bar with a round grip.
+
+    A flat line reads as a crop mark. The gradient fading at the ends, the halo
+    and the grabbable disc read instead as a control - which is what it is, the
+    thing the user drags to compare - so it invites the drag rather than just
+    marking where the two halves meet.
+    """
+    grad = QLinearGradient(x, top, x, bottom)
+    clear = QColor(signal)
+    clear.setAlpha(0)
+    grad.setColorAt(0.0, clear)
+    grad.setColorAt(0.5, signal)
+    grad.setColorAt(1.0, clear)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(grad))
+    painter.drawRect(QRectF(x - 1.0, top, 2.0, bottom - top))
+
+    centre = QPointF(x, (top + bottom) / 2.0)
+    # Concentric translucent rings stand in for the mockup's CSS box-shadow glow,
+    # the same trick the tutorial spotlight uses - the painter has no box-shadow.
+    for radius, alpha in ((23.0, 45), (18.0, 80)):
+        halo = QColor(signal)
+        halo.setAlpha(alpha)
+        painter.setPen(QPen(halo, 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(centre, radius, radius)
+    painter.setBrush(QColor(8, 17, 28))
+    painter.setPen(QPen(signal, 1.5))
+    painter.drawEllipse(centre, 16.0, 16.0)
+
+    # Two chevrons for the grip, drawn rather than set as a glyph so the arrow
+    # never depends on a font that may not carry ⟺.
+    grip = QPen(signal, 1.6)
+    grip.setCapStyle(Qt.PenCapStyle.RoundCap)
+    grip.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(grip)
+    cy = centre.y()
+    left = QPolygonF([QPointF(x - 3, cy - 4), QPointF(x - 7, cy), QPointF(x - 3, cy + 4)])
+    right = QPolygonF([QPointF(x + 3, cy - 4), QPointF(x + 7, cy), QPointF(x + 3, cy + 4)])
+    painter.drawPolyline(left)
+    painter.drawPolyline(right)
+
+
+def _paint_readout(
+    painter: QPainter, widget: QWidget, text: str, *, band: float | None = None,
+) -> None:
+    """A resolution + zoom chip pinned bottom-right, like the mockup's readout.
+
+    Bottom-right rather than centred: it is a passive instrument reading, so it
+    belongs out of the way at the corner, not floating over the middle of the
+    picture the user is judging.
+
+    ``band`` confines the chip to a reserved strip of that height at the very
+    bottom, for the side-by-side view: there the panes must stay pixel-identical
+    for comparison, so the chip has to sit clear of the image rather than float
+    over it as it does on the single and wipe views.
+    """
+    if not text:
+        return
+    _overlay_font(painter, 8.5, caps=False)
+    metrics = painter.fontMetrics()
+    chip_w = metrics.horizontalAdvance(text) + 22.0
+    margin = 12.0
+    if band is not None:
+        chip_h = min(metrics.height() + 8.0, band - 2.0)
+        top = widget.height() - band + (band - chip_h) / 2.0
+    else:
+        chip_h = metrics.height() + 12.0
+        top = widget.height() - chip_h - margin
+    rect = QRectF(widget.width() - chip_w - margin, top, chip_w, chip_h)
+    _draw_chip(
+        painter, rect, text, accent=False, signal=widget.palette().highlight().color(),
+        ink=_OVERLAY_READ, radius=9.0,
+    )
 
 
 class CanvasView(QWidget):
@@ -225,7 +529,36 @@ class CanvasView(QWidget):
         self._pan = QPointF(0.0, 0.0)
         self._panning = False
         self._pan_from = QPointF(0.0, 0.0)
+        # The overlay layer - pills and the resolution readout - is hidden until
+        # the pointer is over the picture, then faded in by the StageHost. It
+        # starts invisible so a converted image is unobstructed the instant it
+        # lands, and the instruments arrive only when the person reaches for them.
+        self._chrome_opacity = 0.0
+        self._hover_listener = None
         self.setMinimumSize(480, 320)
+
+    # -- hover-revealed overlay chrome ---------------------------------------
+
+    def set_chrome_opacity(self, value: float) -> None:
+        """Fade the pills/readout in or out, driven by the StageHost's hover."""
+        value = float(value)
+        if value != self._chrome_opacity:
+            self._chrome_opacity = value
+            self.update()
+
+    def set_hover_listener(self, callback) -> None:
+        """Let the StageHost hear when the pointer enters or leaves the picture."""
+        self._hover_listener = callback
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._hover_listener is not None:
+            self._hover_listener(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._hover_listener is not None:
+            self._hover_listener(False)
+        super().leaveEvent(event)
 
     # -- geometry ------------------------------------------------------------
 
@@ -343,6 +676,18 @@ class CanvasView(QWidget):
     def _zoom_caption(self) -> str:
         return "" if self._zoom <= 1.001 else f"{self._zoom:.1f}x  ·  right-drag to pan"
 
+    def _readout_text(self, size) -> str:
+        """The bottom-right instrument reading: native resolution, then zoom.
+
+        The resolution is the picture's real pixel size, not the on-screen rect,
+        because that is what the person cares about when judging an 8K render;
+        the zoom is appended only when it is doing something.
+        """
+        if size is None or size.width() <= 0 or size.height() <= 0:
+            return ""
+        dims = f"{size.width()} × {size.height()}"
+        return dims if self._zoom <= 1.001 else f"{dims}   ·   {self._zoom:.1f}×"
+
 
 class ImageView(CanvasView):
     """One image, scaled to fit and centred.
@@ -434,12 +779,6 @@ class ImageView(CanvasView):
             self._paint_progress(painter, rect)
         else:
             painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
-        zoom = self._zoom_caption()
-        if zoom:
-            painter.setPen(self.palette().text().color())
-            painter.drawText(
-                QRectF(0, 6, self.width(), 20), Qt.AlignmentFlag.AlignCenter, zoom
-            )
         if self._caption:
             painter.setPen(self.palette().text().color())
             painter.drawText(
@@ -447,6 +786,11 @@ class ImageView(CanvasView):
                 Qt.AlignmentFlag.AlignCenter,
                 self._caption,
             )
+        if self._chrome_opacity > 0.01:
+            painter.save()
+            painter.setOpacity(self._chrome_opacity)
+            _paint_readout(painter, self, self._readout_text(self._pixmap.size()))
+            painter.restore()
 
 
 class WipeView(CanvasView):
@@ -465,6 +809,7 @@ class WipeView(CanvasView):
         self._split = 0.5
         self._dragging = False
         self._labels: tuple[str, str] | None = None
+        self._accent_right = True
         self._progress: float | None = None
         self._grey: QPixmap | None = None
         self.setMouseTracking(True)
@@ -487,15 +832,16 @@ class WipeView(CanvasView):
         self._progress = float(np.clip(fraction, 0.0, 1.0))
         self.update()
 
-    def set_labels(self, left: str = "", right: str = "") -> None:
-        """Name the two halves, for a comparison that is not before/after.
+    def set_labels(self, left: str = "", right: str = "", *, accent_right: bool = True) -> None:
+        """Name the two halves and say whether the right one is the result.
 
-        Source-versus-result needs no labels: which side is which is obvious
-        from the wipe itself. Two neural styles are not obvious at all - the
-        whole difficulty is that they look similar - so an unlabelled wipe
-        would be a puzzle rather than a comparison.
+        ``accent_right`` tints the right pill cyan, marking it as the neural
+        result - correct for source-versus-DLSS, but wrong for a style-versus-
+        style compare where neither half is "the output", so that caller turns
+        it off and both pills read as neutral names.
         """
         self._labels = (left, right) if (left or right) else None
+        self._accent_right = accent_right
         self.update()
 
     def _content_size(self):
@@ -568,24 +914,41 @@ class WipeView(CanvasView):
         painter.drawPixmap(rect, self._before, QRectF(self._before.rect()))
         painter.restore()
 
-        painter.setPen(QPen(self.palette().highlight().color(), 2))
-        painter.drawLine(QPointF(split_x, rect.top()), QPointF(split_x, rect.bottom()))
+        signal = self.palette().highlight().color()
+        # The divider stays visible whether or not the pointer is over the
+        # picture: it is the comparison control, and hiding it would leave no
+        # sign that the two halves can be wiped between.
+        _paint_divider(painter, split_x, rect.top(), rect.bottom(), signal)
 
+        # The pills and readout are hover chrome, faded in and out by the
+        # StageHost so the picture is unobstructed while it is being studied.
+        if self._chrome_opacity <= 0.01:
+            return
+        painter.save()
+        painter.setOpacity(self._chrome_opacity)
+        # Name the two halves. Explicit labels win (a style-versus-style compare
+        # is not obvious); otherwise the default source/result pair, with the
+        # right half accented so the eye reads it as the neural result. Each is
+        # pinned to the image's own top corner and clamped to the widget - so
+        # zoomed in, when the corner has slid off screen, the pill holds at the
+        # visible edge instead of vanishing - then clipped to its own half.
         if self._labels is not None:
             left, right = self._labels
-            # Pinned to the image's own top corners, then clamped to the
-            # widget: zoomed out they sit at the picture's corners, and zoomed
-            # in - when those corners have slid off screen - they hold at the
-            # visible edge instead of vanishing, so the label is always over
-            # the half it names. Each is clipped to its side of the divider.
-            painter.save()
-            painter.setClipRect(QRectF(0, 0, split_x, self.height()))
-            _corner_label(painter, left, rect, self, align_left=True)
-            painter.restore()
-            painter.save()
-            painter.setClipRect(QRectF(split_x, 0, self.width() - split_x, self.height()))
-            _corner_label(painter, right, rect, self, align_left=False)
-            painter.restore()
+            accent_right = self._accent_right
+        else:
+            left, right, accent_right = "SOURCE", "DLSS 5", True
+        painter.save()
+        painter.setClipRect(QRectF(0, 0, split_x, self.height()))
+        _corner_label(painter, left, rect, self, align_left=True, signal=signal)
+        painter.restore()
+        painter.save()
+        painter.setClipRect(QRectF(split_x, 0, self.width() - split_x, self.height()))
+        _corner_label(
+            painter, right, rect, self, align_left=False, accent=accent_right, signal=signal,
+        )
+        painter.restore()
+        _paint_readout(painter, self, self._readout_text(self._before.size()))
+        painter.restore()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt name
         if event.button() == Qt.MouseButton.LeftButton:
@@ -778,13 +1141,23 @@ class SideBySideView(CanvasView):
             painter.restore()
 
             label = self._labels[index] if index < len(self._labels) else ""
-            if label:
-                painter.setPen(self.palette().text().color())
-                painter.drawText(
-                    QRectF(offset, 3.0, self._pane_width(), 20.0),
-                    Qt.AlignmentFlag.AlignCenter,
-                    label,
+            if label and self._chrome_opacity > 0.01:
+                # Centred in the reserved band above the pane, as a pill so it
+                # reads in the same instrument language as the wipe's corner tags.
+                # Hover chrome, so faded with the readout by the StageHost.
+                painter.save()
+                painter.setOpacity(self._chrome_opacity)
+                _overlay_font(painter, 8.5)
+                metrics = painter.fontMetrics()
+                chip_w = metrics.horizontalAdvance(label) + 20.0
+                chip_h = metrics.height() + 8.0
+                chip_x = offset + (self._pane_width() - chip_w) / 2.0
+                chip_y = (self.LABEL_BAND - chip_h) / 2.0
+                _draw_chip(
+                    painter, QRectF(chip_x, chip_y, chip_w, chip_h), label,
+                    accent=False, signal=self.palette().highlight().color(),
                 )
+                painter.restore()
 
         # Seams, so similar images do not read as one wide one.
         painter.setPen(QPen(self.palette().highlight().color(), 1))
@@ -792,14 +1165,142 @@ class SideBySideView(CanvasView):
             middle = self._pane_left(index) - self.GAP / 2
             painter.drawLine(QPointF(middle, view.top()), QPointF(middle, view.bottom()))
 
-        zoom = self._zoom_caption()
-        if zoom:
-            painter.setPen(self.palette().text().color())
-            painter.drawText(
-                QRectF(0, self.height() - 26, self.width(), 22),
-                Qt.AlignmentFlag.AlignCenter,
-                zoom,
+        if self._chrome_opacity > 0.01:
+            painter.save()
+            painter.setOpacity(self._chrome_opacity)
+            _paint_readout(
+                painter, self, self._readout_text(self._panes[0].size()),
+                band=float(self.CAPTION_BAND),
             )
+            painter.restore()
+
+
+class HoverBar(QFrame):
+    """A translucent control bar that reports pointer enter/leave to its host.
+
+    It floats over the picture and carries the view controls. Because it tells
+    the StageHost when the pointer is on it, moving from the image onto the bar
+    keeps the whole overlay revealed rather than flickering it away.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("viewBar")
+        self._hover_listener = None
+
+    def set_hover_listener(self, callback) -> None:
+        self._hover_listener = callback
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._hover_listener is not None:
+            self._hover_listener(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt name
+        if self._hover_listener is not None:
+            self._hover_listener(False)
+        super().leaveEvent(event)
+
+
+class StageHost(QWidget):
+    """Holds the image stack and floats a hover-revealed control bar over it.
+
+    The whole overlay layer - the SOURCE/DLSS pills, the resolution readout and
+    the view bar - fades in when the pointer is over the picture and fades out
+    when it leaves, so the image is unobstructed while it is being studied and
+    the instruments are there the instant they are reached for. The fade is one
+    animation driving both the painted chrome (on the views) and the bar, so the
+    two can never disagree about whether they are shown.
+    """
+
+    #: How long the overlay takes to fade in or out. Short enough to feel
+    #: immediate, long enough not to read as a hard cut.
+    FADE_MS = 160
+
+    def __init__(
+        self, stack: QStackedWidget, bar: HoverBar, parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._stack = stack
+        self._bar = bar
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(stack)
+
+        bar.setParent(self)
+        self._effect = QGraphicsOpacityEffect(bar)
+        bar.setGraphicsEffect(self._effect)
+        self._effect.setOpacity(0.0)
+        bar.setVisible(False)
+
+        self._opacity = 0.0
+        self._target = 0.0
+        self._pending_hide = False
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(self.FADE_MS)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.valueChanged.connect(self._apply)
+
+        # The views exist before the host is built, so bind their hover once.
+        self._views = stack.findChildren(CanvasView)
+        for view in self._views:
+            view.set_hover_listener(self._hover)
+        bar.set_hover_listener(self._hover)
+
+    def _position_bar(self) -> None:
+        """Bottom-left, matching the mockup's stagefoot; the readout is painted
+        bottom-right by the view, so the two share the strip without colliding."""
+        margin = 14
+        self._bar.adjustSize()
+        self._bar.move(margin, max(margin, self.height() - self._bar.height() - margin))
+        self._bar.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt name
+        self._position_bar()
+        super().resizeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt name
+        self._position_bar()
+        super().showEvent(event)
+
+    def _hover(self, entered: bool) -> None:
+        if entered:
+            self._pending_hide = False
+            self._reveal(True)
+        else:
+            # Moving from a view onto the bar (or a bar button) fires a leave
+            # before the next enter, so never hide on the spot: wait, then hide
+            # only if the pointer really is off the whole stage by then.
+            self._pending_hide = True
+            QTimer.singleShot(60, self._maybe_hide)
+
+    def _maybe_hide(self) -> None:
+        if not self._pending_hide:
+            return
+        inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        if not inside:
+            self._reveal(False)
+
+    def _reveal(self, shown: bool) -> None:
+        self._target = 1.0 if shown else 0.0
+        if self._target == self._opacity:
+            return
+        if shown:
+            self._bar.setVisible(True)
+            self._position_bar()
+        self._fade.stop()
+        self._fade.setStartValue(self._opacity)
+        self._fade.setEndValue(self._target)
+        self._fade.start()
+
+    def _apply(self, value: object) -> None:
+        self._opacity = float(value)
+        self._effect.setOpacity(self._opacity)
+        if self._opacity <= 0.001 and self._target == 0.0:
+            self._bar.setVisible(False)
+        for view in self._views:
+            view.set_chrome_opacity(self._opacity)
 
 
 def format_bytes(count: float) -> str:
@@ -834,6 +1335,10 @@ class DownloadDialog(QDialog):
     #: Seconds of history used for the rate estimate.
     WINDOW = 8.0
 
+    #: Emitted when the user asks to abandon the step (only if enable_cancel was
+    #: called). The owner is responsible for stopping the work and closing this.
+    cancelled = Signal()
+
     def __init__(self, title: str, subtitle: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -866,11 +1371,33 @@ class DownloadDialog(QDialog):
 
         self._history: list[tuple[float, int]] = []
 
+    def enable_cancel(self, text: str = "Skip") -> None:
+        """Add a button that lets the user abandon this step.
+
+        Off by default: the first-run downloads carry on whether the dialog is
+        up or not, so a Cancel there would be a lie. The runtime check is the
+        opposite - it can wedge the GPU, and the user needs a way out that is not
+        force-quitting the whole app. Clicking it only emits `cancelled`; the
+        owner stops the work and closes the dialog, so the button can never look
+        like it did something while the process is actually still running.
+        """
+        row = QHBoxLayout()
+        row.addStretch(1)
+        button = QPushButton(text)
+        button.setObjectName("secondary")
+        button.clicked.connect(self.cancelled.emit)
+        row.addWidget(button)
+        self.layout().addLayout(row)
+
     def set_heading(self, text: str) -> None:
         self._heading.setText(text)
 
     def set_status(self, text: str) -> None:
         self._detail.setText(text)
+
+    def set_busy(self) -> None:
+        """Show indeterminate progress for work with no meaningful percentage."""
+        self._bar.setRange(0, 0)
 
     def mark_complete(self) -> None:
         """Fill the bar on success.
@@ -929,10 +1456,10 @@ class SliderRow(QWidget):
         layout.setSpacing(2)
 
         header = QHBoxLayout()
-        name = QLabel(label)
+        self._name = QLabel(label)
         self._value = QLabel(f"{value:+.2f}" if minimum < 0 else f"{value:.2f}")
         self._value.setObjectName("hint")
-        header.addWidget(name)
+        header.addWidget(self._name)
         header.addStretch(1)
         header.addWidget(self._value)
         layout.addLayout(header)
@@ -949,7 +1476,7 @@ class SliderRow(QWidget):
 
         if tooltip:
             self.setToolTip(tooltip)
-            name.setToolTip(tooltip)
+            self._name.setToolTip(tooltip)
 
     def _to_raw(self, value: float) -> int:
         span = self._maximum - self._minimum
@@ -968,6 +1495,363 @@ class SliderRow(QWidget):
 
     def set_value(self, value: float) -> None:
         self._slider.setValue(self._to_raw(value))
+
+    def compact(self) -> "SliderRow":
+        """Drop the name from the header, keeping just the live value readout.
+
+        Used inside a ChipSliderGroup, where the selected chip already carries
+        the name — repeating it under the chip is noise. Returns self so it can
+        be chained at construction.
+        """
+        self._name.hide()
+        return self
+
+    def bare(self) -> "SliderRow":
+        """Hide the whole header, leaving just the slider.
+
+        For a ChipSliderGroup that shows each value on its chip: the name and the
+        value both live on the chip above, so the row under it is only the track.
+        """
+        return self.set_header(False, False)
+
+    def set_header(self, name: bool, value: bool) -> "SliderRow":
+        """Show or hide the name and value parts of the header independently.
+
+        Lets one SliderRow serve both a ChipSliderGroup's compact mode (header
+        off, the chip carries name and value) and its full mode (header on, the
+        row stands alone). Returns self so it can be chained at construction.
+        """
+        self._name.setVisible(name)
+        self._value.setVisible(value)
+        return self
+
+    def formatted(self, value: float) -> str:
+        return f"{value:+.2f}" if self._minimum < 0 else f"{value:.2f}"
+
+
+class FlowLayout(QLayout):
+    """A layout that wraps its children onto new rows when they run out of width.
+
+    Qt ships no wrapping layout, and a row of parameter chips must not overflow a
+    fixed-width sidebar — four chips fit on one line on a wide window and fold to
+    two lines on a narrow one, rather than being clipped. This is the canonical
+    Qt FlowLayout, trimmed to what the chip rows need.
+    """
+
+    def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self._spacing = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:  # noqa: N802 - Qt name
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802 - Qt name
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802 - Qt name
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802 - Qt name
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt name
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt name
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802 - Qt name
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt name
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802 - Qt name
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        x, y = rect.x(), rect.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > rect.right() and line_height > 0:
+                x = rect.x()
+                y = y + line_height + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y()
+
+
+class ChipSliderGroup(QWidget):
+    """A row of parameter chips over one shared slider.
+
+    Rather than stack four sliders — the "wall of sliders" that made the sidebar
+    read as cluttered — the parameters become a segmented row of chips, exactly
+    like the Photo/Result/Depth switch under the image, and only the selected
+    chip's slider is shown below it. Same controls, a fraction of the height, and
+    one pattern reused everywhere a group holds several sliders.
+
+    Each ``param`` is ``(label, value, on_change, tooltip, minimum, maximum)``.
+    ``rows`` exposes the SliderRow per label so callers can still push a value in
+    (a reset, a preset change) through ``set_value``.
+    """
+
+    def __init__(
+        self, params, mode: str = "compact", columns: int = 2,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 2, 0, 2)
+        outer.setSpacing(9)
+
+        # A two-column grid rather than a wrapping flow: equal-width chips that
+        # pack 2×2, so four value-bearing chips take two tidy rows instead of
+        # four ragged ones. Columns stretch so the pair fills the sidebar width.
+        self._chip_bar = QWidget()
+        grid = QGridLayout(self._chip_bar)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+        columns = max(1, columns)
+        for c in range(columns):
+            grid.setColumnStretch(c, 1)
+        outer.addWidget(self._chip_bar)
+
+        # Rows live in a plain box, not a stack, so Full mode can show them all at
+        # once and Compact can hide all but the selected one — one set of widgets,
+        # two layouts, switched live.
+        rows_holder = QWidget()
+        self._rows_box = QVBoxLayout(rows_holder)
+        self._rows_box.setContentsMargins(0, 0, 0, 0)
+        self._rows_box.setSpacing(2)
+        outer.addWidget(rows_holder)
+
+        self._buttons = QButtonGroup(self)
+        self._buttons.setExclusive(True)
+        self.rows: dict[str, SliderRow] = {}
+        self._chips: dict[str, QPushButton] = {}
+        self._order: list[str] = []
+        self._mode = mode
+
+        for index, (label, value, on_change, tooltip, minimum, maximum) in enumerate(params):
+            chip = QPushButton()
+            chip.setObjectName("chip")
+            chip.setCheckable(True)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            if tooltip:
+                chip.setToolTip(tooltip)
+            grid.addWidget(chip, index // columns, index % columns)
+            self._buttons.addButton(chip, index)
+
+            # The chip carries the value as well as the name, so all read at a
+            # glance even with one slider showing. The setter is wrapped to keep
+            # the chip's number in step with its slider as it drags.
+            row = SliderRow(
+                label, value, self._chip_setter(label, on_change), tooltip,
+                maximum=maximum, minimum=minimum,
+            )
+            chip.setText(f"{label}  {row.formatted(value)}")
+            self._rows_box.addWidget(row)
+            self.rows[label] = row
+            self._chips[label] = chip
+            self._order.append(label)
+
+        self._buttons.idClicked.connect(self._select)
+        if params:
+            self._buttons.button(0).setChecked(True)
+        self.set_mode(mode)
+
+    def _chip_setter(self, label: str, on_change):
+        def wrapped(value: float) -> None:
+            chip = self._chips.get(label)
+            row = self.rows.get(label)
+            if chip is not None and row is not None:
+                chip.setText(f"{label}  {row.formatted(value)}")
+            on_change(value)
+        return wrapped
+
+    def _select(self, index: int) -> None:
+        """Compact only: reveal the chosen row, hide the rest."""
+        if self._mode != "compact":
+            return
+        for i, label in enumerate(self._order):
+            self.rows[label].setVisible(i == index)
+
+    def set_mode(self, mode: str) -> None:
+        """Switch between 'compact' (chips + one slider) and 'full' (all sliders).
+
+        Full drops the chip bar and shows every row with its own name and value;
+        Compact brings the chip bar back and leaves only the selected row's bare
+        track under it. The chips stay wired in both, so a value pushed in from
+        outside lands the same way.
+        """
+        self._mode = "full" if mode == "full" else "compact"
+        full = self._mode == "full"
+        self._chip_bar.setVisible(not full)
+        selected = max(0, self._buttons.checkedId())
+        for i, label in enumerate(self._order):
+            row = self.rows[label]
+            row.set_header(full, full)
+            row.setVisible(full or i == selected)
+
+    def set_value(self, label: str, value: float) -> None:
+        row = self.rows.get(label)
+        if row is not None:
+            row.set_value(value)  # fires the wrapped setter, so the chip updates too
+
+
+class SegmentedControl(QWidget):
+    """A row of equal-width, mutually exclusive buttons — a styled radio group.
+
+    The mockup replaces the Style and Detail-mode dropdowns with these: the two
+    or three choices are all visible and one tap wide, instead of hidden behind a
+    combo. ``options`` are ``str`` or ``(label, data)``; ``changed`` carries the
+    selected index and ``current_data`` returns the chosen payload.
+    """
+
+    changed = Signal(int)
+
+    def __init__(self, options, current: int = 0, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self._group = QButtonGroup(self)
+        self._group.setExclusive(True)
+        self._data: list = []
+        for index, option in enumerate(options):
+            label, data = option if isinstance(option, tuple) else (option, option)
+            button = QPushButton(label)
+            button.setObjectName("chip")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            row.addWidget(button, 1)
+            self._group.addButton(button, index)
+            self._data.append(data)
+        self._group.idClicked.connect(self.changed)
+        if options:
+            self._group.button(min(current, len(options) - 1)).setChecked(True)
+
+    def current_index(self) -> int:
+        return self._group.checkedId()
+
+    def current_data(self):
+        index = self._group.checkedId()
+        return self._data[index] if 0 <= index < len(self._data) else None
+
+    def set_index(self, index: int) -> None:
+        button = self._group.button(index)
+        if button is not None:
+            button.setChecked(True)
+
+
+class GpuGauge(QFrame):
+    """The command bar's GPU / VRAM readout — name, a usage bar, and the numbers.
+
+    Read from ``nvidia-smi`` rather than by importing torch, deliberately: torch
+    is a multi-second, gigabyte import this app keeps lazy (see CLAUDE.md), and
+    the gauge must be up the instant the window paints. nvidia-smi ships with the
+    driver, answers in milliseconds, and is run through a QProcess so it never
+    blocks the GUI thread. No GPU, no smi — the gauge just reads a dash.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("gauge")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(13, 6, 13, 6)
+        row.setSpacing(11)
+
+        name_col = QVBoxLayout()
+        name_col.setSpacing(1)
+        lab = QLabel("GPU")
+        lab.setObjectName("gaugeLab")
+        apply_font(lab, family=FONT_MONO, size=7.5, spacing=1.6, caps=True)
+        self._name = QLabel("detecting…")
+        self._name.setObjectName("gpuName")
+        apply_font(self._name, family=FONT_DISPLAY, size=10.5)
+        name_col.addWidget(lab)
+        name_col.addWidget(self._name)
+        row.addLayout(name_col)
+
+        vram_col = QVBoxLayout()
+        vram_col.setSpacing(3)
+        self._bar = QProgressBar()
+        self._bar.setObjectName("vramBar")
+        self._bar.setRange(0, 1000)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(5)
+        self._bar.setFixedWidth(118)
+        self._read = QLabel("VRAM  —")
+        self._read.setObjectName("vramRead")
+        apply_font(self._read, family=FONT_MONO, size=8.5)
+        vram_col.addWidget(self._bar)
+        vram_col.addWidget(self._read)
+        row.addLayout(vram_col)
+
+        self._proc = QProcess(self)
+        self._proc.finished.connect(self._parsed)
+        self._proc.errorOccurred.connect(lambda _err: self._offline())
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start(3000)
+        QTimer.singleShot(0, self._poll)
+
+    def _poll(self) -> None:
+        if self._proc.state() == QProcess.ProcessState.NotRunning:
+            self._proc.start("nvidia-smi", [
+                "--query-gpu=name,memory.total,memory.used",
+                "--format=csv,noheader,nounits",
+            ])
+
+    def _offline(self) -> None:
+        # errorOccurred can fire during window teardown, after the C++ labels are
+        # gone; touching them then raises. A dead gauge has nothing to update.
+        try:
+            self._name.setText("—")
+            self._read.setText("VRAM  —")
+            self._timer.stop()  # smi is missing; polling it again will not help
+        except RuntimeError:
+            pass
+
+    def _parsed(self) -> None:
+        try:
+            self._parse()
+        except RuntimeError:
+            pass  # widget torn down between the process finishing and this slot
+
+    def _parse(self) -> None:
+        raw = bytes(self._proc.readAllStandardOutput()).decode("utf-8", "ignore").strip()
+        line = raw.splitlines()[0] if raw else ""
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            return
+        name = parts[0].replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+        try:
+            total = float(parts[1]) / 1024.0
+            used = float(parts[2]) / 1024.0
+        except ValueError:
+            return
+        self._name.setText(name)
+        self._read.setText(f"VRAM  {used:.1f} / {total:.1f} GB")
+        if total > 0:
+            self._bar.setValue(int(min(1000, used / total * 1000)))
 
 
 class TimelineWidget(QWidget):

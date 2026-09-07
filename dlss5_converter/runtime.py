@@ -87,7 +87,10 @@ def unpack_archives(extra: Path | None = None) -> list[str]:
                         if member.is_dir():
                             continue
                         name = Path(member.filename).name
-                        if name.lower() not in _WANTED_IN_ARCHIVES:
+                        low = name.lower()
+                        # Any .addon64, not just the name we know: RenoDX ships
+                        # the add-on zipped under whatever it is currently called.
+                        if low not in _WANTED_IN_ARCHIVES and not low.endswith(paths.ADDON_SUFFIX):
                             continue
                         target = root / name
                         if target.exists():
@@ -110,7 +113,10 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     def locate() -> None:
         status.neural_dll = paths.find_runtime_file("nvngx_dlssnr.dll", extra)
         status.dlss_dll = paths.find_runtime_file("nvngx_dlss.dll", extra)
-        status.addon = paths.find_runtime_file(paths.ADDON_FILE, extra)
+        # By suffix, not one fixed name: RenoDX renames the add-on between
+        # releases, and matching a single filename makes a routine update look
+        # like a broken install.
+        status.addon = paths.find_addon(extra)
         # ReShade under either name it plausibly has. An existing install has
         # already renamed it to the DLL it proxies, so a user following our own
         # advice drops a "dxgi.dll" here and would otherwise be told ReShade is
@@ -168,8 +174,10 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
         )
     if status.addon is None:
         status.problems.append(
-            f"{paths.ADDON_FILE} was not found. Without the add-on the harness "
-            f"produces a plain DLAA resolve and no neural enhancement. {where}"
+            f"No RenoDX DLSS add-on was found (a {paths.ADDON_SUFFIX} file, such "
+            f"as {paths.ADDON_FILE}; RenoDX has also shipped it as dlss.addon64). "
+            "Without the add-on the harness produces a plain DLAA resolve and no "
+            f"neural enhancement. {where}"
         )
     if status.harness is None:
         status.problems.append(

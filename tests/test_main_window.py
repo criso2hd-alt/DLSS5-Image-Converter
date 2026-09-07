@@ -125,6 +125,98 @@ def test_views_fall_back_when_their_data_is_missing(window):
     assert window._view == "depth"
 
 
+def test_the_overlay_layer_is_hidden_until_the_pointer_is_over_the_image(window):
+    """The pills, readout and view bar are hover chrome, not always-on."""
+    host = window.stage_host
+    # At rest: nothing floating over the picture. isHidden (the explicit flag)
+    # rather than isVisible, because the test window is never actually shown.
+    assert host._bar.isHidden()
+    assert window.wipe._chrome_opacity == 0.0
+
+    # Pointer over the picture reveals the whole overlay in one motion.
+    host._reveal(True)
+    host._fade.setCurrentTime(host._fade.duration())
+    assert not host._bar.isHidden()
+    assert window.wipe._chrome_opacity == pytest.approx(1.0)
+    assert window.side_by_side._chrome_opacity == pytest.approx(1.0)
+
+    # Pointer gone: it fades back out and the bar stops taking clicks.
+    host._reveal(False)
+    host._fade.setCurrentTime(host._fade.duration())
+    assert window.wipe._chrome_opacity == pytest.approx(0.0)
+    assert host._bar.isHidden()
+
+
+def test_the_view_controls_live_on_the_floating_bar(window):
+    """The buttons moved onto the hover bar, not a row under the stage."""
+    assert window.view_result.parent() is window.stage_host._bar
+    assert window.view_grade.parent() is window.stage_host._bar
+
+
+# -- the DLSS check can never hang the app -----------------------------------
+#
+# The old "Checking DLSS 5" step ran the native probe on a path the user could
+# not leave, and a probe that wedged the GPU froze the whole window until it was
+# force-quit. RuntimeProbe replaces it: off the UI thread, watchdog-guarded, and
+# reporting through one done() that no wait() ever blocks on.
+
+
+def test_runtime_probe_reports_a_failure_without_blocking(qt_app):
+    """A harness that cannot even launch settles quickly as not-ok."""
+    from PySide6.QtTest import QTest
+
+    seen: list[tuple[bool, str]] = []
+    probe = gui.RuntimeProbe(gui.Path("no-such-harness.exe"))
+    probe.done.connect(lambda ok, report: seen.append((ok, report)))
+    probe.start()
+    deadline = 3000
+    while not seen and deadline > 0:
+        QTest.qWait(20)
+        deadline -= 20
+    assert len(seen) == 1
+    assert seen[0][0] is False
+
+
+def test_runtime_probe_watchdog_settles_when_the_check_overruns(qt_app, monkeypatch):
+    """A probe that overruns is given up on by the watchdog, not waited for.
+
+    Only the watchdog timer is armed here, not the worker thread, so the timeout
+    path is exercised deterministically without a real slow subprocess whose
+    teardown timing would make the test flaky.
+    """
+    from PySide6.QtTest import QTest
+
+    monkeypatch.setattr(gui.RuntimeProbe, "TIMEOUT_MS", 40)
+    seen: list[tuple[bool, str]] = []
+    probe = gui.RuntimeProbe(gui.Path("slow-harness.exe"))
+    probe.done.connect(lambda ok, report: seen.append((ok, report)))
+    probe._watchdog.start()
+    deadline = 1000
+    while not seen and deadline > 0:
+        QTest.qWait(10)
+        deadline -= 10
+    assert len(seen) == 1, "the watchdog must settle exactly once"
+    assert seen[0][0] is False
+    assert "did not finish" in seen[0][1]
+
+
+def test_runtime_probe_reports_only_the_first_outcome(qt_app):
+    """Watchdog, worker-finish and skip all race to done(); the first wins."""
+    probe = gui.RuntimeProbe(gui.Path("x.exe"))
+    seen: list[tuple[bool, str]] = []
+    probe.done.connect(lambda ok, report: seen.append((ok, report)))
+    probe._on_timeout()                              # watchdog fires first
+    probe._on_worker_finished(True, "late success")  # arrives after — ignored
+    probe.skip()                                     # also ignored
+    assert len(seen) == 1
+    assert seen[0][0] is False
+
+
+def test_cancel_probe_is_safe_when_nothing_is_running():
+    """The Skip button and shutdown call this unconditionally."""
+    gui.evaluator.cancel_probe()  # must not raise with no probe in flight
+
+
 def test_the_progress_sweep_follows_the_pass_count(window):
     prepare(window)
     window._begin_progress()
@@ -160,6 +252,49 @@ def test_the_dialogs_construct(window):
     gui.ExportDialog(window, (1920, 1080))
 
 
+def test_first_run_file_finder_has_the_four_file_checklist(window):
+    dialog = gui.FindFilesDialog(window, onboarding_mode=True)
+    assert dialog.isModal()
+    assert dialog.close_button.text() == "Skip for now"
+    assert dialog.copy_button.text() == "Use these files & verify"
+    for filename in gui.discovery.WANTED:
+        assert filename in dialog.summary.text()
+
+
+def test_tutorial_uses_real_controls_and_skip_persists(window, monkeypatch, tmp_path):
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(gui.paths, "settings_path", lambda: settings_file)
+    window.settings.onboarding_version = 0
+
+    window.start_tutorial()
+    overlay = window._tour_overlay
+    assert overlay is not None
+    assert [step.target for step in overlay._steps] == [
+        window.stack,
+        window.tabs.tabBar(),
+        window.neural_card,
+        window.detail_card,
+        window.convert_button,
+    ]
+    overlay._skip()
+
+    assert window._tour_overlay is None
+    assert gui.AppSettings.load(settings_file).onboarding_version == gui.ONBOARDING_VERSION
+    replay_labels = [button.text() for button in window.findChildren(gui.QPushButton)]
+    assert "Replay introduction…" in replay_labels
+
+
+def test_boost_offers_two_four_and_eight_without_a_fixed_8k_cap(window):
+    factors = [
+        window.detail_supersample.itemData(index)
+        for index in range(window.detail_supersample.count())
+    ]
+    assert factors == [2, 4, 8]
+    labels = [button.text() for button in window.detail_mode.findChildren(gui.QPushButton)]
+    assert "Boost" in labels
+    assert "Boost 4×" not in labels
+
+
 # -- what a run looks like while it is running -------------------------------
 
 
@@ -188,7 +323,10 @@ def test_the_wipe_names_its_halves(window):
     prepare(window)
     window.result = result()
     window.show_view("result")
-    assert window.wipe._labels == ("Before", "After")
+    # SOURCE / DLSS 5, matching the mockup's on-image pills, with the result
+    # half accented so which side is which is clear before the divider moves.
+    assert window.wipe._labels == ("SOURCE", "DLSS 5")
+    assert window.wipe._accent_right is True
 
 
 def test_compare_styles_shows_its_panes_before_converting(window):

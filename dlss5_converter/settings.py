@@ -32,6 +32,11 @@ NR_COLOR_MAX = 1.0
 NR_TRANSFER_MAX = 1.0
 NR_PAPER_WHITE_MAX = 16.0
 
+#: Increment only when an existing user should be offered a substantially new
+#: tour. Existing settings without this key predate onboarding and are migrated
+#: as complete; a genuinely new install starts at zero.
+ONBOARDING_VERSION = 1
+
 
 @dataclass
 class NeuralSettings:
@@ -140,6 +145,97 @@ class EvaluationSettings:
 #: here; the field accepts anything, so an unusual workflow is not blocked.
 MAX_EDGE_CHOICES = (1920, 2560, 3840, 5120, 6144, 7680, 8192)
 
+#: Explicit Boost choices. Centralised so the UI and D3D12-limit guidance can
+#: never disagree about a multiplier the person can actually select.
+DETAIL_BOOST_FACTORS = (2, 4, 8)
+
+
+@dataclass
+class DetailSettings:
+    """How fine detail is recovered after the neural pass.
+
+    DLAA softens genuine photographic texture; this decides how it is given
+    back. Flat and neutral-by-default (mode "off"), matching the other settings
+    groups. See detail.py for the maths and detail_engine.py for the AI step.
+    """
+
+    #: "off"      — leave the DLSS result as-is.
+    #: "preserve" — re-inject the source's real high-frequency band (native
+    #:              resolution; the faithful, free default).
+    #: "boost"    — supersample: upscale the source, crispen, run DLSS at that
+    #:              size, then downscale. Slow, punchy, for high-end renders.
+    mode: str = "off"
+    #: Preserve: how much source detail to blend back, 0..1.
+    #: Boost: strength of the pre-DLSS crispen.
+    amount: float = 0.75
+    #: Gaussian radius of the high/low frequency split, in pixels.
+    radius: float = 2.0
+    #: Boost only: how far to supersample (2, 4 or 8). Higher processes the
+    #: square of the factor in pixels; it is not guaranteed to be sharper on
+    #: every source and is limited by live VRAM and the active DLSS runtime.
+    supersample: int = 4
+
+    @property
+    def is_neutral(self) -> bool:
+        return self.mode == "off"
+
+
+@dataclass
+class EffectsSettings:
+    """The post-DLSS effects stack — the app's native ReShade-style library.
+
+    Flat rather than a dict of sub-objects on purpose: it mirrors NeuralSettings,
+    and the flat shape round-trips through AppSettings.load's field filter with
+    no special handling. Every effect is off by default and every default is a
+    sensible "on" value, so ticking one is immediately visible without hunting
+    for a strength. Applied after the grade; see effects.apply.
+    """
+
+    # Sharpen (unsharp mask).
+    sharpen_enabled: bool = False
+    sharpen_amount: float = 0.6       # 0..2, weight of the high-pass
+    sharpen_radius: float = 1.5       # px
+
+    # Bloom (light bleed from highlights).
+    bloom_enabled: bool = False
+    bloom_threshold: float = 0.75     # 0..1 luma where the glow starts
+    bloom_intensity: float = 0.4      # 0..1
+    bloom_radius: float = 8.0         # px
+
+    # Chromatic aberration (radial R/B split).
+    chroma_enabled: bool = False
+    chroma_amount: float = 0.4        # 0..1
+
+    # LUT (.cube from the luts folder).
+    lut_enabled: bool = False
+    lut_name: str = ""                # filename in paths.luts_dir()
+    lut_amount: float = 1.0           # 0..1 blend
+
+    # CRT (scanlines / phosphor mask / tube curvature).
+    crt_enabled: bool = False
+    crt_scanline: float = 0.4         # 0..1
+    crt_mask: float = 0.3             # 0..1
+    crt_curvature: float = 0.0        # 0..1
+
+    # Vignette.
+    vignette_enabled: bool = False
+    vignette_amount: float = 0.4      # 0..1 corner darkening
+    vignette_feather: float = 0.5     # 0..1 how far in it reaches
+
+    # Film grain.
+    grain_enabled: bool = False
+    grain_amount: float = 0.25        # 0..1
+    grain_size: float = 1.5           # >=1, coarseness
+
+    @property
+    def is_neutral(self) -> bool:
+        """True when nothing is on, so effects.apply can return the input as-is."""
+        return not any((
+            self.sharpen_enabled, self.bloom_enabled, self.chroma_enabled,
+            self.lut_enabled, self.crt_enabled, self.vignette_enabled,
+            self.grain_enabled,
+        ))
+
 
 @dataclass
 class AppSettings:
@@ -149,10 +245,25 @@ class AppSettings:
     #: Applied to the finished image, after the neural pass. Neutral by default,
     #: so it costs nothing until someone touches it.
     grade: GradeSettings = field(default_factory=GradeSettings)
+    #: The post-DLSS effects stack, applied after the grade. Also neutral by
+    #: default — nothing runs until an effect is turned on.
+    effects: EffectsSettings = field(default_factory=EffectsSettings)
+    #: Detail recovery (Preserve / Boost / AI sharpen). Neutral by default.
+    detail: DetailSettings = field(default_factory=DetailSettings)
     #: Folder holding the user's own nvngx_dlssnr.dll and the RenoDX add-on.
     #: Empty means "search the usual places" (see paths.runtime_search_roots).
     runtime_dir: str = ""
     last_output_dir: str = ""
+    #: The colour palette the UI is drawn in, by name (see app.PALETTES). An
+    #: unknown value falls back to the default at apply time.
+    theme: str = "Neural Cyan"
+    #: How multi-slider groups are laid out. "compact" shows a row of parameter
+    #: chips over a single slider; "full" stacks every slider at once. Compact by
+    #: default because it is what keeps the sidebar from reading as a wall.
+    density: str = "compact"
+    #: Zero only for a fresh install. Completing or skipping the introduction
+    #: writes the current version so normal launches go straight to work.
+    onboarding_version: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -178,12 +289,29 @@ class AppSettings:
             known = {f.name for f in fields(target)}
             return target(**{k: v for k, v in payload.items() if k in known})
 
+        try:
+            onboarding_version = int(raw.get("onboarding_version", ONBOARDING_VERSION))
+        except (TypeError, ValueError):
+            onboarding_version = ONBOARDING_VERSION
+
         return cls(
             neural=build(NeuralSettings, raw.get("neural")),
             depth=build(DepthSettings, raw.get("depth")),
             evaluation=build(EvaluationSettings, raw.get("evaluation")),
+            # grade and effects are both written by to_json but were not read
+            # back here; without these two lines a saved colour grade (and now
+            # an effects stack) silently resets to neutral on every restart.
+            grade=build(GradeSettings, raw.get("grade")),
+            effects=build(EffectsSettings, raw.get("effects")),
+            detail=build(DetailSettings, raw.get("detail")),
             runtime_dir=str(raw.get("runtime_dir") or ""),
             last_output_dir=str(raw.get("last_output_dir") or ""),
+            theme=str(raw.get("theme") or "Neural Cyan"),
+            density=str(raw.get("density") or "compact"),
+            # Do not surprise established users with a first-run flow after an
+            # update. A settings file with no key is proof this is not a fresh
+            # install, so migrate it as already introduced.
+            onboarding_version=onboarding_version,
         )
 
     def save(self, path: Path) -> None:
