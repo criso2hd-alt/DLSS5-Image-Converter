@@ -22,6 +22,7 @@ from . import (
     grade,
     hardware,
     hdr,
+    imaging,
     paths,
     runtime,
     sequence,
@@ -971,7 +972,7 @@ def write_video(images: list[Path], destination: Path, fps: float) -> Path:
     """
     if not images:
         raise ValueError("No frames to encode.")
-    first = cv2.imread(str(images[0]), cv2.IMREAD_UNCHANGED)
+    first = imaging.imread(images[0], cv2.IMREAD_UNCHANGED)
     if first is None:
         raise OSError(f"Could not read {images[0]}")
     height, width = first.shape[:2]
@@ -983,7 +984,7 @@ def write_video(images: list[Path], destination: Path, fps: float) -> Path:
         raise OSError(f"Could not open {destination.name} for writing.")
     try:
         for path in images:
-            frame = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            frame = imaging.imread(path, cv2.IMREAD_UNCHANGED)
             if frame is None:
                 continue
             if frame.dtype == np.uint16:
@@ -1023,7 +1024,7 @@ def save_image(image_rgb: np.ndarray, path: str | Path, *, linear: bool = False)
         # The one path where values above 1.0 survive into an OpenCV format.
         # Written linear, which is what both formats mean by convention.
         data = np.maximum(image_rgb, 0.0).astype(np.float32)
-        if not cv2.imwrite(str(target), data[:, :, ::-1]):
+        if not imaging.imwrite(target, data[:, :, ::-1]):
             raise OSError(f"Could not write {target}")
         return
 
@@ -1037,7 +1038,7 @@ def save_image(image_rgb: np.ndarray, path: str | Path, *, linear: bool = False)
         data = rgb.astype(np.float32)
     else:
         data = np.round(rgb * 255.0).astype(np.uint8)
-    if not cv2.imwrite(str(target), data[:, :, ::-1]):
+    if not imaging.imwrite(target, data[:, :, ::-1]):
         raise OSError(f"Could not write {target}")
 
 

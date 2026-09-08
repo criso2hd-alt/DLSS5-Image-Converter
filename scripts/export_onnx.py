@@ -36,6 +36,12 @@ INPUT = 518
 
 def export(model_id: str, out_dir: Path, fp16: bool) -> Path:
     from dlss5_converter import paths
+    from dlss5_converter.depth_engine import enable_system_trust_store
+
+    # Verify TLS against the OS trust store, or an AV/proxy's private root makes
+    # the weight download fail with CERTIFICATE_VERIFY_FAILED (same fix the app
+    # uses). Harmless when the weights are already cached / offline.
+    enable_system_trust_store()
 
     os.environ.setdefault("HF_HOME", str(paths.model_cache_dir()))
     os.environ.setdefault("HF_HUB_OFFLINE", "1")  # reuse the downloaded weights
@@ -70,9 +76,16 @@ def export(model_id: str, out_dir: Path, fp16: bool) -> Path:
 
     if fp16:
         import onnx
-        from onnxconverter_common import float16
 
-        fp16_model = float16.convert_float_to_float16(onnx.load(str(path)), keep_io_types=True)
+        # ONNX Runtime's float16 converter, not onnxconverter-common's: the
+        # latter (1.16.0) crashes on this graph inside remove_unnecessary_cast_node
+        # ("'list' object has no attribute 'input'"). ORT's does the same job.
+        # keep_io_types leaves the input/output float32, so the app's numpy
+        # pre/post-processing (onnx_depth.py) needs no change - only the weights
+        # are halved, and depth differs from fp32 by <0.1% here.
+        from onnxruntime.transformers.float16 import convert_float_to_float16
+
+        fp16_model = convert_float_to_float16(onnx.load(str(path)), keep_io_types=True)
         path = out_dir / f"{name}.fp16.onnx"
         onnx.save(fp16_model, str(path))
     return path

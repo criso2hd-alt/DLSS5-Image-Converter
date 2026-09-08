@@ -11,7 +11,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QObject, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -54,8 +54,11 @@ from . import (
     sequence,
     video,
 )
+from . import __version__
 from . import hdr as hdr_mod
+from . import onnx_depth
 from .depth_engine import MODELS, DepthEngine
+from .onnx_depth import SMALL as SMALL_DEPTH_MODEL
 from .onnx_depth import OnnxDepthEngine
 from .settings import (
     BOOST_LEVEL_LABELS,
@@ -87,6 +90,7 @@ from .widgets import (
     SegmentedControl,
     SideBySideView,
     SliderRow,
+    Spinner,
     WipeView,
     apply_font,
     first_supported,
@@ -175,6 +179,7 @@ QGroupBox::title {
 QLabel { background: transparent; }
 QLabel#hint { color: $ink_faint; }
 QLabel#linkSep { color: $line; }
+QLabel#footerVersion { color: $ink_faint; padding: 0 8px 0 4px; }
 QLabel#onboardingEyebrow { color: $signal; }
 QLabel#onboardingTitle { color: $ink; font-weight: 700; }
 QListWidget#onboardingSources {
@@ -2762,6 +2767,10 @@ class MainWindow(QMainWindow):
         self.drop.opened.connect(self.open_image)
         self.wipe = WipeView()
         self.depth_view = ImageView()
+        # The point-cloud reveal lands on the depth view and, when it has fully
+        # dissipated into the result, asks the window to show the result view.
+        self._reveal_finishing = False
+        self.depth_view.reveal_done.connect(self._on_reveal_done)
         self.diff_view = ImageView()
         self.stack.addWidget(self.drop)
         self.stack.addWidget(self.wipe)
@@ -2962,9 +2971,60 @@ class MainWindow(QMainWindow):
         coffee.setToolTip("Buy me a coffee — entirely optional, and thank you.")
         coffee.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(COFFEE_URL)))
 
+        # A muted build version pinned to the far bottom-right corner, so a bug
+        # report always carries which version it came from. Added last, so it
+        # sits to the right of the links.
+        version = QLabel(f"v{__version__}")
+        version.setObjectName("footerVersion")
+        version.setToolTip("Installed version")
+
         self.statusBar().addPermanentWidget(github)
         self.statusBar().addPermanentWidget(sep)
         self.statusBar().addPermanentWidget(coffee)
+        self.statusBar().addPermanentWidget(version)
+
+        # A tiny spinner shown only while a background operation runs (see
+        # _spin). It is a raw child, not an addWidget, because showMessage hides
+        # non-permanent widgets — exactly the messages we want it beside — so it
+        # floats over the bar, positioned just after the message text.
+        bar = self.statusBar()
+        self._spinner = Spinner(parent=bar)
+        bar.installEventFilter(self)
+        bar.messageChanged.connect(self._position_spinner)
+        self._position_spinner()
+
+    def _position_spinner(self, _message: str = "") -> None:
+        """Sit the spinner just to the right of the status message, so it never
+        covers the text. Repositioned whenever the message changes or the bar
+        resizes."""
+        if not hasattr(self, "_spinner"):
+            return
+        bar = self.statusBar()
+        text = bar.currentMessage()
+        gap = 6
+        left = 6  # QStatusBar's own left indent for the message
+        x = left + (bar.fontMetrics().horizontalAdvance(text) if text else 0) + gap
+        x = max(left, min(x, bar.width() - self._spinner.width() - 4))
+        y = max(0, (bar.height() - self._spinner.height()) // 2)
+        self._spinner.move(int(x), y)
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt name
+        if obj is self.statusBar() and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show,
+        ):
+            self._position_spinner()
+        return super().eventFilter(obj, event)
+
+    def _spin(self, on: bool) -> None:
+        """Show/hide the status spinner. On while a background op runs, off for
+        the result text that follows — matching 'spinner unless it's results'."""
+        if not hasattr(self, "_spinner"):
+            return
+        if on:
+            self._position_spinner()
+            self._spinner.start()
+        else:
+            self._spinner.stop()
 
     # -- view switching ------------------------------------------------------
 
@@ -3200,6 +3260,12 @@ class MainWindow(QMainWindow):
         self.convert_button.setEnabled(False)
         self._style_running = None
         self._style_fraction = 0.0
+        # The panes reveal as the same depth point cloud as the single-image
+        # view (static, facing forward, pulsing) until each style lands.
+        if self.prepared is not None:
+            self.side_by_side.set_reveal_source(
+                self.prepared.source, self.prepared.inverse_depth
+            )
         # Every style is about to be (re)computed. Marking them all pending now
         # is what greys both panes immediately: their current pixels - stale
         # results from the last run, or the source - do not represent what is
@@ -3907,14 +3973,48 @@ class MainWindow(QMainWindow):
         ))
         return hdr
 
+    def _depth_card(self) -> QWidget:
+        """Depth model choice and shaping, kept in the main workflow.
+
+        Depth is the load-bearing input to the neural pass (see contract.py), and
+        the model choice in particular is something people switch per image now
+        that Base/Large download on demand — so it belongs in the sidebar, not
+        buried in Settings.
+        """
+        depth = ModuleCard("Depth")
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model"))
+        self.model_box = QComboBox()
+        for label, model_id in MODELS.items():
+            self.model_box.addItem(label, model_id)
+        index = self.model_box.findData(self.settings.depth.model_id)
+        self.model_box.setCurrentIndex(max(0, index))
+        self.model_box.setToolTip(
+            "Which Depth Anything V2 model estimates depth. Small ships with the "
+            "app; Base and Large are more detailed and download once when chosen."
+        )
+        self.model_box.currentIndexChanged.connect(self._model_changed)
+        model_row.addStretch(1)
+        model_row.addWidget(self.model_box, 1)
+        depth.add_layout(model_row)
+        # No "Depth contrast" slider: it is a monotonic remap of the depth plane,
+        # which DLSS (keying on depth edges, not absolute values) does not react
+        # to on a still frame — measured byte-identical at 0 vs 100. It only ever
+        # moved the mask preview, so a control that looks live but changes nothing
+        # in the export is removed rather than left to confuse.
+        self.tiled = QCheckBox("Tiled depth (slow, sharper silhouettes)")
+        self.tiled.setChecked(self.settings.depth.tiled)
+        self.tiled.toggled.connect(self._tiled_changed)
+        depth.add(self.tiled)
+        return depth
+
     def _settings_page(self) -> QWidget:
         """The Settings tab — a home for everything that is configured once and
         then left alone, so the sidebar can hold only per-image controls.
 
-        Appearance, the DLSS runtime setup (previously loose buttons), and the
-        advanced HDR and Depth controls all live here. Their widgets are still
-        created as the same instance attributes the rest of the app reads, just
-        parented into this page instead of the sidebar.
+        Appearance, the DLSS runtime setup (previously loose buttons) and Help
+        live here. HDR and Depth moved back to the sidebar — they are per-image
+        controls people reach for in the workflow.
         """
         page = QWidget()
         outer = QVBoxLayout(page)
@@ -3982,28 +4082,10 @@ class MainWindow(QMainWindow):
         r_buttons.addStretch(1)
         runtime_grp.add_layout(r_buttons)
 
-        # HDR / display lives in the single-image sidebar now (see _hdr_card),
-        # not here — people went looking for it in the workflow, not in Settings.
-
-        # -- Advanced: Depth --
-        depth = ModuleCard("Depth")
-        self.model_box = QComboBox()
-        for label, model_id in MODELS.items():
-            self.model_box.addItem(label, model_id)
-        index = self.model_box.findData(self.settings.depth.model_id)
-        self.model_box.setCurrentIndex(max(0, index))
-        self.model_box.currentIndexChanged.connect(self._model_changed)
-        depth.add(self.model_box)
-        depth.add(SliderRow(
-            "Depth contrast", min(1.0, self.settings.depth.contrast / 3.0),
-            self._contrast_changed,
-            "Reshapes the near-far spread. Higher pushes more of the frame into "
-            "the foreground. Updates the depth mask live.",
-        ))
-        self.tiled = QCheckBox("Tiled depth (slow, sharper silhouettes)")
-        self.tiled.setChecked(self.settings.depth.tiled)
-        self.tiled.toggled.connect(self._tiled_changed)
-        depth.add(self.tiled)
+        # HDR / display and Depth live in the single-image sidebar now (see
+        # _hdr_card and _depth_card), not here — people went looking for them in
+        # the workflow, and the depth model is switched per image now that
+        # Base/Large download on demand.
 
         # -- Help --
         help_card = ModuleCard("Help")
@@ -4025,7 +4107,6 @@ class MainWindow(QMainWindow):
         left.addWidget(appearance)
         left.addStretch(1)
         right.addWidget(runtime_grp)
-        right.addWidget(depth)
         right.addWidget(help_card)
         right.addStretch(1)
         cols.addLayout(left, 1)
@@ -4131,11 +4212,6 @@ class MainWindow(QMainWindow):
         neural_layout.addWidget(self.live)
         layout.addWidget(neural)
 
-        # HDR/display and Depth are rarely touched, so they live on the Settings
-        # tab now (see _settings_page) — the sidebar keeps only what you reach for
-        # on every image. The controls are still built here as instance state so
-        # everything downstream that reads them is unchanged.
-
         evaluation = ModuleCard("Output")
         eval_layout = evaluation.body
         row = QHBoxLayout()
@@ -4187,6 +4263,7 @@ class MainWindow(QMainWindow):
         eval_layout.addWidget(self.jitter)
         layout.addWidget(evaluation)
 
+        layout.addWidget(self._depth_card())
         layout.addWidget(self._detail_group())
         layout.addWidget(self._hdr_card())
         layout.addStretch(1)
@@ -4243,7 +4320,12 @@ class MainWindow(QMainWindow):
         # 2×/4×/8× multiplier - the number is an implementation detail, and the
         # levels that would blow past the hardware texture limit are disabled by
         # _sync_boost_guard rather than left to fail mid-conversion.
-        ss_row = QHBoxLayout()
+        # Wrapped in a container widget (not a bare layout) so the whole row can
+        # be hidden when Boost is not the active mode — a greyed control here read
+        # to people as a broken button ("why is it there if it does nothing").
+        self.detail_super_row = QWidget()
+        ss_row = QHBoxLayout(self.detail_super_row)
+        ss_row.setContentsMargins(0, 0, 0, 0)
         self.detail_super_label = QLabel("Extra sharpness")
         ss_row.addWidget(self.detail_super_label)
         self.detail_supersample = QComboBox()
@@ -4259,7 +4341,7 @@ class MainWindow(QMainWindow):
         self.detail_supersample.currentIndexChanged.connect(self._detail_super_changed)
         ss_row.addStretch(1)
         ss_row.addWidget(self.detail_supersample)
-        d_layout.addLayout(ss_row)
+        d_layout.addWidget(self.detail_super_row)
 
         # A second, quieter line for the guard message ("Max needs a smaller Max
         # size…"), kept separate from the mode explainer so the two do not fight
@@ -4345,12 +4427,17 @@ class MainWindow(QMainWindow):
             self.detail_guard.setVisible(bool(message))
 
     def _sync_detail_controls(self) -> None:
-        """Grey the sharpness row unless Boost is the active mode, set the card's
-        explainer to match the selected mode, and re-run the Boost guard."""
+        """Show the sharpness row only in Boost, grey Amount in Off, set the
+        card's explainer to match the selected mode, and re-run the Boost guard."""
         mode = self.settings.detail.mode
         is_boost = mode == "boost"
-        self.detail_supersample.setEnabled(is_boost)
-        self.detail_super_label.setEnabled(is_boost)
+        # Extra sharpness is Boost-only: hide the whole row for Off/Preserve so
+        # there is no greyed control to read as broken.
+        self.detail_super_row.setVisible(is_boost)
+        # Amount drives Preserve's blend and Boost's crispen; it does nothing in
+        # Off, so grey it there rather than leaving a live-looking slider that
+        # changes nothing (reported as "Amount has no effect with Off").
+        self.detail_amount.setEnabled(mode != "off")
         if hasattr(self, "detail_hint"):
             self.detail_hint.setText(self._DETAIL_HINTS.get(mode, ""))
         self._sync_boost_guard()
@@ -4402,8 +4489,13 @@ class MainWindow(QMainWindow):
         # milliseconds to the player and frames to the timeline.
         page.player.positionChanged.connect(self._video_position_changed)
         page.player.playbackStateChanged.connect(self._video_playback_state)
+        page.player.mediaStatusChanged.connect(self._video_media_status)
         page.timeline.seeked.connect(self._video_scrub)
         page.output_path: Path | None = None
+        # Set when a freshly loaded video should start playing on its own, so a
+        # loaded video shows motion instead of a black frame that reads as "not
+        # loading" until someone finds the play button.
+        self._video_autoplay_pending = False
 
     # -- effects tab ---------------------------------------------------------
 
@@ -4487,6 +4579,23 @@ class MainWindow(QMainWindow):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.video_page.play_button.setText("Pause" if playing else "Play")
 
+    def _video_media_status(self, status) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        # Auto-play a freshly loaded video once it can actually render, so it
+        # shows motion straight away instead of a black frame people read as a
+        # failed load. One-shot: cleared here so later status changes (looping,
+        # end of media, a re-seek) never restart it on their own.
+        if not self._video_autoplay_pending:
+            return
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            self._video_autoplay_pending = False
+            self.video_page.show_video()
+            self.video_page.player.play()
+
     def _video_position_changed(self, ms: int) -> None:
         # Do not fight the user while they are dragging the playhead.
         if not self.video_page.timeline._drag:
@@ -4549,6 +4658,10 @@ class MainWindow(QMainWindow):
         # the duration the player reports.
         page.timeline.set_duration(info.frames or max(1, round(info.duration * info.fps)), info.fps)
         page.timeline.set_range_mode(page.range_box.currentData() == "range")
+        # Auto-play once the media has loaded (see _video_media_status): setSource
+        # is asynchronous, so play() here can land before there is anything to
+        # play. The status handler starts it the moment the frame is ready.
+        self._video_autoplay_pending = True
         page.player.setSource(QUrl.fromLocalFile(str(path)))
         page.show_video()
 
@@ -5027,7 +5140,7 @@ class MainWindow(QMainWindow):
     def _show_first_conversion_intro(self) -> None:
         palette = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])
         dialog = onboarding.FirstConversionDialog(
-            paths.onboarding_image(), self, palette=palette
+            paths.onboarding_before(), paths.onboarding_after(), self, palette=palette
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self._complete_onboarding()
@@ -5115,13 +5228,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Introduction complete — open Settings to replay it.")
 
     def ensure_model_downloaded(self, model_id: str | None = None) -> None:
-        """Fetch the depth model if it is missing, behind a progress dialog.
+        """Make sure the selected depth model is usable: download it, or fall
+        back to Small.
 
-        Nothing about the model ships with the app — it is a separate download
-        under its own licence — so the first launch has to fetch it. Doing that
-        here rather than inside the first conversion means the wait is explained
-        and measured, instead of appearing as a stalled progress line partway
-        through what the user thought was a conversion.
+        Depth runs on ONNX Runtime now (see onnx_depth.py). Small ships bundled;
+        the larger Base/Large models are an opt-in download (they are
+        non-commercial and large, so they are not in the release zip). If the
+        selection is present, nothing happens. If it has a hosted asset, it is
+        fetched behind a progress dialog. If it is neither installed nor
+        downloadable, we say so plainly and drop back to Small — which
+        onnx_depth.load() would use anyway — reverting the sidebar so it does
+        not claim a model it is not running.
         """
         model_id = model_id or self.settings.depth.model_id
         if self._download_thread is not None:
@@ -5130,26 +5247,54 @@ class MainWindow(QMainWindow):
             return
 
         label = next((k for k, v in MODELS.items() if v == model_id), model_id)
-        self._download_dialog = DownloadDialog(
-            "Finishing setup — just this once.",
-            f"FIRST RUN · STEP 1 OF 3\n\n{label}\n\nThis is a one-time download, kept in the models folder "
-            f"beside the app. Nothing is bundled with the release.",
-            self,
-        )
-        self._download_dialog.setStyleSheet(STYLE)
 
-        self._download_thread = QThread(self)
-        self._download_worker = DownloadWorker(model_id, self.engine)
-        self._download_worker.moveToThread(self._download_thread)
-        self._download_thread.started.connect(self._download_worker.run)
-        self._download_worker.progress.connect(self._download_dialog.set_status)
-        self._download_worker.bytes_progress.connect(self._download_dialog.update_bytes)
-        self._download_worker.finished.connect(self._download_finished)
-        self._download_worker.failed.connect(self._download_failed)
-        self._download_thread.start()
-        # Modal: there is nothing useful to do in the app without this, and a
-        # conversion started midway through would race the download.
-        self._download_dialog.exec()
+        if onnx_depth.is_downloadable(model_id):
+            self._download_dialog = DownloadDialog(
+                "Downloading the depth model…",
+                f"{label}\n\nA one-time download, kept in the models folder "
+                "beside the app. You can keep using the app once it finishes.",
+                self,
+            )
+            self._download_dialog.setStyleSheet(STYLE)
+            self._download_thread = QThread(self)
+            self._download_worker = DownloadWorker(model_id, self.engine)
+            self._download_worker.moveToThread(self._download_thread)
+            self._download_thread.started.connect(self._download_worker.run)
+            self._download_worker.progress.connect(self._download_dialog.set_status)
+            self._download_worker.bytes_progress.connect(self._download_dialog.update_bytes)
+            self._download_worker.finished.connect(self._download_finished)
+            self._download_worker.failed.connect(self._download_failed)
+            self._download_thread.start()
+            self._download_dialog.exec()
+            return
+
+        small = SMALL_DEPTH_MODEL
+        if OnnxDepthEngine.is_downloaded(small):
+            QMessageBox.information(
+                self,
+                "Using the bundled depth model",
+                f"{label} isn't available to download in this build — staying "
+                "on the bundled Small model for now.",
+            )
+            self._select_model(small)
+        else:
+            # Small missing too means a broken package, not a download state.
+            QMessageBox.warning(
+                self,
+                "Depth model missing",
+                "The bundled Small depth model could not be found. This is a "
+                "packaging problem — please reinstall the app.",
+            )
+
+    def _select_model(self, model_id: str) -> None:
+        """Point settings and the sidebar at `model_id` without re-triggering
+        the change handler (which would call back into this method)."""
+        self.settings.depth.model_id = model_id
+        index = self.model_box.findData(model_id)
+        if index >= 0:
+            was_blocked = self.model_box.blockSignals(True)
+            self.model_box.setCurrentIndex(index)
+            self.model_box.blockSignals(was_blocked)
 
     def _close_download(self) -> None:
         if self._download_thread is not None:
@@ -5361,8 +5506,10 @@ class MainWindow(QMainWindow):
         self._depth_worker.finished.connect(self._depth_ready)
         self._depth_worker.failed.connect(self._depth_failed)
         self._depth_thread.start()
+        self._spin(True)
 
     def _depth_teardown(self) -> None:
+        self._spin(False)
         if self._depth_thread is not None:
             self._depth_thread.quit()
             self._depth_thread.wait()
@@ -5431,8 +5578,16 @@ class MainWindow(QMainWindow):
 
     def _live_toggled(self, value: bool) -> None:
         self.settings.evaluation.live_preview = value
+        self.settings.save(paths.settings_path())
         if value:
             self._schedule_preview()
+        else:
+            # Turning it off must actually stop: drop the pending debounce and any
+            # queued rerun, or a slider change made just before unchecking still
+            # fires a preview afterwards - which read as "live preview won't turn
+            # off". An in-flight harness finishes on its own; nothing new starts.
+            self._preview_timer.stop()
+            self._preview_pending = False
 
     def _schedule_preview(self) -> None:
         """Restart the debounce timer.
@@ -5475,13 +5630,6 @@ class MainWindow(QMainWindow):
             return
         self._start_convert(preview=True)
 
-    def _contrast_changed(self, value: float) -> None:
-        # Contrast is applied to the finished depth array, so it never
-        # invalidates the model output — only the picture drawn from it.
-        self.settings.depth.contrast = max(0.2, value * 3.0)
-        if self._view == "depth":
-            self._render_depth_preview()
-
     # -- conversion ----------------------------------------------------------
 
     def convert(self) -> None:
@@ -5500,6 +5648,7 @@ class MainWindow(QMainWindow):
         # after half recomputing against the before half you were comparing it
         # to - which is the whole reason to be on that view.
         self._begin_progress()
+        self._spin(True)
 
         self._thread = QThread(self)
         self._worker = Worker(self.image_path, self.settings, self.engine, self.prepared)
@@ -5511,27 +5660,33 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _begin_progress(self) -> None:
-        """Start the sweep on whatever is already on screen.
+        """Run the depth point-cloud reveal for the run about to begin.
 
-        Deliberately does not move the user. An earlier version pulled the view
-        back to the source for every run, which is wrong for the case that
-        matters most: nudging a slider while watching the result. There the
-        thing you want is the previous result still in front of you, with the
-        after half working - not the source image and no comparison at all.
+        The same cinematic for a deliberate Convert and for a live preview: it
+        wipes back to the un-DLSS'd source and rebuilds it as the cloud, landing
+        on the result when the work finishes. (Live preview shares it by request,
+        so a slider nudge plays the reveal too, not a plain sweep.)
         """
-        if self._view == "result" and self.result is not None:
-            self._sweeping = self.wipe
-            self.wipe.set_progress(0.0)
-        elif self.prepared is not None:
+        if self.prepared is not None:
             self.show_view("photo")
             self._sweeping = self.depth_view
-            self.depth_view.set_progress(0.0)
+            self.depth_view.start_cloud(self.prepared.source, self.prepared.inverse_depth)
 
     def _end_progress(self) -> None:
+        # A reveal that is landing/dissipating into the result finishes on its
+        # own timer and then switches the view (see _on_reveal_done), so it must
+        # not be torn down here; only a cancelled/failed run stops it outright.
+        if not self._reveal_finishing:
+            self.depth_view.stop_cloud()
         self.depth_view.set_progress(None)
         self.wipe.set_progress(None)
         self.side_by_side.clear_progress()
         self._sweeping = None
+
+    def _on_reveal_done(self) -> None:
+        """The point cloud has dissipated into the result — reveal it."""
+        self._reveal_finishing = False
+        self.show_view("result")
 
     def _sweep(self, fraction: float) -> None:
         """Move whichever sweep is running to `fraction`."""
@@ -5543,6 +5698,10 @@ class MainWindow(QMainWindow):
                     self.side_by_side.set_pane_progress(index, fraction)
             return
         if self._sweeping is not None:
+            # The depth view runs the self-animated point-cloud reveal, not a
+            # progress-tracked sweep, so it ignores the fraction while active.
+            if self._sweeping is self.depth_view and self.depth_view.cloud_active():
+                return
             self._sweeping.set_progress(fraction)
 
     def _report_progress(self, message: str) -> None:
@@ -5563,6 +5722,7 @@ class MainWindow(QMainWindow):
             self._sweep(done / total)
 
     def _teardown(self) -> None:
+        self._spin(False)
         self._end_progress()
         if self._thread is not None:
             self._thread.quit()
@@ -5600,7 +5760,14 @@ class MainWindow(QMainWindow):
         self._update_effects_preview()
         self.save_button.setEnabled(True)
         self.feedback_button.setEnabled(True)
-        self.show_view("result")
+        # The reveal (convert or preview) lands and dissipates into the result,
+        # then switches to the result view itself (_on_reveal_done). If none is
+        # running, show the result straight away.
+        if self.depth_view.cloud_active():
+            self._reveal_finishing = True
+            self.depth_view.finish_cloud(result.enhanced)
+        else:
+            self.show_view("result")
         if self._previewing:
             neural = self.settings.neural
             self.statusBar().showMessage(

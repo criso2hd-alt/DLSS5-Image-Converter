@@ -68,20 +68,22 @@ class TourStep:
 
 
 class ComparisonPreview(QWidget):
-    """A small, honest visual explanation of Preserve rather than a fake result.
+    """The actual feature, shown honestly: DLSS 5's neural pass off vs on.
 
-    The right half is the bundled source at full detail; the left is the same
-    image downsampled and restored, standing in for the texture DLAA commonly
-    softens.  It is an illustration in the introduction, never presented as an
-    actual conversion or used by the pipeline.
+    A real in-game screenshot pair — the left half is the frame with the neural
+    renderer OFF, the right half the same frame with it ON — wiped between so the
+    difference reads at a glance. This is what the app does, not a sharpen demo,
+    which is the point for the gamers it is for. Illustrative only; not a
+    conversion the pipeline produced.
     """
 
     def __init__(
-        self, image_path: Path, accent: str = "#42dcf5",
+        self, before_path: Path, after_path: Path, accent: str = "#42dcf5",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._sharp = QPixmap(str(image_path))
+        self._before = QPixmap(str(before_path))  # neural OFF
+        self._after = QPixmap(str(after_path))    # neural ON
         self._accent = QColor(accent)
         self._split = 0.18
         self.setMinimumHeight(180)
@@ -106,37 +108,25 @@ class ComparisonPreview(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         area = self.rect().adjusted(1, 1, -1, -1)
-        if self._sharp.isNull():
+        if self._before.isNull() or self._after.isNull():
             painter.fillRect(area, QColor("#0a111c"))
             painter.setPen(QColor("#8ea1ba"))
-            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "Fine-detail preview")
+            painter.drawText(area, Qt.AlignmentFlag.AlignCenter, "DLSS 5 preview")
             return
 
-        sharp = self._sharp.scaled(
-            area.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        # A small round trip removes high frequencies without inventing a
-        # second image.  The comparison therefore teaches the right concept
-        # while remaining clearly illustrative.
-        tiny = sharp.scaled(
-            max(1, sharp.width() // 5), max(1, sharp.height() // 5),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        soft = tiny.scaled(
-            sharp.size(), Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        mode = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+        smooth = Qt.TransformationMode.SmoothTransformation
+        before = self._before.scaled(area.size(), mode, smooth)
+        after = self._after.scaled(area.size(), mode, smooth)
 
-        x = area.x() + (area.width() - sharp.width()) // 2
-        y = area.y() + (area.height() - sharp.height()) // 2
+        x = area.x() + (area.width() - before.width()) // 2
+        y = area.y() + (area.height() - before.height()) // 2
         split = area.left() + int(area.width() * self._split)
         painter.save()
         painter.setClipRect(area)
-        painter.drawPixmap(x, y, soft)
+        painter.drawPixmap(x, y, before)  # neural OFF, full
         painter.setClipRect(QRect(split, area.y(), area.right() - split + 1, area.height()))
-        painter.drawPixmap(x, y, sharp)
+        painter.drawPixmap(x, y, after)   # neural ON, right of the divider
         painter.restore()
 
         painter.setPen(QPen(self._accent, 2))
@@ -147,17 +137,18 @@ class ComparisonPreview(QWidget):
         painter.setPen(QColor("#d8e5f4"))
         painter.drawText(area.adjusted(12, 0, 0, -10),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
-                         "SOURCE · SOFTENED")
+                         "DLSS 5 OFF")
         painter.drawText(area.adjusted(0, 0, -12, -10),
                          Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
-                         "DETAIL PRESERVED")
+                         "DLSS 5 ON")
 
 
 class FirstConversionDialog(QDialog):
     """Bridge from successful setup into the hands-on tour."""
 
     def __init__(
-        self, image_path: Path, parent: QWidget | None = None,
+        self, before_path: Path, after_path: Path,
+        parent: QWidget | None = None,
         palette: dict[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
@@ -187,13 +178,14 @@ class FirstConversionDialog(QDialog):
         layout.addWidget(title)
 
         body = QLabel(
-            "Choose an image and the short tour will show you where to tune the "
-            "neural look, preserve detail, compare the result, and convert."
+            "This is DLSS 5's neural renderer on a still frame — drag to compare "
+            "the pass off and on. Choose an image and the short tour shows you "
+            "where to tune the look, compare, and convert."
         )
         body.setObjectName("onboardingBody")
         body.setWordWrap(True)
         layout.addWidget(body)
-        layout.addWidget(ComparisonPreview(image_path, colours["signal"]))
+        layout.addWidget(ComparisonPreview(before_path, after_path, colours["signal"]))
 
         buttons = QHBoxLayout()
         self.start_button = QPushButton("Choose an image && start")

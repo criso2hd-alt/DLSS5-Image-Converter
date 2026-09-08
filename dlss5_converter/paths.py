@@ -81,9 +81,19 @@ def fonts_dir() -> Path:
     return resource_dir() / "dlss5_converter" / "assets" / "fonts"
 
 
-def onboarding_image() -> Path:
-    """The original architectural sample used by the first-run introduction."""
-    return resource_dir() / "dlss5_converter" / "assets" / "onboarding" / "architectural-detail.jpg"
+def onboarding_before() -> Path:
+    """DLSS 5 neural pass OFF — the 'before' half of the first-run wipe.
+
+    A real in-game screenshot pair (off vs on) rather than a sharpen demo, so the
+    introduction shows the actual feature — the neural render — to the gamers it
+    is for.
+    """
+    return resource_dir() / "dlss5_converter" / "assets" / "onboarding" / "dlss-off.jpg"
+
+
+def onboarding_after() -> Path:
+    """DLSS 5 neural pass ON — the 'after' half of the first-run wipe."""
+    return resource_dir() / "dlss5_converter" / "assets" / "onboarding" / "dlss-on.jpg"
 
 
 def bundled_onnx_dir() -> Path:

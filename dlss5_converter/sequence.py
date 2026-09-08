@@ -30,6 +30,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import imaging
+
 #: What we will treat as a frame. EXR is included because renderers emit depth
 #: that way and it is the only common format that survives real Z values. JPEG
 #: XR because that is what an HDR screenshot is on Windows.
@@ -89,7 +91,7 @@ def load_depth_map(path: Path, invert: bool = False) -> np.ndarray:
     shot changes a lot between frames. For the fixed-camera work this is mostly
     used for, the range is stable and this is invisible.
     """
-    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
+    image = imaging.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
     if image is None:
         raise OSError(f"Could not read the depth map {path}")
 

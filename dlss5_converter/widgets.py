@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
+
+from . import reveal
 from PySide6.QtCore import (
     QEasingCurve,
     QPoint,
@@ -294,6 +296,60 @@ def desaturated(pixmap: QPixmap) -> QPixmap:
     return QPixmap.fromImage(
         pixmap.toImage().convertToFormat(QImage.Format.Format_Grayscale8)
     )
+
+
+class Spinner(QWidget):
+    """A tiny indeterminate spinner for the status bar.
+
+    Fixed, small, with its own padding, so it never grows the bar. Visible only
+    while running: the status line otherwise looked frozen during a conversion,
+    and this shows work is happening without a progress number to attach to.
+    """
+
+    def __init__(self, diameter: int = 12, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._d = diameter
+        self._angle = 0
+        self._pad = 4  # breathing room top/bottom and each side
+        self.setFixedSize(diameter + self._pad * 2, diameter + self._pad * 2)
+        self._timer = QTimer(self)
+        self._timer.setInterval(83)  # ~12 fps, a calm sweep, not a strobe
+        self._timer.timeout.connect(self._advance)
+        self.hide()
+
+    def start(self) -> None:
+        if not self._timer.isActive():
+            self._timer.start()
+        self.show()
+        self.raise_()
+        self.update()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _advance(self) -> None:
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(self.width() / 2.0, self.height() / 2.0)
+        painter.rotate(self._angle)
+        base = self.palette().highlight().color()
+        r = self._d / 2.0
+        pen = QPen()
+        pen.setWidthF(1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        # Eight spokes with rising alpha, so the ring reads as spinning.
+        for i in range(8):
+            colour = QColor(base)
+            colour.setAlphaF(0.12 + 0.88 * (i / 7.0))
+            pen.setColor(colour)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(0.0, -r * 0.5), QPointF(0.0, -r))
+            painter.rotate(45)
 
 
 def paint_sweep(
@@ -689,6 +745,20 @@ class CanvasView(QWidget):
         return dims if self._zoom <= 1.001 else f"{dims}   ·   {self._zoom:.1f}×"
 
 
+def _cloud_render_size(rect: QRectF) -> tuple[int, int, bool]:
+    """Render the point cloud at native surface resolution so 1px dots stay true
+    pixels — no upscale squares, no moiré from resampling a low-res grid. Only
+    very large surfaces are capped (and then smoothed), where a full-resolution
+    buffer every frame would be too heavy. Returns (w, h, needs_smoothing)."""
+    rw = max(1, int(round(rect.width())))
+    rh = max(1, int(round(rect.height())))
+    cap = 1920
+    if max(rw, rh) <= cap:
+        return rw, rh, False
+    s = cap / max(rw, rh)
+    return max(1, int(rw * s)), max(1, int(rh * s)), True
+
+
 class ImageView(CanvasView):
     """One image, scaled to fit and centred.
 
@@ -698,12 +768,35 @@ class ImageView(CanvasView):
     squinting at to judge silhouettes.
     """
 
+    #: Emitted when the point-cloud reveal has fully dissipated into the result,
+    #: so the window can switch to the result/comparison view at the right moment.
+    reveal_done = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self._caption = ""
         self._progress: float | None = None
         self._grey: QPixmap | None = None
+        # Depth point-cloud reveal (see reveal.py). Active only while a
+        # conversion runs on this view; self-animated on a timer rather than
+        # driven by the coarse per-frame progress, so the build-up is smooth.
+        self._cloud_src: np.ndarray | None = None
+        self._cloud_depth: np.ndarray | None = None
+        self._cloud_result: QPixmap | None = None
+        # form → orbit → land → dissipate, then None. See _tick_cloud.
+        self._cloud_stage: str | None = None
+        self._cloud_flatten = 1.0
+        self._cloud_fade = 0.0
+        self._cloud_scan = 0.0
+        self._cloud_orbit = 0.0
+        # A tasteful floor: even an instant conversion plays form + a minimum
+        # orbit before landing, so the reveal never strobes past in a blink.
+        self._cloud_finish_requested = False
+        self._cloud_orbit_ticks = 0
+        self._cloud_timer = QTimer(self)
+        self._cloud_timer.setInterval(33)  # ~30 fps
+        self._cloud_timer.timeout.connect(self._tick_cloud)
 
     def _content_size(self):
         return self._pixmap.size() if self._pixmap is not None else None
@@ -768,6 +861,112 @@ class ImageView(CanvasView):
             self._progress or 0.0, self.palette().highlight().color(),
         )
 
+    # -- depth point-cloud reveal --------------------------------------------
+    #
+    # A four-stage cinematic that stands in for the missing intermediate image:
+    #   form      the flat photo tilts and extrudes into a 3D point cloud
+    #   orbit     the cloud drifts (parallax) for as long as the work runs
+    #   land      it flattens head-on back to the frame (call finish_cloud)
+    #   dissipate the finished result appears behind and the points fade out
+    # Each stage is a value eased on the timer; render lives in reveal.py.
+
+    def start_cloud(self, source_rgb01: np.ndarray, inverse_depth: np.ndarray) -> None:
+        """Begin the reveal: form out of the flat photo, then orbit until finished."""
+        self._cloud_src = (np.clip(source_rgb01, 0.0, 1.0) * 255.0).astype(np.uint8)
+        self._cloud_depth = np.ascontiguousarray(inverse_depth, dtype=np.float32)
+        self._cloud_result = None
+        self._cloud_stage = "form"
+        self._cloud_flatten = 1.0  # start flat, extrude outward
+        self._cloud_fade = 0.0
+        self._cloud_scan = 0.0
+        self._cloud_orbit = 0.0
+        self._cloud_finish_requested = False
+        self._cloud_orbit_ticks = 0
+        self._cloud_timer.start()
+        self.update()
+
+    def cloud_active(self) -> bool:
+        return self._cloud_stage is not None
+
+    def finish_cloud(self, result_rgb: np.ndarray) -> None:
+        """Land the cloud and dissipate it into `result_rgb` (float sRGB 0..1).
+
+        Called when the conversion succeeds. If no reveal is running (e.g. a
+        light preview), it does nothing and the caller shows the result itself.
+        """
+        if self._cloud_stage is None:
+            return
+        self._cloud_result = QPixmap.fromImage(to_qimage(result_rgb))
+        # Do not snap to land now: let form finish and a minimum orbit play, so a
+        # fast conversion still gets the full, unhurried cinematic (_tick_cloud
+        # consumes this flag once it is safe to land).
+        self._cloud_finish_requested = True
+
+    def stop_cloud(self) -> None:
+        """Hard stop with no landing — for cancellation or failure."""
+        self._cloud_timer.stop()
+        self._cloud_src = None
+        self._cloud_depth = None
+        self._cloud_result = None
+        self._cloud_stage = None
+        self._cloud_flatten = 1.0
+        self._cloud_fade = 0.0
+        self.update()
+
+    #: Minimum orbit ticks (~0.9 s at 30 fps) before a requested finish lands, so
+    #: the cinematic always breathes rather than flashing on a fast conversion.
+    _MIN_ORBIT_TICKS = 26
+
+    def _tick_cloud(self) -> None:
+        stage = self._cloud_stage
+        self._cloud_orbit += 0.11
+        self._cloud_scan = (self._cloud_scan + 0.03) % 1.15  # gentle, not strobing
+        if stage == "form":
+            self._cloud_flatten = max(0.0, self._cloud_flatten - 0.05)
+            if self._cloud_flatten <= 0.0:
+                self._cloud_stage = "orbit"
+                self._cloud_orbit_ticks = 0
+        elif stage == "orbit":
+            self._cloud_orbit_ticks += 1
+            if self._cloud_finish_requested and self._cloud_orbit_ticks >= self._MIN_ORBIT_TICKS:
+                self._cloud_stage = "land"
+        elif stage == "land":
+            self._cloud_flatten = min(1.0, self._cloud_flatten + 0.045)
+            if self._cloud_flatten >= 1.0:
+                self._cloud_stage = "dissipate"
+        elif stage == "dissipate":
+            self._cloud_fade = min(1.0, self._cloud_fade + 0.06)
+            if self._cloud_fade >= 1.0:
+                self._cloud_timer.stop()
+                self._cloud_src = None
+                self._cloud_depth = None
+                self._cloud_result = None
+                self._cloud_stage = None
+                self.update()
+                self.reveal_done.emit()
+                return
+        self.update()
+
+    def _paint_cloud(self, painter: QPainter, rect: QRectF) -> None:
+        w, h, smooth = _cloud_render_size(rect)
+        # Ripple while the cloud is free-moving; off during the landing so the
+        # dots line up pixel-perfect with the result they fade into.
+        ripple = 0.0 if self._cloud_stage in ("land", "dissipate") else 1.0
+        frame = reveal.render_point_cloud_frame(
+            self._cloud_src, self._cloud_depth, w, h,
+            self._cloud_scan, self._cloud_orbit, self._cloud_flatten, ripple,
+        )
+        painter.save()
+        # In the dissipate stage the finished image sits behind and the cloud
+        # fades out over it, so the points melt into the result.
+        if self._cloud_result is not None:
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.drawPixmap(rect, self._cloud_result, QRectF(self._cloud_result.rect()))
+            painter.setOpacity(1.0 - self._cloud_fade)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
+        painter.drawImage(rect, to_qimage_u8(frame))
+        painter.restore()
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
         painter.fillRect(self.rect(), self.palette().window())
@@ -775,7 +974,9 @@ class ImageView(CanvasView):
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         rect = self._display_rect(self._pixmap.size())
-        if self._progress is not None and self._grey is not None:
+        if self._cloud_depth is not None:
+            self._paint_cloud(painter, rect)
+        elif self._progress is not None and self._grey is not None:
             self._paint_progress(painter, rect)
         else:
             painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
@@ -1015,34 +1216,71 @@ class SideBySideView(CanvasView):
         self._labels: list[str] = []
         self._progress: list[float | None] = []
         self._grey: list[QPixmap | None] = []
+        # Depth point-cloud reveal, per pane. Same cloud as the single-image
+        # view, but static (facing forward, no orbit) with only the scan pulse —
+        # styles convert one at a time, so each pane sits as the cloud until its
+        # result lands, then crossfades to it.
+        self._reveal_src: np.ndarray | None = None
+        self._reveal_depth: np.ndarray | None = None
+        self._reveal: list[bool] = []          # this pane is still computing
+        self._shown_cloud: list[bool] = []      # the cloud is currently drawn
+        self._fade: list[float | None] = []     # crossfade cloud→result, 0..1
+        self._pulse = 0.0
+        self._cloud_timer = QTimer(self)
+        self._cloud_timer.setInterval(45)
+        self._cloud_timer.timeout.connect(self._tick_cloud)
+
+    def set_reveal_source(self, source_rgb01: np.ndarray, inverse_depth: np.ndarray) -> None:
+        """The photo + depth every pane's cloud is built from (shared)."""
+        self._reveal_src = (np.clip(source_rgb01, 0.0, 1.0) * 255.0).astype(np.uint8)
+        self._reveal_depth = np.ascontiguousarray(inverse_depth, dtype=np.float32)
+
+    def _ensure_reveal_size(self) -> None:
+        n = len(self._panes)
+        for lst, fill in ((self._reveal, False), (self._shown_cloud, False), (self._fade, None)):
+            while len(lst) < n:
+                lst.append(fill)
+        del self._reveal[n:], self._shown_cloud[n:], self._fade[n:]
 
     # -- progress ------------------------------------------------------------
 
     def set_pane_progress(self, index: int, fraction: float | None) -> None:
-        """Sweep one pane while its version is being computed.
+        """Mark one pane as computing (show the cloud) or done.
 
-        Per pane rather than per view, because the styles are converted one
-        after another - the add-on reads its configuration once at startup, so
-        each style is its own harness. Showing them all sweeping together would
-        claim work is happening that has not started.
+        Per pane because styles convert one after another. `fraction` is kept
+        for API compatibility but the cloud self-animates, so only None vs
+        not-None matters: not-None means "still computing, show the cloud",
+        None means "done, let it crossfade to the result".
         """
-        while len(self._progress) < len(self._panes):
-            self._progress.append(None)
-            self._grey.append(None)
-        if not 0 <= index < len(self._progress):
+        self._ensure_reveal_size()
+        if not 0 <= index < len(self._reveal):
             return
-        if fraction is None:
-            self._progress[index] = None
-            self._grey[index] = None
-        else:
-            if self._grey[index] is None and index < len(self._panes):
-                self._grey[index] = desaturated(self._panes[index])
-            self._progress[index] = float(np.clip(fraction, 0.0, 1.0))
+        self._reveal[index] = fraction is not None
+        if fraction is not None and self._reveal_src is not None:
+            if not self._cloud_timer.isActive():
+                self._cloud_timer.start()
         self.update()
 
     def clear_progress(self) -> None:
-        self._progress = [None] * len(self._panes)
-        self._grey = [None] * len(self._panes)
+        self._ensure_reveal_size()
+        self._reveal = [False] * len(self._panes)
+        self._cloud_timer.stop()
+        self.update()
+
+    def _tick_cloud(self) -> None:
+        self._pulse = (self._pulse + 0.03) % 1.15
+        # Advance any pane crossfading from cloud to its result.
+        alive = any(self._reveal)
+        for i, f in enumerate(self._fade):
+            if f is not None:
+                f = min(1.0, f + 0.08)
+                self._fade[i] = None if f >= 1.0 else f
+                if self._fade[i] is None:
+                    self._shown_cloud[i] = False
+                else:
+                    alive = True
+        if not alive:
+            self._cloud_timer.stop()
         self.update()
 
     # -- geometry ------------------------------------------------------------
@@ -1098,10 +1336,15 @@ class SideBySideView(CanvasView):
         )
         # New pictures, so any sweep state belongs to images that are gone. The
         # caller re-arms whatever is still outstanding; keeping it here would
-        # leave a finished pane greyed because it used to be working.
+        # leave a finished pane greyed because it used to be working. Reveal
+        # flags reset the same way, but _shown_cloud/_fade are kept so a pane
+        # whose result just arrived can crossfade from its cloud (paintEvent
+        # starts that fade once it sees the pane is no longer revealing).
         self._panes = pixmaps
         self._progress = [None] * len(pixmaps)
         self._grey = [None] * len(pixmaps)
+        self._reveal = [False] * len(pixmaps)
+        self._ensure_reveal_size()
         if changed:
             self.reset_view()
         self.update()
@@ -1118,9 +1361,24 @@ class SideBySideView(CanvasView):
         self._panes = []
         self._progress = []
         self._grey = []
+        self._reveal = []
+        self._shown_cloud = []
+        self._fade = []
+        self._cloud_timer.stop()
         self.update()
 
     # -- painting ------------------------------------------------------------
+
+    def _paint_pane_cloud(self, painter: QPainter, here: QRectF) -> None:
+        w, h, smooth = _cloud_render_size(here)
+        # flatten=1: facing forward, aligned to the pane; the scan pulses and
+        # ripples (ripple=1) so the pixels wave side to side, not only brighten.
+        frame = reveal.render_point_cloud_frame(
+            self._reveal_src, self._reveal_depth, w, h, self._pulse, 0.0, 1.0, 1.0
+        )
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, smooth)
+        painter.drawImage(here, to_qimage_u8(frame))
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt name
         painter = QPainter(self)
@@ -1128,6 +1386,7 @@ class SideBySideView(CanvasView):
         if not self._panes:
             return
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._ensure_reveal_size()
 
         rect = self._display_rect(self._panes[0].size())
         view = self._viewport()
@@ -1137,12 +1396,30 @@ class SideBySideView(CanvasView):
             painter.save()
             painter.setClipRect(pane)
             here = rect.translated(offset, 0.0)
-            progress = self._progress[index] if index < len(self._progress) else None
-            grey = self._grey[index] if index < len(self._grey) else None
-            if progress is not None and grey is not None:
+            revealing = self._reveal[index] and self._reveal_src is not None
+            if revealing:
+                # Still computing: the static point cloud with its scan pulse.
+                self._shown_cloud[index] = True
+                self._fade[index] = None
+                self._paint_pane_cloud(painter, here)
+            elif self._shown_cloud[index]:
+                # Result just arrived: crossfade the result up over the cloud.
+                if self._fade[index] is None:
+                    self._fade[index] = 0.0
+                    if not self._cloud_timer.isActive():
+                        self._cloud_timer.start()
+                painter.drawPixmap(here, pixmap, QRectF(pixmap.rect()))
+                painter.save()
+                painter.setOpacity(1.0 - self._fade[index])
+                self._paint_pane_cloud(painter, here)
+                painter.restore()
+            elif self._progress[index] is not None and index < len(self._grey) \
+                    and self._grey[index] is not None:
+                # No reveal source (shouldn't happen in the style view) — fall
+                # back to the old grey sweep rather than nothing.
                 paint_sweep(
-                    painter, here, pixmap, grey,
-                    progress, self.palette().highlight().color(),
+                    painter, here, pixmap, self._grey[index],
+                    self._progress[index], self.palette().highlight().color(),
                 )
             else:
                 painter.drawPixmap(here, pixmap, QRectF(pixmap.rect()))
