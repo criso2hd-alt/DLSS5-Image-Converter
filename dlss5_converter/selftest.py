@@ -19,6 +19,62 @@ def _line(text: str = "") -> None:
     print(text, file=sys.stderr, flush=True)
 
 
+def run_gpu_check() -> int:
+    """Prove the depth stage runs on the GPU, and nothing else.
+
+    A deliberately narrow diagnostic: it loads the bundled ONNX model and runs
+    one inference, reporting the execution provider it actually landed on. It
+    never touches the native DLSS harness, so it is safe to run headless and
+    finishes in a second - the answer to "is this really using my GPU?" without
+    the weight of a full --selftest.
+    """
+    _line("DLSS 5 Converter - GPU depth check")
+    _line("=" * 34)
+    try:
+        import onnxruntime as ort
+
+        _line(f"onnxruntime      : {ort.__version__}")
+    except Exception as error:  # noqa: BLE001 - reporting is the whole point
+        _line(f"onnxruntime      : FAILED - {type(error).__name__}: {error}")
+        return 1
+
+    try:
+        import numpy as np
+
+        from .onnx_depth import OnnxDepthEngine
+        from .settings import AppSettings
+
+        model_id = AppSettings().depth.model_id
+        if not OnnxDepthEngine.is_downloaded(model_id):
+            _line("depth model      : not installed (the Small model should ship bundled)")
+            return 1
+
+        engine = OnnxDepthEngine()
+        device = engine.load(model_id)
+        _line(f"active providers : {', '.join(engine.session.get_providers())}")
+        probe = (np.random.default_rng(0).random((720, 1280, 3)) * 255).astype("uint8")
+        engine.infer(probe)  # warm up: first run pays the CUDA/cuDNN init cost
+        import time
+
+        start = time.perf_counter()
+        depth = engine.infer(probe)
+        elapsed = time.perf_counter() - start
+        _line(
+            f"depth inference  : ok {depth.shape} in {elapsed * 1000:.0f} ms on {device}"
+        )
+        if device != "cuda":
+            _line("")
+            _line("RESULT: running on " + device.upper() + ", not the GPU.")
+            return 1
+    except Exception as error:  # noqa: BLE001
+        _line(f"depth inference  : FAILED - {type(error).__name__}: {error}")
+        return 1
+
+    _line("")
+    _line("RESULT: GPU depth path is working.")
+    return 0
+
+
 def run_selftest() -> int:
     """Return 0 if the app can do its job, 1 otherwise."""
     failures = 0
@@ -181,6 +237,7 @@ def run_selftest() -> int:
             import numpy as np
 
             from . import pipeline
+            from .onnx_depth import OnnxDepthEngine
             from .settings import AppSettings
 
             settings = AppSettings()
@@ -192,7 +249,7 @@ def run_selftest() -> int:
             rng = np.random.default_rng(0)
             pipeline.save_image(rng.random((256, 256, 3)).astype("float32"), sample)
 
-            engine = DepthEngine()
+            engine = OnnxDepthEngine()
             result = pipeline.convert(sample, settings, engine)
             _line(
                 f"conversion       : ok {result.enhanced.shape[1]}x"
@@ -249,7 +306,7 @@ def run_selftest() -> int:
             import numpy as np
 
             from . import video
-            from .depth_engine import DepthEngine
+            from .onnx_depth import OnnxDepthEngine
             from .pipeline import convert_video
             from .settings import AppSettings
 
@@ -280,7 +337,7 @@ def run_selftest() -> int:
             settings.evaluation.frames = 1
             settings.evaluation.max_edge = 256
             done = 0
-            for _update in convert_video(clip, out, settings, DepthEngine(), codec_key="h264"):
+            for _update in convert_video(clip, out, settings, OnnxDepthEngine(), codec_key="h264"):
                 done += 1
             info = video.probe(out)
             _line(f"video conversion : ok {info.width}x{info.height}, {info.frames} frames")
