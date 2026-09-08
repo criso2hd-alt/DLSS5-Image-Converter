@@ -5117,41 +5117,44 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Introduction complete — open Settings to replay it.")
 
     def ensure_model_downloaded(self, model_id: str | None = None) -> None:
-        """Fetch the depth model if it is missing, behind a progress dialog.
+        """Make sure a usable depth model is selected.
 
-        Nothing about the model ships with the app — it is a separate download
-        under its own licence — so the first launch has to fetch it. Doing that
-        here rather than inside the first conversion means the wait is explained
-        and measured, instead of appearing as a stalled progress line partway
-        through what the user thought was a conversion.
+        The Apache-2.0 Small model ships inside the app as ONNX, so it is always
+        present. Base and Large are not bundled and have no ONNX download source
+        in this build, so selecting one cannot fetch anything - it used to crash
+        the download path with an ONNX/engine error. Rather than pretend to
+        download, fall back to Small and say so.
         """
         model_id = model_id or self.settings.depth.model_id
-        if self._download_thread is not None:
-            return
         if OnnxDepthEngine.is_downloaded(model_id):
             return
+        self._fall_back_to_small_model(model_id)
 
-        label = next((k for k, v in MODELS.items() if v == model_id), model_id)
-        self._download_dialog = DownloadDialog(
-            "Finishing setup — just this once.",
-            f"FIRST RUN · STEP 1 OF 3\n\n{label}\n\nThis is a one-time download, kept in the models folder "
-            f"beside the app. Nothing is bundled with the release.",
+    def _fall_back_to_small_model(self, requested: str) -> None:
+        """Reset the depth model to the bundled Small one, and explain why."""
+        from .onnx_depth import SMALL
+
+        if requested == SMALL:
+            # Small should always be present (it is bundled); if it somehow is
+            # not, there is nothing to fall back to, so stay quiet rather than
+            # loop. load() will raise a clear error at conversion time.
+            return
+        label = next((k for k, v in MODELS.items() if v == requested), requested)
+        self.settings.depth.model_id = SMALL
+        self.settings.save(paths.settings_path())
+        if hasattr(self, "model_box"):
+            self.model_box.blockSignals(True)
+            index = self.model_box.findData(SMALL)
+            if index >= 0:
+                self.model_box.setCurrentIndex(index)
+            self.model_box.blockSignals(False)
+        QMessageBox.information(
             self,
+            "Using the Small depth model",
+            f"{label} is not available in this build yet — only the bundled "
+            "Small model ships with the app. Staying on Small, which works out "
+            "of the box and needs no download.",
         )
-        self._download_dialog.setStyleSheet(STYLE)
-
-        self._download_thread = QThread(self)
-        self._download_worker = DownloadWorker(model_id, self.engine)
-        self._download_worker.moveToThread(self._download_thread)
-        self._download_thread.started.connect(self._download_worker.run)
-        self._download_worker.progress.connect(self._download_dialog.set_status)
-        self._download_worker.bytes_progress.connect(self._download_dialog.update_bytes)
-        self._download_worker.finished.connect(self._download_finished)
-        self._download_worker.failed.connect(self._download_failed)
-        self._download_thread.start()
-        # Modal: there is nothing useful to do in the app without this, and a
-        # conversion started midway through would race the download.
-        self._download_dialog.exec()
 
     def _close_download(self) -> None:
         if self._download_thread is not None:

@@ -308,6 +308,26 @@ def test_boost_offers_two_four_and_eight_without_a_fixed_8k_cap(window):
     assert "Boost 4×" not in labels
 
 
+def test_an_unavailable_depth_model_falls_back_to_small_without_crashing(window, monkeypatch):
+    """Base/Large have no ONNX download source; picking one must fall back to the
+    bundled Small model with a clear message, not crash the old download path."""
+    from dlss5_converter import app as gui
+    from dlss5_converter.onnx_depth import SMALL, OnnxDepthEngine
+
+    monkeypatch.setattr(
+        OnnxDepthEngine, "is_downloaded",
+        classmethod(lambda cls, model_id: model_id == SMALL),
+    )
+    told: list[bool] = []
+    monkeypatch.setattr(gui.QMessageBox, "information", lambda *a, **k: told.append(True))
+
+    window.ensure_model_downloaded("depth-anything/Depth-Anything-V2-Large-hf")
+
+    assert window.settings.depth.model_id == SMALL
+    assert told, "the user must be told it fell back to Small"
+    assert window.model_box.currentData() == SMALL
+
+
 def test_boost_levels_read_as_plain_names(window):
     """No 2×/4×/8× jargon in the sharpness control - Standard/High/Max instead."""
     names = [
