@@ -36,6 +36,17 @@ WANTED = (NEURAL_DLL, DLSS_DLL, ADDON, RESHADE)
 #: .addon64 beside it regardless of what it is called.
 ADDON_SUFFIX = ".addon64"
 
+#: Streamline runtime libraries that sit beside nvngx_dlss.dll in a Production /
+#: streamline drop (sl.interposer.dll, sl.common.dll, sl.dlss.dll, …). A modern
+#: nvngx_dlss.dll is a thin front for these, so copying it without them leaves
+#: DLSS unable to initialise - which reads as every indicator 0. They must be
+#: found and copied as part of the set. The folder they live in can be named
+#: anything (the user renames it), so they are matched by this pattern, not by a
+#: folder name, and collected from whatever subfolder holds nvngx_dlss.dll.
+def _is_streamline_lib(filename: str) -> bool:
+    low = filename.lower()
+    return low.startswith("sl.") and low.endswith(".dll")
+
 #: The real neural model is ~158 MB. Anything far smaller is a stub, a
 #: placeholder, or an error page saved with a .dll name.
 _MIN_NEURAL_BYTES = 100 * 1024 * 1024
@@ -63,6 +74,11 @@ class Candidate:
 
     folder: Path
     files: dict[str, Path] = field(default_factory=dict)
+    #: Streamline libraries in this folder (sl.interposer.dll, …), keyed by their
+    #: own filename since they keep their names in dlss_files. Not counted toward
+    #: the score - they ride along with nvngx_dlss.dll rather than being one of
+    #: the four the user is asked to find.
+    streamline: dict[str, Path] = field(default_factory=dict)
 
     @property
     def score(self) -> int:
@@ -92,10 +108,11 @@ class Candidate:
         return max(times) if times else 0.0
 
     def describe(self) -> str:
+        extra = f" + {len(self.streamline)} Streamline" if self.streamline else ""
         missing = [name for name in WANTED if name not in self.files]
         if not missing:
-            return f"{self.folder}  —  all four"
-        return f"{self.folder}  —  {self.score} of 4, missing {', '.join(missing)}"
+            return f"{self.folder}  —  all four{extra}"
+        return f"{self.folder}  —  {self.score} of 4{extra}, missing {', '.join(missing)}"
 
 
 def looks_like_reshade(path: Path) -> bool:
@@ -249,8 +266,15 @@ def scan(
             if on_progress is not None and scanned % 400 == 0:
                 on_progress(f"Searching… {scanned} folders, {len(by_folder)} hit(s)")
 
+            streamline_here: dict[str, Path] = {}
             for filename in filenames:
                 low = filename.lower()
+                # Streamline libraries: collected for this folder and attached
+                # only if the folder turns out to hold one of the wanted files,
+                # so a stray sl.*.dll elsewhere does not create a phantom hit.
+                if _is_streamline_lib(filename):
+                    streamline_here.setdefault(low, here / filename)
+                    continue
                 canonical = wanted_lower.get(low)
                 if canonical is None:
                     # A RenoDX rename: any .addon64 stands in for the add-on and
@@ -264,6 +288,12 @@ def scan(
                     continue
                 candidate = by_folder.setdefault(here, Candidate(here))
                 candidate.files.setdefault(canonical, path)
+
+            # Attach this folder's Streamline set to its candidate, if any wanted
+            # file was found here. They ride with nvngx_dlss.dll into dlss_files.
+            if streamline_here and here in by_folder:
+                for name, path in streamline_here.items():
+                    by_folder[here].streamline.setdefault(name, path)
 
     return _ranked(by_folder)
 
@@ -306,6 +336,18 @@ def best_set(candidates: list[Candidate]) -> dict[str, Path]:
             newest_time, newest_addon = when, path
     if newest_addon is not None:
         chosen[ADDON] = newest_addon
+
+    # Bring the Streamline set along with the nvngx_dlss.dll that was chosen -
+    # they are what makes a modern DLSS dll actually initialise, and they must
+    # come from the same folder as it, not be mixed from elsewhere. Keyed by
+    # their own filename, so install writes them under the names Streamline uses.
+    chosen_dlss = chosen.get(DLSS_DLL)
+    if chosen_dlss is not None:
+        for candidate in candidates:
+            if candidate.files.get(DLSS_DLL) == chosen_dlss:
+                for name, path in candidate.streamline.items():
+                    chosen.setdefault(name, path)
+                break
     return chosen
 
 

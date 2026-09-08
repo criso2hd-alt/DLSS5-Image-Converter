@@ -49,6 +49,53 @@ def test_the_most_complete_folder_ranks_first(tmp_path):
     assert results[0].folder.name == "bin"
 
 
+def test_streamline_libraries_are_collected_with_the_set(tmp_path):
+    """A renamed folder holding the four plus a Streamline runtime: the sl.*.dll
+    files ride along, matched by pattern rather than by the folder's name."""
+    folder = full_set(tmp_path / "my-renamed-dlss-stuff")
+    big(folder / "sl.interposer.dll", 1)
+    big(folder / "sl.common.dll", 1)
+    big(folder / "sl.dlss.dll", 1)
+
+    results = scan([tmp_path])
+    assert results and results[0].complete
+    assert set(results[0].streamline) == {
+        "sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"
+    }
+
+    chosen = best_set(results)
+    for name in ("sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"):
+        assert name in chosen, name
+
+    destination = tmp_path / "dlss_files"
+    copied, _skipped = install(chosen, destination)
+    for name in ("sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"):
+        assert (destination / name).exists(), name
+        assert name in copied
+
+
+def test_a_lone_streamline_lib_creates_no_phantom_hit(tmp_path):
+    """sl.*.dll with none of the four in the folder must not register a folder."""
+    big(tmp_path / "somewhere" / "sl.interposer.dll", 1)
+    assert scan([tmp_path]) == []
+
+
+def test_streamline_libs_still_copy_when_the_four_already_exist(tmp_path):
+    """The reported rescan bug: with the four already in dlss_files, pointing at a
+    folder must still bring the Streamline files it was missing, not report
+    'nothing to copy'."""
+    source = full_set(tmp_path / "game" / "bin")
+    big(source / "sl.interposer.dll", 1)
+    destination = tmp_path / "dlss_files"
+    full_set(destination)  # the four are already present, no Streamline
+
+    copied, skipped = install(best_set(scan([source])), destination)
+    assert "sl.interposer.dll" in copied
+    assert (destination / "sl.interposer.dll").exists()
+    # The four are left alone (never overwritten), but the set is no longer empty.
+    assert NEURAL_DLL in skipped
+
+
 def test_a_stub_runtime_is_rejected(tmp_path):
     """A 2 MB nvngx_dlssnr.dll is not the 158 MB model."""
     big(tmp_path / "fake" / NEURAL_DLL, 2)

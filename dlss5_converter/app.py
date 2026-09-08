@@ -1068,7 +1068,9 @@ class FindFilesDialog(QDialog):
 
     def _selection_changed(self, _row: int) -> None:
         plan = self._plan()
-        self.copy_button.setEnabled(len(plan) == len(discovery.WANTED))
+        # Complete means all four wanted files; the plan may also carry Streamline
+        # libraries, which must not be counted as if they were missing mains.
+        self.copy_button.setEnabled(all(name in plan for name in discovery.WANTED))
         if not plan:
             if self._onboarding_mode:
                 self._set_plan_summary({})
