@@ -29,6 +29,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>  // CommandLineToArgvW - see main() for why argv is rebuilt
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -905,8 +906,28 @@ Options Parse(int argc, char** argv) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-    Options options = Parse(argc, argv);
+int main(int /*argc*/, char** /*argv*/) {
+    // Windows hands main() its argv already down-converted to the system ANSI
+    // code page, which cannot represent characters outside it: a contract-plane
+    // path under a folder with Cyrillic (or any non-Latin) characters arrives as
+    // "?" and the file fails to open ("Could not open a contract plane"). So we
+    // ignore the ANSI argv and rebuild it from the real UTF-16 command line,
+    // re-encoding each argument as UTF-8 - which Widen() decodes losslessly - so
+    // paths survive regardless of the machine's locale. Colour/output paths that
+    // travel over stdin are already UTF-8 (see evaluator.py) and never had this
+    // problem; only the argv paths (--depth, --motion) did.
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (wargv == nullptr) Fail("Could not read the command line.");
+    std::vector<std::string> utf8_args;
+    utf8_args.reserve(static_cast<size_t>(wargc));
+    for (int i = 0; i < wargc; ++i) utf8_args.push_back(Narrow(wargv[i]));
+    LocalFree(wargv);
+    std::vector<char*> argv_utf8;
+    argv_utf8.reserve(utf8_args.size());
+    for (std::string& arg : utf8_args) argv_utf8.push_back(arg.data());
+
+    Options options = Parse(wargc, argv_utf8.data());
 
     Harness harness;
     harness.Initialise(options);

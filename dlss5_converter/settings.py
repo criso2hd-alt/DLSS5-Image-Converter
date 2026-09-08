@@ -75,21 +75,20 @@ class NeuralSettings:
     #: further from the source than Natural does at the same strengths. Default
     #: (0) is the add-on's own starting look.
     style: int = 0
-    # Defaults are 1.0 - the midpoint of the 0..2 range - rather than the
-    # gentler values these once held. The old defaults were low enough that on
-    # already-photographic content the change was invisible side by side, and
-    # the commonest first report was "it does nothing". 1.0 is clearly visible
-    # while leaving obvious headroom to push or pull back.
+    # Defaults are the maximum (2.0). The whole point of the tool is the neural
+    # effect, so it opens fully on and obviously working — the commonest first
+    # report on gentler defaults was "it does nothing" — and anyone who finds a
+    # face waxy or the relight too strong pulls the sliders down from there.
     #: Overall strength of the neural pass. 0 is a plain DLAA resolve.
-    intensity: float = 1.0
+    intensity: float = NR_STRENGTH_MAX
     #: Subsurface-scattering and pore-level work on faces. The reason most
     #: people want this tool, and the first thing to lower when output looks
     #: waxy or "yassified".
-    skin: float = 1.0
+    skin: float = NR_STRENGTH_MAX
     #: Local tone response — how much the model is allowed to relight.
-    local_tone: float = 1.0
+    local_tone: float = NR_STRENGTH_MAX
     #: Micro-contrast and material structure (fabric weave, hair strands).
-    structure: float = 1.0
+    structure: float = NR_STRENGTH_MAX
 
     # --- HDR group ---------------------------------------------------------
     #

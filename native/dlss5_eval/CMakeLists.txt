@@ -28,6 +28,7 @@ target_link_libraries(dlss5_eval PRIVATE
     dxgi
     dxguid
     user32
+    shell32  # CommandLineToArgvW, for Unicode-safe argv (see main.cpp)
 )
 
 # /MT so the harness does not depend on a VC++ redistributable being installed.

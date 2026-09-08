@@ -55,7 +55,8 @@ def test_bad_onboarding_version_does_not_break_settings(tmp_path):
 
 
 def test_tutorial_asset_is_bundled():
-    assert paths.onboarding_image().is_file()
+    assert paths.onboarding_before().is_file()
+    assert paths.onboarding_after().is_file()
 
 
 def test_spotlight_walks_each_real_target_and_finishes(qt_app):

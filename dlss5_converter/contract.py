@@ -170,7 +170,7 @@ def load_source(path: str | Path) -> Source:
     """
     # Imported here rather than at module scope: hdr needs this module's
     # transfer curves, so importing it at the top would be a cycle.
-    from . import hdr, wic
+    from . import hdr, imaging, wic
 
     target = Path(path)
     is_hdr = hdr.is_hdr_source(target)
@@ -178,7 +178,7 @@ def load_source(path: str | Path) -> Source:
     if wic.handles(target):
         linear = wic.read(target)
     else:
-        source = cv2.imread(str(target), cv2.IMREAD_UNCHANGED)
+        source = imaging.imread(target, cv2.IMREAD_UNCHANGED)
         if source is None:
             raise ValueError(f"Could not read {target.name} — unsupported or corrupt.")
         if source.ndim == 2:

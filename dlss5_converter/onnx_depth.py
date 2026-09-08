@@ -36,6 +36,115 @@ ONNX_FILES = {
 #: (non-bundled) model has not been exported or downloaded.
 SMALL = "depth-anything/Depth-Anything-V2-Small-hf"
 
+#: Where the larger depth models are fetched from. Base and Large are CC-BY-NC
+#: and large (fp16: ~190 MB and ~670 MB), so bundling them would multiply the
+#: release size and raise a redistribution question the Apache-2.0 Small model
+#: does not — they are an opt-in one-file download instead. Small is always
+#: bundled and never listed here. Kept behind a release tag so the whole set
+#: moves as a unit and an older app keeps resolving the URLs it shipped with.
+DOWNLOAD_BASE_URL = (
+    "https://github.com/criso2hd-alt/DLSS5-Image-Converter/"
+    "releases/download/depth-models-v1"
+)
+
+#: model_id -> hosted fp16 asset. ``sha256`` and ``bytes`` are filled once the
+#: asset is actually uploaded (see scripts/export_onnx.py --fp16); until then
+#: ``is_downloadable`` returns False and the app falls back to the bundled Small,
+#: so shipping this half-populated changes nothing at run time. The downloaded
+#: file is saved locally under ``ONNX_FILES[model_id]`` so ``locate`` finds it,
+#: regardless of the asset's own name.
+ONNX_DOWNLOADS: dict[str, dict[str, object]] = {
+    "depth-anything/Depth-Anything-V2-Base-hf": {
+        "asset": "Depth-Anything-V2-Base-hf.fp16.onnx",
+        "sha256": "1199aedf43ce042a5dce13cee99d3ee1a77b3792fba657e628556270eff68451",
+        "bytes": 194738079,
+    },
+    "depth-anything/Depth-Anything-V2-Large-hf": {
+        "asset": "Depth-Anything-V2-Large-hf.fp16.onnx",
+        "sha256": "9911617ea9c39de788ab6f2b38b9aeb811ce9b864965997cf86eb41b3276e3b1",
+        "bytes": 668961707,
+    },
+}
+
+
+def is_downloadable(model_id: str) -> bool:
+    """Whether `model_id` has a hosted asset the app can fetch.
+
+    False until the asset's ``sha256`` is filled in ONNX_DOWNLOADS, so a build
+    made before the models were uploaded simply treats them as unavailable
+    rather than chasing a URL that 404s.
+    """
+    entry = ONNX_DOWNLOADS.get(model_id)
+    return bool(entry and entry.get("sha256"))
+
+
+def download_model(
+    model_id: str,
+    dest_dir: Path,
+    progress: Callable[[str], None] | None = None,
+    bytes_progress: Callable[[int, int], None] | None = None,
+) -> Path:
+    """Fetch the hosted fp16 ONNX for `model_id` into `dest_dir`, verified.
+
+    Streams to a ``.part`` file, checks size and SHA-256 before committing, and
+    only then atomically renames into place — so an interrupted or corrupted
+    download never leaves a half-file that ``locate`` would happily load and
+    ONNX Runtime would then choke on. Returns the final path.
+    """
+    import hashlib
+    import urllib.request
+
+    entry = ONNX_DOWNLOADS.get(model_id)
+    if not entry or not entry.get("sha256"):
+        raise RuntimeError(f"No download is available for {model_id}.")
+
+    # Same trust-store fix the HF download uses: verify TLS against the OS store
+    # so an AV/proxy's private root does not fail the fetch (see depth_engine).
+    from .depth_engine import enable_system_trust_store
+
+    enable_system_trust_store()
+
+    asset = str(entry["asset"])
+    expected_sha = str(entry["sha256"])
+    expected_bytes = int(entry["bytes"]) if entry.get("bytes") else 0
+    url = f"{DOWNLOAD_BASE_URL}/{asset}"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    final = dest_dir / ONNX_FILES[model_id]
+    part = final.with_suffix(final.suffix + ".part")
+
+    if progress:
+        progress("Downloading the depth model…")
+    digest = hashlib.sha256()
+    done = 0
+    with urllib.request.urlopen(url) as response:  # noqa: S310 - fixed https host
+        total = expected_bytes or int(response.headers.get("Content-Length") or 0)
+        with open(part, "wb") as handle:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                if bytes_progress and total:
+                    bytes_progress(done, total)
+
+    if expected_bytes and done != expected_bytes:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded {done} bytes but expected {expected_bytes}. "
+            "The download was interrupted; try again."
+        )
+    if digest.hexdigest() != expected_sha:
+        part.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded depth model failed its integrity check and was "
+            "discarded. Try again, or pick a different model."
+        )
+    os.replace(part, final)
+    return final
+
 #: The square edge the models are exported at (multiple of 14; DINOv2 patch size).
 INPUT = 518
 
@@ -156,6 +265,37 @@ class OnnxDepthEngine:
     @classmethod
     def is_downloaded(cls, model_id: str) -> bool:
         return locate(model_id) is not None
+
+    def ensure_downloaded(
+        self,
+        model_id: str,
+        progress: Callable[[str], None] | None = None,
+        bytes_progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        """Interface parity with depth_engine.DepthEngine: make `model_id`
+        present, downloading it if there is a hosted asset for it.
+
+        The bundled Small model is already present, so this returns at once for
+        it. Base/Large are fetched from ONNX_DOWNLOADS when their asset has been
+        published; if there is no source yet, it raises a clear message and the
+        caller falls back to Small.
+
+        This method existing at all is also the fix for a v0.3.0 crash: the
+        download path (app.DownloadWorker) called ``engine.ensure_downloaded``
+        blindly, and because this class did not define it, selecting Base/Large
+        blew up with "'OnnxDepthEngine' object has no attribute
+        'ensure_downloaded'".
+        """
+        if locate(model_id) is not None:
+            return
+        if is_downloadable(model_id):
+            download_model(model_id, onnx_models_dir(), progress, bytes_progress)
+            return
+        name = ONNX_FILES.get(model_id, model_id)
+        raise RuntimeError(
+            f"{name} is not bundled and is not available to download in this "
+            "build — only the Small model ships as ONNX."
+        )
 
     def load(
         self,

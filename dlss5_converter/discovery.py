@@ -318,14 +318,29 @@ def install(files: dict[str, Path], destination: Path) -> tuple[list[str], list[
     destination.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
     skipped: list[str] = []
-    for name, source in files.items():
-        target = destination / name
+
+    def copy_one(source: Path, target: Path) -> None:
         if target.exists():
-            skipped.append(name)
-            continue
+            skipped.append(target.name)
+            return
         try:
             shutil.copy2(source, target)
-            copied.append(name)
+            copied.append(target.name)
         except OSError as error:
-            skipped.append(f"{name} ({error})")
+            skipped.append(f"{target.name} ({error})")
+
+    for name, source in files.items():
+        copy_one(source, destination / name)
+
+    # Streamline siblings. A modern nvngx_dlss.dll is a thin front that loads
+    # sl.interposer.dll and friends from its own folder; the finder otherwise
+    # copies only the four named files and leaves those behind, so the runtime
+    # cannot hook — the "find my files doesn't copy the Streamline folder"
+    # report. Bring across any sl.*.dll sitting beside the chosen nvngx_dlss.dll.
+    # Additive and safe: a plain game bin with no Streamline layer has none.
+    dlss = files.get(DLSS_DLL)
+    if dlss is not None:
+        for sibling in sorted(dlss.parent.glob("sl.*.dll")):
+            copy_one(sibling, destination / sibling.name)
+
     return copied, skipped
