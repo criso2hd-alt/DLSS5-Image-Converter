@@ -109,7 +109,7 @@ def test_every_teardown_survives_being_called(window):
 def test_every_view_switches_without_raising(window):
     prepare(window)
     window.result = result()
-    window.style_results = {0: result(), 1: result()}
+    window.style_results = {0: result(), 1: result(), 2: result()}
     window._style_signature_used = window._style_signature()
     for view in ("photo", "depth", "result", "difference", "styles", "photo"):
         window.show_view(view)
@@ -251,7 +251,7 @@ def test_progress_messages_are_harmless_when_no_sweep_is_running(window):
 
 def test_adopting_a_style_makes_it_the_result(window):
     prepare(window)
-    window.style_results = {0: result(), 1: result()}
+    window.style_results = {0: result(), 1: result(), 2: result()}
     window._style_signature_used = window._style_signature()
     window._adopt_style(1)
     assert window.settings.neural.style == 1
@@ -306,6 +306,45 @@ def test_boost_offers_two_four_and_eight_without_a_fixed_8k_cap(window):
     labels = [button.text() for button in window.detail_mode.findChildren(gui.QPushButton)]
     assert "Boost" in labels
     assert "Boost 4×" not in labels
+
+
+def test_boost_levels_read_as_plain_names(window):
+    """No 2×/4×/8× jargon in the sharpness control - Standard/High/Max instead."""
+    names = [
+        window.detail_supersample.itemText(i)
+        for i in range(window.detail_supersample.count())
+    ]
+    assert names == ["Standard", "High", "Max"]
+
+
+def test_boost_guard_disables_levels_that_overflow_the_texture_limit(window):
+    """At a high Max size the big levels are greyed and the choice steps down.
+
+    This is jerkalerk's InvalidParameter error turned into a prevented, spoken
+    state: 8192 px only leaves room for the smallest level (8192×2 = 16384).
+    """
+    window.settings.detail.mode = "boost"
+    window.settings.detail.supersample = 8  # "Max"
+    window.settings.evaluation.max_edge = 8192
+    window._sync_boost_guard()
+
+    # Stepped down to the only level that fits, and said so. (isVisible() is
+    # False in an unshown test window, so assert the message text instead.)
+    assert window.settings.detail.supersample == 2
+    assert window.detail_guard.text() != ""
+    assert not window.detail_guard.isHidden()
+    model = window.detail_supersample.model()
+    enabled = [model.item(i).isEnabled() for i in range(window.detail_supersample.count())]
+    assert enabled == [True, False, False]  # Standard fits; High and Max do not
+
+
+def test_boost_guard_reports_when_nothing_fits(window):
+    """Above 8192 px even the smallest level overflows: Boost cannot supersample."""
+    window.settings.detail.mode = "boost"
+    window.settings.evaluation.max_edge = 12000
+    window._sync_boost_guard()
+    assert "8192" in window.detail_guard.text()
+    assert not window.detail_guard.isHidden()
 
 
 # -- what a run looks like while it is running -------------------------------
@@ -375,16 +414,18 @@ def test_each_pane_returns_to_colour_only_when_its_own_style_lands(window):
     window.style_count_box.setCurrentIndex(1)
     window.show_view("styles")
 
-    window._style_started(0)
+    # Style indices are NR_STYLES = (Default, Natural, Cinematic); the default
+    # three-pane view shows Original, Natural (1), Cinematic (2).
+    window._style_started(1)
     window._report_progress("DLSS 5 pass 4 of 8")
     # Natural sweeping; Cinematic still fully grey, not blank.
     assert window.side_by_side._progress == [None, pytest.approx(0.5), 0.0]
 
-    window._style_one_done(0, result())
+    window._style_one_done(1, result())
     assert window.side_by_side._progress[1] is None, "Natural is done, full colour"
     assert window.side_by_side._progress[2] == 0.0, "Cinematic still waiting, grey"
 
-    window._style_started(1)
+    window._style_started(2)
     window._report_progress("DLSS 5 pass 2 of 8")
     assert window.side_by_side._progress == [None, None, pytest.approx(0.25)]
 
@@ -392,7 +433,7 @@ def test_each_pane_returns_to_colour_only_when_its_own_style_lands(window):
 def test_finishing_a_comparison_clears_up(window):
     prepare(window)
     window.show_view("styles")
-    window._styles_ready({0: result(), 1: result()})
+    window._styles_ready({0: result(), 1: result(), 2: result()})
     assert window._view == "styles"
     assert window.side_by_side._progress == [None, None]
     assert window.view_styles.isEnabled(), "the button must come back"
@@ -406,7 +447,7 @@ def test_a_settings_change_re_runs_the_comparison_in_place(window):
     disabled for the rest of the session.
     """
     prepare(window)
-    window.style_results = {0: result(), 1: result()}
+    window.style_results = {0: result(), 1: result(), 2: result()}
     window._style_signature_used = window._style_signature()
     window.show_view("styles")
     window._styles_ready(window.style_results)

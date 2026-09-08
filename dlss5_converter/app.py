@@ -58,8 +58,10 @@ from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
 from .onnx_depth import OnnxDepthEngine
 from .settings import (
+    BOOST_LEVEL_LABELS,
     DETAIL_BOOST_FACTORS,
     MAX_EDGE_CHOICES,
+    max_boost_factor,
     NR_COLOR_MAX,
     NR_PAPER_WHITE_MAX,
     ONBOARDING_VERSION,
@@ -68,6 +70,7 @@ from .settings import (
     NR_STYLES,
     NR_TRANSFER_MAX,
     AppSettings,
+    style_slug,
 )
 from .widgets import (
     FONT_DISPLAY,
@@ -1591,7 +1594,8 @@ class VideoQueueDialog(QDialog):
         # A distinct name so a queue pointed at its own source folder never
         # overwrites an input, and the H.264 default does not collide with an
         # H.264 source of the same stem.
-        return self.destination / f"{source.stem}_dlss5{suffix}"
+        style = style_slug(self._window.settings.neural.style)
+        return self.destination / f"{source.stem}_dlss5_{style}{suffix}"
 
     def _start(self) -> None:
         if not self.jobs or self._thread is not None:
@@ -3285,11 +3289,13 @@ class MainWindow(QMainWindow):
     def _apply_pane_defaults(self, count: int) -> None:
         """Sensible starting selections for a given number of panes.
 
-        Two panes is the style question - Natural against Cinematic. Three is
+        Two panes is the style question - Natural against Cinematic (the two
+        looks that actually differ; Default is the add-on's baseline). Three is
         the "is it helping" question, and that reads best with the source
         first, so the eye moves from unprocessed to most processed.
         """
-        defaults = [0, 1] if count == 2 else [-1, 0, 1]
+        # NR_STYLES is (Default, Natural, Cinematic) = indices 0, 1, 2.
+        defaults = [1, 2] if count == 2 else [-1, 1, 2]
         for box, value in zip(self.style_choices, defaults):
             index = box.findData(value)
             if index >= 0:
@@ -4047,13 +4053,20 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(self.preset_box, 1)
         neural_layout.addLayout(preset_row)
 
-        # Style is two choices — Natural or Cinematic — so it reads better as a
-        # segmented control with both visible than as a dropdown that hides one.
+        # Style is the add-on's three looks — Default, Natural, Cinematic — so it
+        # reads better as a segmented control with all three visible than as a
+        # dropdown that hides two. Default is what DLSS 5 gives the moment it is
+        # switched on; Natural and Cinematic are the two graded looks.
         self.style_box = SegmentedControl(
             list(NR_STYLES),
             current=min(len(NR_STYLES) - 1, max(0, settings.style)),
         )
-        self.style_box.setToolTip("Broad look, applied on top of the preset.")
+        self.style_box.setToolTip(
+            "The add-on's overall look.\n\n"
+            "Default — the look DLSS 5 starts with.\n"
+            "Natural — subtle grade, closer to the source.\n"
+            "Cinematic — stronger grade, moves furthest from the source."
+        )
         self.style_box.changed.connect(self._style_changed)
         neural_layout.addWidget(self.style_box)
 
@@ -4198,26 +4211,35 @@ class MainWindow(QMainWindow):
         )
         d_layout.addWidget(self.detail_amount)
 
-        # Boost-only: how far to supersample. Sits under Amount, greyed unless
-        # Boost is selected, since it means nothing to the other modes.
+        # Boost-only: how hard to push it. "Extra sharpness" instead of the raw
+        # 2×/4×/8× multiplier - the number is an implementation detail, and the
+        # levels that would blow past the hardware texture limit are disabled by
+        # _sync_boost_guard rather than left to fail mid-conversion.
         ss_row = QHBoxLayout()
-        self.detail_super_label = QLabel("Supersample")
+        self.detail_super_label = QLabel("Extra sharpness")
         ss_row.addWidget(self.detail_super_label)
         self.detail_supersample = QComboBox()
         for factor in DETAIL_BOOST_FACTORS:
-            self.detail_supersample.addItem(f"{factor}x", factor)
+            self.detail_supersample.addItem(BOOST_LEVEL_LABELS[factor], factor)
         self.detail_supersample.setToolTip(
-            "Boost only. 2×/4×/8× process 4/16/64 times the pixels. The app "
-            "uses current free VRAM for a preflight instead of silently stepping "
-            "the factor down. D3D12 has a hard 16,384 px limit per side, and "
-            "the installed DLSS runtime may impose a lower working limit."
+            "How much sharper Boost pushes. Higher runs DLSS at a larger size "
+            "before shrinking it back, so it is crisper but slower. Levels that "
+            "would not fit at the current Max size are greyed out."
         )
         ss_idx = self.detail_supersample.findData(self.settings.detail.supersample)
-        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 1)
+        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 0)
         self.detail_supersample.currentIndexChanged.connect(self._detail_super_changed)
         ss_row.addStretch(1)
         ss_row.addWidget(self.detail_supersample)
         d_layout.addLayout(ss_row)
+
+        # A second, quieter line for the guard message ("Max needs a smaller Max
+        # size…"), kept separate from the mode explainer so the two do not fight
+        # over one label.
+        self.detail_guard = QLabel()
+        self.detail_guard.setObjectName("hint")
+        self.detail_guard.setWordWrap(True)
+        d_layout.addWidget(self.detail_guard)
 
         # A one-line explainer under the controls, like the mockup's card copy —
         # updated to whichever mode is selected.
@@ -4231,23 +4253,79 @@ class MainWindow(QMainWindow):
 
     _DETAIL_HINTS = {
         "off": "The plain DLSS result — no detail recovery.",
-        "preserve": "Preserve re-injects the source's real fine detail — brick, "
-                    "mesh and fabric stay crisp while the neural relight is kept. "
-                    "No halos.",
-        "boost": "Boost supersamples: DLSS runs at 2×/4×/8× the size, crispened, "
-                 "then downscales. The selected factor is never silently reduced; "
-                 "VRAM is checked first and DLSS reports its own runtime limit.",
+        "preserve": "Preserve keeps the source's own fine texture — brick, mesh "
+                    "and fabric stay crisp — while keeping the neural relight. "
+                    "Instant, and the right default.",
+        "boost": "Boost runs DLSS larger than the image, then shrinks it back for "
+                 "extra crispness. Slower, and it applies on the next Convert.",
     }
 
+    def _sync_boost_guard(self) -> None:
+        """Offer only the sharpness levels that fit the current Max size.
+
+        Boost runs at (Max size × level), and a D3D12 texture cannot exceed
+        D3D12_MAX_TEXTURE_DIMENSION on a side, so a high level at a high Max size
+        overflows - the opaque failure a user hit as an add-on init error. Here
+        the overflowing levels are simply disabled, the selection is stepped down
+        to the best that fits, and a plain line explains it. Above 8192 px even
+        the smallest level cannot fit, which is the "Boost needs Max size 8192 px
+        or smaller" case.
+        """
+        if not hasattr(self, "detail_supersample"):
+            return
+        max_edge = int(self.settings.evaluation.max_edge)
+        ceiling = max_boost_factor(max_edge)  # 0 when nothing fits
+        active = self.settings.detail.mode == "boost"
+
+        # Enable/disable each level by whether it fits, without firing the change
+        # handler while we reshape the list.
+        self.detail_supersample.blockSignals(True)
+        model = self.detail_supersample.model()
+        for i in range(self.detail_supersample.count()):
+            factor = self.detail_supersample.itemData(i)
+            fits = ceiling > 0 and factor <= ceiling
+            model.item(i).setEnabled(fits)
+
+        # Only clamp the stored level and speak up while Boost is the live mode.
+        # Doing it when Boost is off would silently change a setting the user
+        # cannot see the effect of; the guard re-runs the moment Boost is chosen.
+        message = ""
+        if active:
+            if ceiling == 0:
+                # Nothing fits: Boost can't supersample at this Max size.
+                message = (
+                    f"Boost needs Max size 8192 px or smaller — at {max_edge} px "
+                    "it would exceed the GPU's texture limit."
+                )
+            else:
+                chosen = int(self.settings.detail.supersample)
+                if chosen > ceiling:
+                    # Step the stored setting down to the best that fits, say so.
+                    self.settings.detail.supersample = ceiling
+                    self.settings.save(paths.settings_path())
+                    idx = self.detail_supersample.findData(ceiling)
+                    if idx >= 0:
+                        self.detail_supersample.setCurrentIndex(idx)
+                    message = (
+                        f"{BOOST_LEVEL_LABELS.get(chosen, 'That level')} needs a "
+                        f"smaller Max size — using {BOOST_LEVEL_LABELS[ceiling]} "
+                        f"at {max_edge} px."
+                    )
+        self.detail_supersample.blockSignals(False)
+        if hasattr(self, "detail_guard"):
+            self.detail_guard.setText(message)
+            self.detail_guard.setVisible(bool(message))
+
     def _sync_detail_controls(self) -> None:
-        """Grey the supersample row unless Boost is the active mode, and set the
-        card's explainer to match the selected mode."""
+        """Grey the sharpness row unless Boost is the active mode, set the card's
+        explainer to match the selected mode, and re-run the Boost guard."""
         mode = self.settings.detail.mode
         is_boost = mode == "boost"
         self.detail_supersample.setEnabled(is_boost)
         self.detail_super_label.setEnabled(is_boost)
         if hasattr(self, "detail_hint"):
             self.detail_hint.setText(self._DETAIL_HINTS.get(mode, ""))
+        self._sync_boost_guard()
 
     def _detail_mode_changed(self, _index: int) -> None:
         self.settings.detail.mode = self.detail_mode.current_data() or "off"
@@ -4398,7 +4476,8 @@ class MainWindow(QMainWindow):
         page = self.video_page
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
         stem = page.source.stem if page.source else "video"
-        start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5{codec.suffix}"))
+        style = style_slug(self.settings.neural.style)
+        start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5_{style}{codec.suffix}"))
         chosen, _ = QFileDialog.getSaveFileName(
             self, "Output video", start_dir, f"{codec.label} (*{codec.suffix})"
         )
@@ -4448,7 +4527,8 @@ class MainWindow(QMainWindow):
         # A default output beside the app, so Convert works without a detour
         # through the Output picker - but the picker can override it.
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
-        page.output_path = paths.output_dir() / f"{path.stem}_dlss5{codec.suffix}"
+        style = style_slug(self.settings.neural.style)
+        page.output_path = paths.output_dir() / f"{path.stem}_dlss5_{style}{codec.suffix}"
         page.output_label.setText(f"Output: {page.output_path}")
 
     def _video_mode_changed(self) -> None:
@@ -5252,6 +5332,9 @@ class MainWindow(QMainWindow):
         if value == self.settings.evaluation.max_edge:
             return
         self.settings.evaluation.max_edge = value
+        # Max size is the ceiling Boost multiplies, so a change here can make the
+        # current sharpness level fit or overflow. Re-run the guard.
+        self._sync_boost_guard()
         # Depth is estimated on the fitted image, so a different size means the
         # cached depth is the wrong shape and has to be redone.
         self._depth_settings_changed()
@@ -5499,7 +5582,8 @@ class MainWindow(QMainWindow):
         # first would quietly tone map away the entire reason the source was
         # opened as HDR.
         is_hdr = self.result.hdr
-        default = str(Path(suggested) / f"{stem}_dlss5.{'jxr' if is_hdr else 'png'}")
+        style = style_slug(self.settings.neural.style)
+        default = str(Path(suggested) / f"{stem}_dlss5_{style}.{'jxr' if is_hdr else 'png'}")
         hdr_filters = "JPEG XR (*.jxr);;OpenEXR (*.exr);;"
         sdr_filters = "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)"
         filters = (hdr_filters + sdr_filters) if is_hdr else (sdr_filters + ";;" + hdr_filters.rstrip(";"))
@@ -5587,8 +5671,18 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
         report = outcome.get("report", "")
+        # The probe can come back "ready" by file detection yet fail the live
+        # test with every field 0 (issue #6). Interpret the fields into a plain
+        # cause, show it first, and treat a failed probe as a problem so the
+        # Troubleshooting button appears.
+        probe_problems = evaluator.interpret_probe(report) if report else []
+        extra: list[str] = []
+        if probe_problems:
+            extra += [""] + probe_problems
+        if report:
+            extra += ["", report]
         self._show_runtime_report(
-            lines + (["", report] if report else []), bool(status.problems)
+            lines + extra, bool(status.problems) or bool(probe_problems)
         )
 
     def _show_runtime_report(self, lines: list[str], has_problems: bool) -> None:

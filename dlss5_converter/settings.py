@@ -14,7 +14,24 @@ from .grade import GradeSettings
 #: these lists are the mapping and their order is not ours to change. Recovered
 #: from the add-on binary and confirmed by measuring each value's output.
 NR_PRESETS = ("Default", "Preset #1", "Preset #2", "Preset #3")
-NR_STYLES = ("Natural", "Cinematic")
+#: The add-on's NRStyle combo. It has THREE entries and Default is index 0 - the
+#: look you get the moment DLSS 5 is switched on, before choosing Natural or
+#: Cinematic. An earlier revision listed only ("Natural", "Cinematic"), which
+#: put our index 0 ("Natural") on the add-on's Default and made Cinematic
+#: unreachable; confirmed against the RenoDX add-on's own UI. The ini stores the
+#: index, so this order must match the add-on's.
+NR_STYLES = ("Default", "Natural", "Cinematic")
+
+
+def style_slug(style_index: int) -> str:
+    """The style's lowercase name for a filename, e.g. 'natural'.
+
+    Written into the output name (…_dlss5_natural.png) so a folder of results
+    says which look each was made with - a request from users comparing styles.
+    Clamped, so a stored index past the end of NR_STYLES still yields a name.
+    """
+    clamped = min(len(NR_STYLES) - 1, max(0, int(style_index)))
+    return NR_STYLES[clamped].lower()
 
 #: Top of the add-on's own strength sliders, and measured to be real: on a
 #: photograph the output keeps changing from 1.0 through 2.0 and then stops dead
@@ -53,9 +70,10 @@ class NeuralSettings:
     #: measured bit-identical with upscaling off — it most likely picks a Super
     #: Resolution preset, which a DLAA-only path never exercises.
     preset: int = 0
-    #: Natural or Cinematic. Unlike the preset this is very much live: on a
-    #: portrait, Cinematic moves the image about 50% further from the source
-    #: than Natural does at the same strengths.
+    #: Default, Natural or Cinematic (index into NR_STYLES). Unlike the preset
+    #: this is very much live: on a portrait, Cinematic moves the image about 50%
+    #: further from the source than Natural does at the same strengths. Default
+    #: (0) is the add-on's own starting look.
     style: int = 0
     # Defaults are 1.0 - the midpoint of the 0..2 range - rather than the
     # gentler values these once held. The old defaults were low enough that on
@@ -148,6 +166,26 @@ MAX_EDGE_CHOICES = (1920, 2560, 3840, 5120, 6144, 7680, 8192)
 #: Explicit Boost choices. Centralised so the UI and D3D12-limit guidance can
 #: never disagree about a multiplier the person can actually select.
 DETAIL_BOOST_FACTORS = (2, 4, 8)
+
+#: Plain names for the Boost factors, shown to users in place of "2×/4×/8×" -
+#: the multiplier is an implementation detail nobody outside the code needs.
+BOOST_LEVEL_LABELS = {2: "Standard", 4: "High", 8: "Max"}
+
+#: A D3D12 2D texture cannot exceed this on a side. Boost runs DLSS at
+#: (working size × factor), so the working size × factor must stay under it -
+#: this is the hard limit behind "Boost needs Max size 8192 px or smaller"
+#: (8192 × 2 = 16384). Mirrored in pipeline for the conversion-time check.
+D3D12_MAX_TEXTURE_DIMENSION = 16384
+
+
+def max_boost_factor(max_edge: int) -> int:
+    """Largest Boost factor whose working size fits the texture limit.
+
+    Returns 0 when even the smallest factor overflows (Max size above 8192),
+    which is the signal that Boost cannot run at this Max size at all.
+    """
+    allowed = [f for f in DETAIL_BOOST_FACTORS if max_edge * f <= D3D12_MAX_TEXTURE_DIMENSION]
+    return max(allowed) if allowed else 0
 
 
 @dataclass

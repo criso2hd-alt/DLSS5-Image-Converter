@@ -72,7 +72,8 @@ def test_zero_intensity_disables_the_pass_outright(tmp_path):
 
 
 def test_enum_indices_stay_inside_the_addons_own_lists(tmp_path):
-    """Game inis carry NRStyle=2 with only two styles; never pass that through."""
+    """A stored index past the ends of the add-on's own combos is clamped, never
+    passed through (a game ini can carry NRStyle=9 with only three styles)."""
     section = read_section(runtime.write_addon_config(tmp_path, NeuralSettings(preset=9, style=9)))
     assert int(section["NRPreset"]) == len(NR_PRESETS) - 1
     assert int(section["NRStyle"]) == len(NR_STYLES) - 1
