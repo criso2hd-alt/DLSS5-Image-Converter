@@ -56,6 +56,7 @@ from . import (
 )
 from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
+from .onnx_depth import OnnxDepthEngine
 from .settings import (
     DETAIL_BOOST_FACTORS,
     MAX_EDGE_CHOICES,
@@ -766,60 +767,26 @@ class RuntimeProbe(QObject):
 
 
 def ensure_runtime_ready(parent: QWidget | None = None) -> bool:
-    """Fetch PyTorch if this build did not ship it. True if the app can run.
+    """True if the app can run. There is no first-run download here anymore.
 
-    Runs before the main window exists, because without torch there is no depth
-    estimation and therefore nothing the window can usefully do. Blocking here
-    with an explained progress bar is better than starting, looking healthy, and
-    failing on the first image.
+    Depth estimation moved from PyTorch to ONNX Runtime (see onnx_depth.py):
+    ONNX Runtime is bundled in the build and the Apache-2.0 Small depth model
+    ships inside the app, so the old 2.7 GB PyTorch fetch - the biggest source of
+    first-run failures - is gone. A missing onnxruntime is a broken build, not a
+    downloadable state, so it is reported rather than fetched.
     """
-    if bootstrap.is_ready():
-        return True
-
-    dialog = DownloadDialog(
-        "Setting up — just this once.",
-        f"FIRST RUN · STEP 1 OF 3\n\nPyTorch {bootstrap.TORCH_VERSION} is downloaded once, rather than "
-        "shipped with the app - it is roughly 1.8 GB and would otherwise be in "
-        "every copy. It is kept in the pytorch folder beside the app and "
-        "survives updates.",
-        parent,
-    )
-    dialog.setStyleSheet(STYLE)
-
-    thread = QThread()
-    worker = RuntimeWorker()
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
-    worker.progress.connect(dialog.set_heading)
-    worker.bytes_progress.connect(dialog.update_bytes)
-
-    state = {"ok": False, "error": ""}
-
-    def done() -> None:
-        state["ok"] = True
-        dialog.mark_complete()
-        dialog.accept()
-
-    def failed(message: str) -> None:
-        state["error"] = message
-        dialog.reject()
-
-    worker.finished.connect(done)
-    worker.failed.connect(failed)
-    thread.start()
-    dialog.exec()
-    thread.quit()
-    thread.wait(5000)
-
-    if not state["ok"]:
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception as error:  # noqa: BLE001 - a broken build must say so clearly
         QMessageBox.critical(
             parent,
-            "Could not set up the runtime",
-            (state["error"] or ("The download did not finish.\n\n" + bootstrap.NETWORK_HELP))
-            + "\n\nPyTorch is needed for depth estimation, so the app cannot "
-            "start without it. Nothing is left half-installed.",
+            "Could not start",
+            "ONNX Runtime is missing from this build, so depth estimation cannot "
+            "run. This is a packaging problem rather than something to download - "
+            f"please reinstall the app.\n\n{error}",
         )
-    return state["ok"]
+        return False
+    return True
 
 
 class DownloadWorker(QObject):
@@ -2654,7 +2621,9 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings.load(paths.settings_path())
         # One engine for the window's lifetime. Reloading Depth Anything per
         # image would add several seconds and a gigabyte of churn to every run.
-        self.engine = DepthEngine()
+        # ONNX Runtime, not PyTorch: same depth, no 2.7 GB torch download, and
+        # the Apache-2.0 Small model ships in the app. See onnx_depth.py.
+        self.engine = OnnxDepthEngine()
         self.result: pipeline.Result | None = None
         self.image_path: Path | None = None
         self.prepared: pipeline.Prepared | None = None
@@ -4851,7 +4820,7 @@ class MainWindow(QMainWindow):
         self.ensure_model_downloaded()
         if self.settings.onboarding_version >= ONBOARDING_VERSION:
             return
-        if not DepthEngine.is_downloaded(self.settings.depth.model_id):
+        if not OnnxDepthEngine.is_downloaded(self.settings.depth.model_id):
             # The download dialog already explained the failure. Leave the
             # version at zero so a later successful launch can resume.
             return
@@ -5010,7 +4979,7 @@ class MainWindow(QMainWindow):
         model_id = model_id or self.settings.depth.model_id
         if self._download_thread is not None:
             return
-        if DepthEngine.is_downloaded(model_id):
+        if OnnxDepthEngine.is_downloaded(model_id):
             return
 
         label = next((k for k, v in MODELS.items() if v == model_id), model_id)

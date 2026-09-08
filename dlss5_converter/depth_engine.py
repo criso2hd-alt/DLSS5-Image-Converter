@@ -25,7 +25,10 @@ MODELS = {
 #: Base is the default here rather than Small. The neural pass reacts to depth
 #: *edges* — a soft silhouette from the Small model shows up as haloing around
 #: heads and shoulders, which is exactly where people look first.
-DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Base-hf"
+# Small is the default: it is the model bundled as ONNX (Apache-2.0, tiny), so
+# the app runs depth out of the box with no download. Base/Large are
+# non-commercial and must be exported/downloaded before they can be selected.
+DEFAULT_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
 
 
 def configure_model_cache() -> Path:

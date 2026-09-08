@@ -31,6 +31,10 @@ ONNX_FILES = {
     "depth-anything/Depth-Anything-V2-Large-hf": "Depth-Anything-V2-Large-hf.onnx",
 }
 
+#: The always-available bundled model, used as a fallback when a selected
+#: (non-bundled) model has not been exported or downloaded.
+SMALL = "depth-anything/Depth-Anything-V2-Small-hf"
+
 #: The square edge the models are exported at (multiple of 14; DINOv2 patch size).
 INPUT = 518
 
@@ -40,8 +44,28 @@ _STD = np.asarray([0.229, 0.224, 0.225], np.float32).reshape(1, 1, 3)
 
 
 def onnx_models_dir() -> Path:
-    """Where exported ONNX depth models live, beside the HF model cache."""
+    """Where downloaded ONNX depth models live, beside the HF model cache.
+
+    The bundled Apache-2.0 Small model ships read-only inside the app
+    (paths.bundled_onnx_dir); this cache is for larger models fetched later.
+    """
     return paths.model_cache_dir() / "onnx"
+
+
+def locate(model_id: str) -> Path | None:
+    """The ONNX file for `model_id`, bundled copy first, else the cache.
+
+    Returns None if it is not installed. Bundled wins so a release always has a
+    working depth model with no download.
+    """
+    name = ONNX_FILES.get(model_id)
+    if not name:
+        return None
+    for base in (paths.bundled_onnx_dir(), onnx_models_dir()):
+        candidate = base / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _providers() -> list[str]:
@@ -74,8 +98,7 @@ class OnnxDepthEngine:
 
     @classmethod
     def is_downloaded(cls, model_id: str) -> bool:
-        name = ONNX_FILES.get(model_id)
-        return bool(name) and (onnx_models_dir() / name).is_file()
+        return locate(model_id) is not None
 
     def load(
         self,
@@ -93,14 +116,22 @@ class OnnxDepthEngine:
         if self.model_id == model_id and self.session is not None:
             return self.device
 
-        name = ONNX_FILES.get(model_id)
-        if name is None:
+        if model_id not in ONNX_FILES:
             raise RuntimeError(f"No ONNX export is known for {model_id}.")
-        path = onnx_models_dir() / name
-        if not path.is_file():
+        path = locate(model_id)
+        if path is None and model_id != SMALL:
+            # A non-bundled model (Base/Large) that was never exported: fall back
+            # to the always-present Small rather than failing the conversion.
+            fallback = locate(SMALL)
+            if fallback is not None:
+                if progress:
+                    progress("Selected depth model not installed; using Small.")
+                model_id, path = SMALL, fallback
+        if path is None:
             raise RuntimeError(
-                f"The ONNX depth model is not installed ({path.name}). Run "
-                "scripts/export_onnx.py, or install the model bundle."
+                f"The ONNX depth model is not installed ({ONNX_FILES[model_id]}). "
+                "The Small model ships with the app; larger models must be "
+                "exported with scripts/export_onnx.py or downloaded."
             )
 
         import onnxruntime as ort

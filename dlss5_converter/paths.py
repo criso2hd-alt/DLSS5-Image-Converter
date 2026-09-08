@@ -86,6 +86,16 @@ def onboarding_image() -> Path:
     return resource_dir() / "dlss5_converter" / "assets" / "onboarding" / "architectural-detail.jpg"
 
 
+def bundled_onnx_dir() -> Path:
+    """ONNX depth models shipped inside the app.
+
+    The Apache-2.0 Small model rides here so a release runs depth out of the box
+    with no download and no PyTorch. Larger models, being non-commercial, are not
+    bundled; they land in the per-user cache instead. See onnx_depth.py.
+    """
+    return resource_dir() / "dlss5_converter" / "assets" / "onnx"
+
+
 def _user_data_dir() -> Path:
     try:
         from platformdirs import user_data_dir

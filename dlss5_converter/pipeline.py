@@ -28,6 +28,7 @@ from . import (
     wic,
 )
 from .depth_engine import DepthEngine
+from .onnx_depth import OnnxDepthEngine
 from .settings import DETAIL_BOOST_FACTORS, AppSettings
 
 Progress = Callable[[str], None]
@@ -1061,7 +1062,7 @@ def main() -> None:
     output = Path(args.output) if args.output else _default_output(args.input)
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    result = convert(args.input, settings, DepthEngine(), progress=print)
+    result = convert(args.input, settings, OnnxDepthEngine(), progress=print)
     save_image(result.enhanced, output)
     print(f"Wrote {output} ({result.notes})")
 
