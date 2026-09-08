@@ -466,6 +466,80 @@ def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
     return (out or err or "").strip() or "No output."
 
 
+def interpret_probe(report: str) -> list[str]:
+    """Turn the harness's raw probe fields into plain problems and fixes.
+
+    The harness prints machine fields (``reshade_proxy_loaded: 0`` …). On a
+    failed run they are all 0 and ``test_evaluation`` carries a raw NGX code like
+    ``NVSDK_NGX_Result_FAIL_UnableToInitializeFeature`` - which tells a user
+    nothing. The cause is whichever link in the load chain broke *first*, because
+    each one needs the previous: ReShade's proxy → the RenoDX add-on → the neural
+    module, all riding on a working DLSS SR. This names that first broken link
+    and what to do about it, so "everything is 0" becomes one actionable line.
+
+    Returns an empty list when the run is healthy (nothing to say).
+    """
+    fields: dict[str, str] = {}
+    for line in report.splitlines():
+        if ":" in line:
+            key, _, value = line.partition(":")
+            fields[key.strip().lower()] = value.strip()
+
+    def is_on(name: str) -> bool | None:
+        """A 1/0 flag as a bool; None when the harness did not report it."""
+        value = fields.get(name)
+        if value is None:
+            return None
+        return value.strip().startswith("1")
+
+    test = fields.get("test_evaluation", "")
+    healthy = test.lower() == "ok" and is_on("dlssnr_module_loaded")
+    if healthy:
+        return []
+
+    problems: list[str] = []
+    # Dependency order: report only the first broken link, since a break at the
+    # base makes everything above it 0 as a matter of course.
+    if is_on("reshade_proxy_loaded") is False:
+        problems.append(
+            "ReShade did not load (reshade_proxy_loaded: 0) - and everything "
+            "else needs it. Make sure dlss_files\\dxgi.dll is a real 64-bit "
+            "ReShade renamed to dxgi.dll; a stub or a 32-bit build will not load."
+        )
+    elif is_on("neural_addon_loaded") is False:
+        problems.append(
+            "ReShade loaded but the RenoDX DLSS 5 add-on did not "
+            "(neural_addon_loaded: 0). Check renodx-dlss5.addon64 is present "
+            "beside the harness and is a current build."
+        )
+    elif is_on("dlssnr_module_loaded") is False:
+        problems.append(
+            "The add-on loaded but the neural renderer did not attach "
+            "(dlssnr_module_loaded: 0). Usually an out-of-date add-on on a newer "
+            "card, or a DLSS runtime it rejected - the reason is in "
+            "engine\\ReShade.log. On RTX 40/50-series the RTX-patched "
+            "nvngx_dlssnr.dll is the one that works."
+        )
+
+    if is_on("dlss_available") is False:
+        problems.append(
+            "DLSS Super Resolution is not available (dlss_available: 0). The "
+            "neural pass runs inside a DLSS evaluation, so nvngx_dlss.dll from a "
+            "Streamline Production folder is required alongside the rest."
+        )
+    if is_on("needs_driver_update"):
+        problems.append(
+            "The driver is too old for this DLSS runtime (needs_driver_update: "
+            f"1, driver {fields.get('driver_version', '?')}). Update the GPU driver."
+        )
+
+    if not problems and test and test.lower() != "ok":
+        # A failure the flags did not localise: surface the raw line rather than
+        # silently claiming everything is fine.
+        problems.append(f"The live DLSS test failed: {test}.")
+    return problems
+
+
 def cancel_probe() -> None:
     """End a probe in flight - the setup dialog's Skip button.
 

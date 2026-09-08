@@ -56,9 +56,12 @@ from . import (
 )
 from . import hdr as hdr_mod
 from .depth_engine import MODELS, DepthEngine
+from .onnx_depth import OnnxDepthEngine
 from .settings import (
+    BOOST_LEVEL_LABELS,
     DETAIL_BOOST_FACTORS,
     MAX_EDGE_CHOICES,
+    max_boost_factor,
     NR_COLOR_MAX,
     NR_PAPER_WHITE_MAX,
     ONBOARDING_VERSION,
@@ -67,6 +70,7 @@ from .settings import (
     NR_STYLES,
     NR_TRANSFER_MAX,
     AppSettings,
+    style_slug,
 )
 from .widgets import (
     FONT_DISPLAY,
@@ -667,16 +671,35 @@ class RuntimeWorker(QObject):
 
 
 class RuntimeProbeWorker(QObject):
-    """Prove DLSS, ReShade, RenoDX and the neural module all load."""
+    """Prove DLSS, ReShade, RenoDX and the neural module all load.
+
+    Stages the current runtime beside the harness *first* when handed a status,
+    so a probe always tests the files that are in dlss_files right now - not a
+    stale copy left over from startup. Without this, replacing a file and hitting
+    Check runtime kept reporting the old result until the app was restarted.
+    """
 
     finished = Signal(bool, str)
 
-    def __init__(self, harness: Path) -> None:
+    def __init__(
+        self,
+        harness: Path,
+        status: runtime.RuntimeStatus | None = None,
+        neural: object | None = None,
+    ) -> None:
         super().__init__()
         self._harness = harness
+        self._status = status
+        self._neural = neural
 
     def run(self) -> None:
         try:
+            # Refresh the staged copy and the add-on's ini before the probe, so
+            # the check reflects the files and settings in place now.
+            if self._status is not None:
+                runtime.stage_runtime(self._status)
+                if self._neural is not None:
+                    runtime.write_addon_config(self._harness.parent, self._neural)
             report = evaluator.probe(self._harness)
         except Exception as error:  # noqa: BLE001 - reported in the setup dialog
             self.finished.emit(False, str(error))
@@ -708,11 +731,17 @@ class RuntimeProbe(QObject):
     #: a runtime that has hung, so the watchdog steps in rather than waiting.
     TIMEOUT_MS = 30000
 
-    def __init__(self, harness: Path, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        harness: Path,
+        parent: QObject | None = None,
+        status: runtime.RuntimeStatus | None = None,
+        neural: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self._settled = False
         self._thread = QThread()
-        self._worker = RuntimeProbeWorker(harness)
+        self._worker = RuntimeProbeWorker(harness, status, neural)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_worker_finished)
@@ -766,60 +795,26 @@ class RuntimeProbe(QObject):
 
 
 def ensure_runtime_ready(parent: QWidget | None = None) -> bool:
-    """Fetch PyTorch if this build did not ship it. True if the app can run.
+    """True if the app can run. There is no first-run download here anymore.
 
-    Runs before the main window exists, because without torch there is no depth
-    estimation and therefore nothing the window can usefully do. Blocking here
-    with an explained progress bar is better than starting, looking healthy, and
-    failing on the first image.
+    Depth estimation moved from PyTorch to ONNX Runtime (see onnx_depth.py):
+    ONNX Runtime is bundled in the build and the Apache-2.0 Small depth model
+    ships inside the app, so the old 2.7 GB PyTorch fetch - the biggest source of
+    first-run failures - is gone. A missing onnxruntime is a broken build, not a
+    downloadable state, so it is reported rather than fetched.
     """
-    if bootstrap.is_ready():
-        return True
-
-    dialog = DownloadDialog(
-        "Setting up — just this once.",
-        f"FIRST RUN · STEP 1 OF 3\n\nPyTorch {bootstrap.TORCH_VERSION} is downloaded once, rather than "
-        "shipped with the app - it is roughly 1.8 GB and would otherwise be in "
-        "every copy. It is kept in the pytorch folder beside the app and "
-        "survives updates.",
-        parent,
-    )
-    dialog.setStyleSheet(STYLE)
-
-    thread = QThread()
-    worker = RuntimeWorker()
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
-    worker.progress.connect(dialog.set_heading)
-    worker.bytes_progress.connect(dialog.update_bytes)
-
-    state = {"ok": False, "error": ""}
-
-    def done() -> None:
-        state["ok"] = True
-        dialog.mark_complete()
-        dialog.accept()
-
-    def failed(message: str) -> None:
-        state["error"] = message
-        dialog.reject()
-
-    worker.finished.connect(done)
-    worker.failed.connect(failed)
-    thread.start()
-    dialog.exec()
-    thread.quit()
-    thread.wait(5000)
-
-    if not state["ok"]:
+    try:
+        import onnxruntime  # noqa: F401
+    except Exception as error:  # noqa: BLE001 - a broken build must say so clearly
         QMessageBox.critical(
             parent,
-            "Could not set up the runtime",
-            (state["error"] or ("The download did not finish.\n\n" + bootstrap.NETWORK_HELP))
-            + "\n\nPyTorch is needed for depth estimation, so the app cannot "
-            "start without it. Nothing is left half-installed.",
+            "Could not start",
+            "ONNX Runtime is missing from this build, so depth estimation cannot "
+            "run. This is a packaging problem rather than something to download - "
+            f"please reinstall the app.\n\n{error}",
         )
-    return state["ok"]
+        return False
+    return True
 
 
 class DownloadWorker(QObject):
@@ -1624,7 +1619,8 @@ class VideoQueueDialog(QDialog):
         # A distinct name so a queue pointed at its own source folder never
         # overwrites an input, and the H.264 default does not collide with an
         # H.264 source of the same stem.
-        return self.destination / f"{source.stem}_dlss5{suffix}"
+        style = style_slug(self._window.settings.neural.style)
+        return self.destination / f"{source.stem}_dlss5_{style}{suffix}"
 
     def _start(self) -> None:
         if not self.jobs or self._thread is not None:
@@ -2654,7 +2650,9 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings.load(paths.settings_path())
         # One engine for the window's lifetime. Reloading Depth Anything per
         # image would add several seconds and a gigabyte of churn to every run.
-        self.engine = DepthEngine()
+        # ONNX Runtime, not PyTorch: same depth, no 2.7 GB torch download, and
+        # the Apache-2.0 Small model ships in the app. See onnx_depth.py.
+        self.engine = OnnxDepthEngine()
         self.result: pipeline.Result | None = None
         self.image_path: Path | None = None
         self.prepared: pipeline.Prepared | None = None
@@ -2993,12 +2991,13 @@ class MainWindow(QMainWindow):
         )
         self.view_styles = QPushButton("Compare styles")
         self.view_styles.setToolTip(
-            "Natural against Cinematic, on this image, at these settings.\n\n"
-            "Converts once per style and wipes between them. There are only "
-            "two, so this is the whole choice rather than a sample.\n\n"
-            "It costs two conversions: the add-on reads its configuration once "
-            "when it starts, so a style change needs a new harness. Depth is "
-            "estimated once and shared."
+            "The add-on's styles side by side, on this image, at these settings.\n\n"
+            "Converts once per style and wipes between them. The default view "
+            "compares Natural and Cinematic (the two graded looks); Default is "
+            "the add-on's baseline.\n\n"
+            "Each style is a separate conversion: the add-on reads its "
+            "configuration once when it starts, so a style change needs a new "
+            "harness. Depth is estimated once and shared."
         )
         for button in (
             self.view_photo, self.view_depth, self.view_result,
@@ -3316,11 +3315,13 @@ class MainWindow(QMainWindow):
     def _apply_pane_defaults(self, count: int) -> None:
         """Sensible starting selections for a given number of panes.
 
-        Two panes is the style question - Natural against Cinematic. Three is
+        Two panes is the style question - Natural against Cinematic (the two
+        looks that actually differ; Default is the add-on's baseline). Three is
         the "is it helping" question, and that reads best with the source
         first, so the eye moves from unprocessed to most processed.
         """
-        defaults = [0, 1] if count == 2 else [-1, 0, 1]
+        # NR_STYLES is (Default, Natural, Cinematic) = indices 0, 1, 2.
+        defaults = [1, 2] if count == 2 else [-1, 1, 2]
         for box, value in zip(self.style_choices, defaults):
             index = box.findData(value)
             if index >= 0:
@@ -3827,8 +3828,10 @@ class MainWindow(QMainWindow):
         # Apply to folder moved to the tab band's right corner (self.tab_apply),
         # so it is not repeated here; batch_button is kept as state for its
         # tooltip and any enable/disable, just not shown in this column.
-        layout.addWidget(self.open_button)
+        # Convert sits at the very top - it is the hero action, so it leads the
+        # column rather than following Open. Open/Save/Use-as-input follow.
         layout.addWidget(self.convert_button)
+        layout.addWidget(self.open_button)
         layout.addWidget(self.save_button)
         layout.addWidget(self.feedback_button)
 
@@ -4078,13 +4081,20 @@ class MainWindow(QMainWindow):
         preset_row.addWidget(self.preset_box, 1)
         neural_layout.addLayout(preset_row)
 
-        # Style is two choices — Natural or Cinematic — so it reads better as a
-        # segmented control with both visible than as a dropdown that hides one.
+        # Style is the add-on's three looks — Default, Natural, Cinematic — so it
+        # reads better as a segmented control with all three visible than as a
+        # dropdown that hides two. Default is what DLSS 5 gives the moment it is
+        # switched on; Natural and Cinematic are the two graded looks.
         self.style_box = SegmentedControl(
             list(NR_STYLES),
             current=min(len(NR_STYLES) - 1, max(0, settings.style)),
         )
-        self.style_box.setToolTip("Broad look, applied on top of the preset.")
+        self.style_box.setToolTip(
+            "The add-on's overall look.\n\n"
+            "Default — the look DLSS 5 starts with.\n"
+            "Natural — subtle grade, closer to the source.\n"
+            "Cinematic — stronger grade, moves furthest from the source."
+        )
         self.style_box.changed.connect(self._style_changed)
         neural_layout.addWidget(self.style_box)
 
@@ -4229,26 +4239,35 @@ class MainWindow(QMainWindow):
         )
         d_layout.addWidget(self.detail_amount)
 
-        # Boost-only: how far to supersample. Sits under Amount, greyed unless
-        # Boost is selected, since it means nothing to the other modes.
+        # Boost-only: how hard to push it. "Extra sharpness" instead of the raw
+        # 2×/4×/8× multiplier - the number is an implementation detail, and the
+        # levels that would blow past the hardware texture limit are disabled by
+        # _sync_boost_guard rather than left to fail mid-conversion.
         ss_row = QHBoxLayout()
-        self.detail_super_label = QLabel("Supersample")
+        self.detail_super_label = QLabel("Extra sharpness")
         ss_row.addWidget(self.detail_super_label)
         self.detail_supersample = QComboBox()
         for factor in DETAIL_BOOST_FACTORS:
-            self.detail_supersample.addItem(f"{factor}x", factor)
+            self.detail_supersample.addItem(BOOST_LEVEL_LABELS[factor], factor)
         self.detail_supersample.setToolTip(
-            "Boost only. 2×/4×/8× process 4/16/64 times the pixels. The app "
-            "uses current free VRAM for a preflight instead of silently stepping "
-            "the factor down. D3D12 has a hard 16,384 px limit per side, and "
-            "the installed DLSS runtime may impose a lower working limit."
+            "How much sharper Boost pushes. Higher runs DLSS at a larger size "
+            "before shrinking it back, so it is crisper but slower. Levels that "
+            "would not fit at the current Max size are greyed out."
         )
         ss_idx = self.detail_supersample.findData(self.settings.detail.supersample)
-        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 1)
+        self.detail_supersample.setCurrentIndex(ss_idx if ss_idx >= 0 else 0)
         self.detail_supersample.currentIndexChanged.connect(self._detail_super_changed)
         ss_row.addStretch(1)
         ss_row.addWidget(self.detail_supersample)
         d_layout.addLayout(ss_row)
+
+        # A second, quieter line for the guard message ("Max needs a smaller Max
+        # size…"), kept separate from the mode explainer so the two do not fight
+        # over one label.
+        self.detail_guard = QLabel()
+        self.detail_guard.setObjectName("hint")
+        self.detail_guard.setWordWrap(True)
+        d_layout.addWidget(self.detail_guard)
 
         # A one-line explainer under the controls, like the mockup's card copy —
         # updated to whichever mode is selected.
@@ -4262,23 +4281,79 @@ class MainWindow(QMainWindow):
 
     _DETAIL_HINTS = {
         "off": "The plain DLSS result — no detail recovery.",
-        "preserve": "Preserve re-injects the source's real fine detail — brick, "
-                    "mesh and fabric stay crisp while the neural relight is kept. "
-                    "No halos.",
-        "boost": "Boost supersamples: DLSS runs at 2×/4×/8× the size, crispened, "
-                 "then downscales. The selected factor is never silently reduced; "
-                 "VRAM is checked first and DLSS reports its own runtime limit.",
+        "preserve": "Preserve keeps the source's own fine texture — brick, mesh "
+                    "and fabric stay crisp — while keeping the neural relight. "
+                    "Instant, and the right default.",
+        "boost": "Boost runs DLSS larger than the image, then shrinks it back for "
+                 "extra crispness. Slower, and it applies on the next Convert.",
     }
 
+    def _sync_boost_guard(self) -> None:
+        """Offer only the sharpness levels that fit the current Max size.
+
+        Boost runs at (Max size × level), and a D3D12 texture cannot exceed
+        D3D12_MAX_TEXTURE_DIMENSION on a side, so a high level at a high Max size
+        overflows - the opaque failure a user hit as an add-on init error. Here
+        the overflowing levels are simply disabled, the selection is stepped down
+        to the best that fits, and a plain line explains it. Above 8192 px even
+        the smallest level cannot fit, which is the "Boost needs Max size 8192 px
+        or smaller" case.
+        """
+        if not hasattr(self, "detail_supersample"):
+            return
+        max_edge = int(self.settings.evaluation.max_edge)
+        ceiling = max_boost_factor(max_edge)  # 0 when nothing fits
+        active = self.settings.detail.mode == "boost"
+
+        # Enable/disable each level by whether it fits, without firing the change
+        # handler while we reshape the list.
+        self.detail_supersample.blockSignals(True)
+        model = self.detail_supersample.model()
+        for i in range(self.detail_supersample.count()):
+            factor = self.detail_supersample.itemData(i)
+            fits = ceiling > 0 and factor <= ceiling
+            model.item(i).setEnabled(fits)
+
+        # Only clamp the stored level and speak up while Boost is the live mode.
+        # Doing it when Boost is off would silently change a setting the user
+        # cannot see the effect of; the guard re-runs the moment Boost is chosen.
+        message = ""
+        if active:
+            if ceiling == 0:
+                # Nothing fits: Boost can't supersample at this Max size.
+                message = (
+                    f"Boost needs Max size 8192 px or smaller — at {max_edge} px "
+                    "it would exceed the GPU's texture limit."
+                )
+            else:
+                chosen = int(self.settings.detail.supersample)
+                if chosen > ceiling:
+                    # Step the stored setting down to the best that fits, say so.
+                    self.settings.detail.supersample = ceiling
+                    self.settings.save(paths.settings_path())
+                    idx = self.detail_supersample.findData(ceiling)
+                    if idx >= 0:
+                        self.detail_supersample.setCurrentIndex(idx)
+                    message = (
+                        f"{BOOST_LEVEL_LABELS.get(chosen, 'That level')} needs a "
+                        f"smaller Max size — using {BOOST_LEVEL_LABELS[ceiling]} "
+                        f"at {max_edge} px."
+                    )
+        self.detail_supersample.blockSignals(False)
+        if hasattr(self, "detail_guard"):
+            self.detail_guard.setText(message)
+            self.detail_guard.setVisible(bool(message))
+
     def _sync_detail_controls(self) -> None:
-        """Grey the supersample row unless Boost is the active mode, and set the
-        card's explainer to match the selected mode."""
+        """Grey the sharpness row unless Boost is the active mode, set the card's
+        explainer to match the selected mode, and re-run the Boost guard."""
         mode = self.settings.detail.mode
         is_boost = mode == "boost"
         self.detail_supersample.setEnabled(is_boost)
         self.detail_super_label.setEnabled(is_boost)
         if hasattr(self, "detail_hint"):
             self.detail_hint.setText(self._DETAIL_HINTS.get(mode, ""))
+        self._sync_boost_guard()
 
     def _detail_mode_changed(self, _index: int) -> None:
         self.settings.detail.mode = self.detail_mode.current_data() or "off"
@@ -4429,7 +4504,8 @@ class MainWindow(QMainWindow):
         page = self.video_page
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
         stem = page.source.stem if page.source else "video"
-        start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5{codec.suffix}"))
+        style = style_slug(self.settings.neural.style)
+        start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5_{style}{codec.suffix}"))
         chosen, _ = QFileDialog.getSaveFileName(
             self, "Output video", start_dir, f"{codec.label} (*{codec.suffix})"
         )
@@ -4479,7 +4555,8 @@ class MainWindow(QMainWindow):
         # A default output beside the app, so Convert works without a detour
         # through the Output picker - but the picker can override it.
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
-        page.output_path = paths.output_dir() / f"{path.stem}_dlss5{codec.suffix}"
+        style = style_slug(self.settings.neural.style)
+        page.output_path = paths.output_dir() / f"{path.stem}_dlss5_{style}{codec.suffix}"
         page.output_label.setText(f"Output: {page.output_path}")
 
     def _video_mode_changed(self) -> None:
@@ -4851,7 +4928,7 @@ class MainWindow(QMainWindow):
         self.ensure_model_downloaded()
         if self.settings.onboarding_version >= ONBOARDING_VERSION:
             return
-        if not DepthEngine.is_downloaded(self.settings.depth.model_id):
+        if not OnnxDepthEngine.is_downloaded(self.settings.depth.model_id):
             # The download dialog already explained the failure. Leave the
             # version at zero so a later successful launch can resume.
             return
@@ -4882,31 +4959,70 @@ class MainWindow(QMainWindow):
                 status = None
 
         if status is not None and status.ready and status.harness is not None:
-            self._begin_background_probe(status.harness)
+            self._begin_background_probe(status)
+        else:
+            # Files still not in place after the finder. Say so plainly rather
+            # than dropping the user into the tour as if setup succeeded - the
+            # reported trap where people believed the app was working when it had
+            # never found its runtime at all.
+            self.statusBar().showMessage("DLSS 5 files are not set up yet.")
+            QMessageBox.information(
+                self,
+                "DLSS 5 files not set up yet",
+                "The DLSS 5 runtime files were not found, so conversions will "
+                "not change the image yet. The tour below still works, and you "
+                "can add the files any time from Settings → Check runtime.",
+            )
 
         self._show_first_conversion_intro()
 
-    def _begin_background_probe(self, harness: Path) -> None:
+    def _begin_background_probe(self, status: runtime.RuntimeStatus) -> None:
         """Confirm the neural path loads, off the UI thread, without blocking.
 
-        The tour and the whole app stay usable while this runs; the status bar
-        reports the result when it lands, and the watchdog inside RuntimeProbe
-        gives up on a runtime that hangs instead of freezing the window.
+        The tour and the whole app stay usable while this runs; the watchdog
+        inside RuntimeProbe gives up on a runtime that hangs instead of freezing
+        the window. Passing the status re-stages the files first, so the check
+        reflects what was just copied in.
         """
-        if self._runtime_probe is not None:
+        if self._runtime_probe is not None or status.harness is None:
             return
         self.statusBar().showMessage("Checking DLSS 5 in the background…")
-        probe = RuntimeProbe(harness, parent=self)
+        probe = RuntimeProbe(
+            status.harness, parent=self, status=status, neural=self.settings.neural
+        )
         self._runtime_probe = probe
         probe.done.connect(self._background_probe_done)
         probe.start()
 
     def _background_probe_done(self, ok: bool, report: str) -> None:
         self._runtime_probe = None
-        self.statusBar().showMessage(
-            "DLSS 5 verified — the neural pass is live." if ok
-            else "Could not confirm the neural pass — Settings → Check runtime for details."
+        if ok:
+            self.statusBar().showMessage("DLSS 5 verified — the neural pass is live.")
+            return
+        # A quiet status-bar line here was the trap users described: files were
+        # present so onboarding walked them into the tour, the background check
+        # failed, and nothing told them - so they concluded the app "does
+        # nothing". Say it plainly, with the specific cause, and offer the fix.
+        self.statusBar().showMessage("DLSS 5 did not load — see the message.")
+        problems = evaluator.interpret_probe(report)
+        detail = "\n\n".join(problems) if problems else (
+            "The live DLSS test did not pass. Open Settings → Check runtime for "
+            "the full report."
         )
+        box = QMessageBox(
+            QMessageBox.Icon.Warning,
+            "DLSS 5 is not hooked up yet",
+            "Your files are in place, but the neural pass did not load, so "
+            "conversions will not change the image until this is fixed:\n\n"
+            f"{detail}\n\nThe app and the tour still work - you can fix this "
+            "any time from Settings → Check runtime.",
+            parent=self,
+        )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        guide = box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
+        box.exec()
+        if box.clickedButton() is guide:
+            open_help("Troubleshooting")
 
     def _show_first_conversion_intro(self) -> None:
         palette = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])
@@ -5010,7 +5126,7 @@ class MainWindow(QMainWindow):
         model_id = model_id or self.settings.depth.model_id
         if self._download_thread is not None:
             return
-        if DepthEngine.is_downloaded(model_id):
+        if OnnxDepthEngine.is_downloaded(model_id):
             return
 
         label = next((k for k, v in MODELS.items() if v == model_id), model_id)
@@ -5283,6 +5399,9 @@ class MainWindow(QMainWindow):
         if value == self.settings.evaluation.max_edge:
             return
         self.settings.evaluation.max_edge = value
+        # Max size is the ceiling Boost multiplies, so a change here can make the
+        # current sharpness level fit or overflow. Re-run the guard.
+        self._sync_boost_guard()
         # Depth is estimated on the fitted image, so a different size means the
         # cached depth is the wrong shape and has to be redone.
         self._depth_settings_changed()
@@ -5530,7 +5649,8 @@ class MainWindow(QMainWindow):
         # first would quietly tone map away the entire reason the source was
         # opened as HDR.
         is_hdr = self.result.hdr
-        default = str(Path(suggested) / f"{stem}_dlss5.{'jxr' if is_hdr else 'png'}")
+        style = style_slug(self.settings.neural.style)
+        default = str(Path(suggested) / f"{stem}_dlss5_{style}.{'jxr' if is_hdr else 'png'}")
         hdr_filters = "JPEG XR (*.jxr);;OpenEXR (*.exr);;"
         sdr_filters = "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)"
         filters = (hdr_filters + sdr_filters) if is_hdr else (sdr_filters + ";;" + hdr_filters.rstrip(";"))
@@ -5605,7 +5725,12 @@ class MainWindow(QMainWindow):
         dialog.set_busy()
         dialog.enable_cancel("Skip this check")
 
-        probe = RuntimeProbe(status.harness, parent=self)
+        # Pass the freshly detected status so the probe re-stages dlss_files
+        # before testing - otherwise Check runtime reports the copy staged at
+        # startup and a just-added file needs an app restart to be seen.
+        probe = RuntimeProbe(
+            status.harness, parent=self, status=status, neural=self.settings.neural
+        )
         outcome: dict[str, str] = {}
 
         def done(_ok: bool, report: str) -> None:
@@ -5618,8 +5743,18 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
         report = outcome.get("report", "")
+        # The probe can come back "ready" by file detection yet fail the live
+        # test with every field 0 (issue #6). Interpret the fields into a plain
+        # cause, show it first, and treat a failed probe as a problem so the
+        # Troubleshooting button appears.
+        probe_problems = evaluator.interpret_probe(report) if report else []
+        extra: list[str] = []
+        if probe_problems:
+            extra += [""] + probe_problems
+        if report:
+            extra += ["", report]
         self._show_runtime_report(
-            lines + (["", report] if report else []), bool(status.problems)
+            lines + extra, bool(status.problems) or bool(probe_problems)
         )
 
     def _show_runtime_report(self, lines: list[str], has_problems: bool) -> None:

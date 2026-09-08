@@ -28,7 +28,13 @@ from . import (
     wic,
 )
 from .depth_engine import DepthEngine
-from .settings import DETAIL_BOOST_FACTORS, AppSettings
+from .onnx_depth import OnnxDepthEngine
+from .settings import (
+    D3D12_MAX_TEXTURE_DIMENSION,
+    DETAIL_BOOST_FACTORS,
+    AppSettings,
+    style_slug,
+)
 
 Progress = Callable[[str], None]
 
@@ -117,9 +123,10 @@ def prepare(
     )
 
 
-#: A D3D12 2D texture cannot exceed this in either dimension. Unlike the old
-#: 8192 policy ceiling this is an API limit, independent of VRAM capacity.
-D3D12_MAX_TEXTURE_DIMENSION = 16384
+# D3D12_MAX_TEXTURE_DIMENSION is imported from settings at the top of this file:
+# it is defined there so the sidebar's Boost guard and this conversion-time
+# check share one number and cannot drift apart. (An API limit on a 2D texture
+# side, independent of VRAM capacity.)
 
 #: Conservative working-set estimate for the four harness textures, NGX feature
 #: state and driver overhead. This is a preflight, not an allocator: D3D12 still
@@ -349,15 +356,21 @@ class SequenceFrame:
     image: np.ndarray  # 0..1 float RGB, graded
 
 
-def hdr_output_path(destination: Path, stem: str, source: Path) -> Path:
+def hdr_output_path(
+    destination: Path, stem: str, source: Path, style: str | None = None
+) -> Path:
     """Where a converted frame goes, in a format that can hold what it holds.
 
     Decided from the *input* extension rather than from the decoded pixels,
     because the batch has to know the output name before it loads anything -
     that is what lets it skip files it has already done.
+
+    ``style`` (default/natural/cinematic) is written into the name when given, so
+    a folder of results says which look each was made with.
     """
     suffix = ".jxr" if hdr.is_hdr_source(source) else ".png"
-    return destination / f"{stem}_dlss5{suffix}"
+    tag = f"_{style}" if style else ""
+    return destination / f"{stem}_dlss5{tag}{suffix}"
 
 
 def _finish(
@@ -565,7 +578,9 @@ def convert_sequence(
                 detail_settings=settings.detail,
                 source_srgb=source,
             )
-            output = hdr_output_path(destination, frame_path.stem, frame_path)
+            output = hdr_output_path(
+                destination, frame_path.stem, frame_path, style_slug(settings.neural.style)
+            )
             save_image(payload, output, linear=is_linear)
             yield SequenceFrame(index, len(frames), frame_path, output, preview)
 
@@ -858,7 +873,9 @@ def convert_batch(
                 say("Stopped.")
                 return
 
-            output = hdr_output_path(destination, path.stem, path)
+            output = hdr_output_path(
+                destination, path.stem, path, style_slug(settings.neural.style)
+            )
             if skip_existing and output.exists():
                 yield BatchItem(index, len(images), path, output, skipped=True)
                 continue
@@ -1058,22 +1075,26 @@ def main() -> None:
     if args.runtime_dir:
         settings.runtime_dir = args.runtime_dir
 
-    output = Path(args.output) if args.output else _default_output(args.input)
+    output = (
+        Path(args.output) if args.output
+        else _default_output(args.input, style_slug(settings.neural.style))
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    result = convert(args.input, settings, DepthEngine(), progress=print)
+    result = convert(args.input, settings, OnnxDepthEngine(), progress=print)
     save_image(result.enhanced, output)
     print(f"Wrote {output} ({result.notes})")
 
 
-def _default_output(input_path: str | Path) -> Path:
-    """``output/<name>_dlss5.png``, without overwriting an earlier run."""
+def _default_output(input_path: str | Path, style: str = "") -> Path:
+    """``output/<name>_dlss5_<style>.png``, without overwriting an earlier run."""
     stem = Path(input_path).stem
     folder = paths.output_dir()
-    candidate = folder / f"{stem}_dlss5.png"
+    tag = f"_{style}" if style else ""
+    candidate = folder / f"{stem}_dlss5{tag}.png"
     index = 2
     while candidate.exists():
-        candidate = folder / f"{stem}_dlss5_{index}.png"
+        candidate = folder / f"{stem}_dlss5{tag}_{index}.png"
         index += 1
     return candidate
 

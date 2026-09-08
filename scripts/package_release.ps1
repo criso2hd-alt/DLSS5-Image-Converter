@@ -61,12 +61,14 @@ Put your own files in dlss_files\ - only there. Do not copy dlss5_eval.exe into
 dlss_files\, and do not hand-copy your DLLs here.
 '@
 
-# The four folders the app expects, each carrying only its placeholder. These
-# are what tell a new user where their own files go.
-foreach ($folder in @("dlss_files", "models", "output", "pytorch")) {
+# The folders the app expects, each carrying only its placeholder. These are
+# what tell a new user where their own files go. No "pytorch" any more - v0.3.0
+# runs depth on ONNX with the model bundled, so there is no torch download folder.
+foreach ($folder in @("dlss_files", "models", "output")) {
     $target = Join-Path $Root $folder
     New-Item -ItemType Directory -Force -Path $target | Out-Null
-    Get-ChildItem -LiteralPath (Join-Path $Release $folder) -Filter "READ*.txt" -File |
+    Get-ChildItem -LiteralPath (Join-Path $Release $folder) -Filter "READ*.txt" -File `
+        -ErrorAction SilentlyContinue |
         ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $target }
 }
 

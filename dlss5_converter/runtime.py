@@ -221,6 +221,28 @@ def _already_staged(source: Path, destination: Path) -> bool:
     return here.st_size == there.st_size and int(here.st_mtime) == int(there.st_mtime)
 
 
+def _streamline_siblings(dlss_dll: Path | None) -> list[Path]:
+    """The Streamline runtime DLLs sitting beside a Streamline ``nvngx_dlss.dll``.
+
+    A Production/streamline drop contains ``sl.interposer.dll`` and friends next
+    to ``nvngx_dlss.dll``. They are what a modern nvngx_dlss.dll loads to
+    actually run, so they have to be staged with it. Returns an empty list when
+    the dll is missing or came from a plain game ``bin\\x64`` with no Streamline
+    layer (there is simply nothing matching to copy), so this is safe to call
+    unconditionally.
+    """
+    if dlss_dll is None:
+        return []
+    try:
+        folder = dlss_dll.parent
+        return sorted(
+            p for p in folder.glob("sl.*.dll")
+            if p.is_file()
+        )
+    except OSError:
+        return []
+
+
 def stage_runtime(status: RuntimeStatus) -> Path:
     """Copy the runtime beside the harness, which is where the loaders look.
 
@@ -249,7 +271,16 @@ def stage_runtime(status: RuntimeStatus) -> Path:
     target = status.harness.parent
     target.mkdir(parents=True, exist_ok=True)
 
-    for source in (status.neural_dll, status.dlss_dll, status.addon, status.reshade):
+    sources = [status.neural_dll, status.dlss_dll, status.addon, status.reshade]
+    # nvngx_dlss.dll from a modern Streamline drop is a thin front for the
+    # Streamline runtime beside it (sl.interposer.dll, sl.common.dll, sl.dlss.dll,
+    # …). Copying only nvngx_dlss.dll leaves those behind, DLSS then fails to
+    # initialise, and every indicator reads 0 - a confirmed cause of "I have all
+    # the files and nothing happens". So when the DLSS dll came out of a folder
+    # that also holds Streamline libraries, bring its whole sl*.dll set along.
+    sources += _streamline_siblings(status.dlss_dll)
+
+    for source in sources:
         if source is None:
             continue
         # ReShade only hooks when it is loaded as a proxy for a DLL the process

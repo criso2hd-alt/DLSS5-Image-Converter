@@ -34,4 +34,12 @@ if __name__ == "__main__":
         from dlss5_converter.selftest import run_selftest
 
         sys.exit(run_selftest())
+    # `DLSS5Converter.exe --check-gpu` answers just one question - is depth
+    # running on the GPU? - without touching the native DLSS harness, so it is
+    # quick and safe to run. Use it to confirm a machine picked up the bundled
+    # CUDA runtime:  DLSS5Converter.exe --check-gpu 2> gpu.txt
+    if "--check-gpu" in sys.argv:
+        from dlss5_converter.selftest import run_gpu_check
+
+        sys.exit(run_gpu_check())
     main()

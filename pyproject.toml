@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlss5-converter"
-version = "0.2.1"
+version = "0.3.0"
 description = "Run NVIDIA's DLSS 5 neural renderer over still images."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -14,9 +14,14 @@ dependencies = [
   "numpy>=1.26,<3",
   "opencv-python-headless>=4.10,<5",
   "Pillow>=10.4,<12",
-  "torch>=2.4,<3",
-  "transformers>=4.56,<5",
-  "safetensors>=0.4,<1",
+  # Depth runs on ONNX Runtime, not PyTorch - see onnx_depth.py - which is what
+  # removes the 2.7 GB torch download. The shipped GPU path is DirectML: it runs
+  # on any DirectX 12 GPU (NVIDIA/AMD/Intel) through the driver the user already
+  # has, is a single ~18 MB DLL (no CUDA toolkit, no 1.5 GB cuDNN bundle, no
+  # download), and matches CUDA's speed on this workload. CPU is the built-in
+  # fallback. A user who wants CUDA can pip install onnxruntime-gpu instead;
+  # _providers() prefers it when present.
+  "onnxruntime-directml>=1.20,<2",
   "huggingface-hub>=0.25,<1",
   "truststore>=0.9,<1",
   "platformdirs>=4,<5",
@@ -25,6 +30,14 @@ dependencies = [
 [project.optional-dependencies]
 build = ["pyinstaller>=6.11,<7"]
 test = ["pytest>=8,<9"]
+# Dev-only tooling for scripts/export_onnx.py, which regenerates the bundled
+# ONNX depth models from the Depth Anything V2 weights. Never needed at runtime.
+export = [
+  "torch>=2.4,<3",
+  "transformers>=4.56,<5",
+  "onnx>=1.16",
+  "onnxconverter-common>=1.14",
+]
 
 [project.scripts]
 dlss5-converter = "dlss5_converter.app:main"

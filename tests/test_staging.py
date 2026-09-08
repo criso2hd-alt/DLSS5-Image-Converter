@@ -56,6 +56,32 @@ def test_the_files_are_placed_beside_the_harness(staged):
         assert (engine / name).exists(), name
 
 
+def test_streamline_libraries_beside_the_dlss_dll_are_staged_too(staged):
+    """A modern nvngx_dlss.dll needs its Streamline siblings, so they must come
+    along - copying only nvngx_dlss.dll is a confirmed 'I have all the files and
+    nothing happens'."""
+    engine, source, status = staged
+    write(source / "sl.interposer.dll", b"sl-interposer")
+    write(source / "sl.common.dll", b"sl-common")
+    write(source / "sl.dlss.dll", b"sl-dlss")
+    # An unrelated dll in the same folder must not be dragged in.
+    write(source / "d3dcompiler_47.dll", b"unrelated")
+
+    stage_runtime(status())
+
+    for name in ("sl.interposer.dll", "sl.common.dll", "sl.dlss.dll"):
+        assert (engine / name).exists(), name
+    assert not (engine / "d3dcompiler_47.dll").exists()
+
+
+def test_staging_without_streamline_siblings_is_fine(staged):
+    """A plain bin\\x64 with no Streamline layer has nothing matching to copy;
+    staging must not fail looking for it."""
+    engine, _source, status = staged
+    stage_runtime(status())  # no sl.*.dll present
+    assert (engine / "nvngx_dlss.dll").exists()
+
+
 def test_a_replacement_of_the_same_size_is_picked_up(staged):
     """The bug. Two add-on builds are frequently byte-for-byte the same size.
 
