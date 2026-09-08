@@ -671,16 +671,35 @@ class RuntimeWorker(QObject):
 
 
 class RuntimeProbeWorker(QObject):
-    """Prove DLSS, ReShade, RenoDX and the neural module all load."""
+    """Prove DLSS, ReShade, RenoDX and the neural module all load.
+
+    Stages the current runtime beside the harness *first* when handed a status,
+    so a probe always tests the files that are in dlss_files right now - not a
+    stale copy left over from startup. Without this, replacing a file and hitting
+    Check runtime kept reporting the old result until the app was restarted.
+    """
 
     finished = Signal(bool, str)
 
-    def __init__(self, harness: Path) -> None:
+    def __init__(
+        self,
+        harness: Path,
+        status: runtime.RuntimeStatus | None = None,
+        neural: object | None = None,
+    ) -> None:
         super().__init__()
         self._harness = harness
+        self._status = status
+        self._neural = neural
 
     def run(self) -> None:
         try:
+            # Refresh the staged copy and the add-on's ini before the probe, so
+            # the check reflects the files and settings in place now.
+            if self._status is not None:
+                runtime.stage_runtime(self._status)
+                if self._neural is not None:
+                    runtime.write_addon_config(self._harness.parent, self._neural)
             report = evaluator.probe(self._harness)
         except Exception as error:  # noqa: BLE001 - reported in the setup dialog
             self.finished.emit(False, str(error))
@@ -712,11 +731,17 @@ class RuntimeProbe(QObject):
     #: a runtime that has hung, so the watchdog steps in rather than waiting.
     TIMEOUT_MS = 30000
 
-    def __init__(self, harness: Path, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        harness: Path,
+        parent: QObject | None = None,
+        status: runtime.RuntimeStatus | None = None,
+        neural: object | None = None,
+    ) -> None:
         super().__init__(parent)
         self._settled = False
         self._thread = QThread()
-        self._worker = RuntimeProbeWorker(harness)
+        self._worker = RuntimeProbeWorker(harness, status, neural)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_worker_finished)
@@ -2966,12 +2991,13 @@ class MainWindow(QMainWindow):
         )
         self.view_styles = QPushButton("Compare styles")
         self.view_styles.setToolTip(
-            "Natural against Cinematic, on this image, at these settings.\n\n"
-            "Converts once per style and wipes between them. There are only "
-            "two, so this is the whole choice rather than a sample.\n\n"
-            "It costs two conversions: the add-on reads its configuration once "
-            "when it starts, so a style change needs a new harness. Depth is "
-            "estimated once and shared."
+            "The add-on's styles side by side, on this image, at these settings.\n\n"
+            "Converts once per style and wipes between them. The default view "
+            "compares Natural and Cinematic (the two graded looks); Default is "
+            "the add-on's baseline.\n\n"
+            "Each style is a separate conversion: the add-on reads its "
+            "configuration once when it starts, so a style change needs a new "
+            "harness. Depth is estimated once and shared."
         )
         for button in (
             self.view_photo, self.view_depth, self.view_result,
@@ -3802,8 +3828,10 @@ class MainWindow(QMainWindow):
         # Apply to folder moved to the tab band's right corner (self.tab_apply),
         # so it is not repeated here; batch_button is kept as state for its
         # tooltip and any enable/disable, just not shown in this column.
-        layout.addWidget(self.open_button)
+        # Convert sits at the very top - it is the hero action, so it leads the
+        # column rather than following Open. Open/Save/Use-as-input follow.
         layout.addWidget(self.convert_button)
+        layout.addWidget(self.open_button)
         layout.addWidget(self.save_button)
         layout.addWidget(self.feedback_button)
 
@@ -4931,31 +4959,70 @@ class MainWindow(QMainWindow):
                 status = None
 
         if status is not None and status.ready and status.harness is not None:
-            self._begin_background_probe(status.harness)
+            self._begin_background_probe(status)
+        else:
+            # Files still not in place after the finder. Say so plainly rather
+            # than dropping the user into the tour as if setup succeeded - the
+            # reported trap where people believed the app was working when it had
+            # never found its runtime at all.
+            self.statusBar().showMessage("DLSS 5 files are not set up yet.")
+            QMessageBox.information(
+                self,
+                "DLSS 5 files not set up yet",
+                "The DLSS 5 runtime files were not found, so conversions will "
+                "not change the image yet. The tour below still works, and you "
+                "can add the files any time from Settings → Check runtime.",
+            )
 
         self._show_first_conversion_intro()
 
-    def _begin_background_probe(self, harness: Path) -> None:
+    def _begin_background_probe(self, status: runtime.RuntimeStatus) -> None:
         """Confirm the neural path loads, off the UI thread, without blocking.
 
-        The tour and the whole app stay usable while this runs; the status bar
-        reports the result when it lands, and the watchdog inside RuntimeProbe
-        gives up on a runtime that hangs instead of freezing the window.
+        The tour and the whole app stay usable while this runs; the watchdog
+        inside RuntimeProbe gives up on a runtime that hangs instead of freezing
+        the window. Passing the status re-stages the files first, so the check
+        reflects what was just copied in.
         """
-        if self._runtime_probe is not None:
+        if self._runtime_probe is not None or status.harness is None:
             return
         self.statusBar().showMessage("Checking DLSS 5 in the background…")
-        probe = RuntimeProbe(harness, parent=self)
+        probe = RuntimeProbe(
+            status.harness, parent=self, status=status, neural=self.settings.neural
+        )
         self._runtime_probe = probe
         probe.done.connect(self._background_probe_done)
         probe.start()
 
     def _background_probe_done(self, ok: bool, report: str) -> None:
         self._runtime_probe = None
-        self.statusBar().showMessage(
-            "DLSS 5 verified — the neural pass is live." if ok
-            else "Could not confirm the neural pass — Settings → Check runtime for details."
+        if ok:
+            self.statusBar().showMessage("DLSS 5 verified — the neural pass is live.")
+            return
+        # A quiet status-bar line here was the trap users described: files were
+        # present so onboarding walked them into the tour, the background check
+        # failed, and nothing told them - so they concluded the app "does
+        # nothing". Say it plainly, with the specific cause, and offer the fix.
+        self.statusBar().showMessage("DLSS 5 did not load — see the message.")
+        problems = evaluator.interpret_probe(report)
+        detail = "\n\n".join(problems) if problems else (
+            "The live DLSS test did not pass. Open Settings → Check runtime for "
+            "the full report."
         )
+        box = QMessageBox(
+            QMessageBox.Icon.Warning,
+            "DLSS 5 is not hooked up yet",
+            "Your files are in place, but the neural pass did not load, so "
+            "conversions will not change the image until this is fixed:\n\n"
+            f"{detail}\n\nThe app and the tour still work - you can fix this "
+            "any time from Settings → Check runtime.",
+            parent=self,
+        )
+        box.addButton(QMessageBox.StandardButton.Ok)
+        guide = box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
+        box.exec()
+        if box.clickedButton() is guide:
+            open_help("Troubleshooting")
 
     def _show_first_conversion_intro(self) -> None:
         palette = PALETTES.get(self.settings.theme, PALETTES[DEFAULT_THEME])
@@ -5658,7 +5725,12 @@ class MainWindow(QMainWindow):
         dialog.set_busy()
         dialog.enable_cancel("Skip this check")
 
-        probe = RuntimeProbe(status.harness, parent=self)
+        # Pass the freshly detected status so the probe re-stages dlss_files
+        # before testing - otherwise Check runtime reports the copy staged at
+        # startup and a just-added file needs an app restart to be seen.
+        probe = RuntimeProbe(
+            status.harness, parent=self, status=status, neural=self.settings.neural
+        )
         outcome: dict[str, str] = {}
 
         def done(_ok: bool, report: str) -> None:

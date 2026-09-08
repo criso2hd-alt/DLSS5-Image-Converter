@@ -779,13 +779,21 @@ class ImageView(CanvasView):
             self._paint_progress(painter, rect)
         else:
             painter.drawPixmap(rect, self._pixmap, QRectF(self._pixmap.rect()))
-        if self._caption:
-            painter.setPen(self.palette().text().color())
+        # The caption sits under the picture as a quiet label, not a headline:
+        # the app's overlay face (mono, faded) rather than the default white in
+        # the platform font, which read as pasted-on. "None" is not worth a line,
+        # so an empty or "None" caption draws nothing.
+        caption = self._caption
+        if caption and caption.strip().lower() != "none":
+            painter.save()
+            _overlay_font(painter, 8.5, caps=False)
+            painter.setPen(_OVERLAY_READ)
             painter.drawText(
                 QRectF(0, self.height() - 26, self.width(), 22),
                 Qt.AlignmentFlag.AlignCenter,
-                self._caption,
+                caption,
             )
+            painter.restore()
         if self._chrome_opacity > 0.01:
             painter.save()
             painter.setOpacity(self._chrome_opacity)
