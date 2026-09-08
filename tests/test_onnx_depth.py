@@ -27,6 +27,22 @@ def test_is_downloaded_is_false_for_unknown_model():
     assert OnnxDepthEngine.is_downloaded("not/a-real-model") is False
 
 
+def test_providers_does_not_request_tensorrt():
+    """TensorRT is not bundled; requesting it only makes onnxruntime probe for
+    nvinfer and log a failure. CUDA is the GPU path we ship."""
+    assert "TensorrtExecutionProvider" not in onnx_depth._providers()
+
+
+def test_prepare_gpu_libs_is_a_safe_noop_without_a_gpu_build():
+    """_gpu_lib_dir returns the bundled CUDA folder or None, and preparing the
+    search path never raises - a CPU/DirectML install just has nothing to add."""
+    from pathlib import Path
+
+    lib_dir = onnx_depth._gpu_lib_dir()
+    assert lib_dir is None or isinstance(lib_dir, Path)
+    onnx_depth._prepare_gpu_libs()  # must not raise on any platform/install
+
+
 def test_preprocess_produces_normalised_square_nchw():
     eng = OnnxDepthEngine()
     img = (np.random.default_rng(0).random((240, 320, 3)) * 255).astype(np.uint8)

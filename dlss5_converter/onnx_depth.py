@@ -15,6 +15,7 @@ reversed-Z layout DLSS expects.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -68,18 +69,74 @@ def locate(model_id: str) -> Path | None:
     return None
 
 
+#: The CUDA 13 / cuDNN 9 runtime DLLs onnxruntime-gpu loads by bare name at run
+#: time. Windows resolves those against PATH and the executable's directory, not
+#: against the folder the onnxruntime provider DLL lives in, so a bundled GPU
+#: build has to put their directory on the search path itself (see
+#: _prepare_gpu_libs). cudnn64_9.dll is the marker we probe for.
+_CUDA_MARKER = "cudnn64_9.dll"
+
+
+def _gpu_lib_dir() -> Path | None:
+    """The bundled CUDA/cuDNN runtime directory, or None if this isn't a GPU build.
+
+    The build ships the runtime DLLs beside onnxruntime's own provider DLLs
+    (onnxruntime/capi), so that is where we look. A CPU-only or DirectML install
+    simply has no cuDNN there and this returns None - the caller then does
+    nothing and inference runs on whatever provider is available.
+    """
+    try:
+        import onnxruntime as ort
+    except Exception:  # noqa: BLE001 - onnxruntime absence is handled by the caller
+        return None
+    root = Path(ort.__file__).resolve().parent
+    for candidate in (root / "capi", root):
+        if (candidate / _CUDA_MARKER).is_file():
+            return candidate
+    return None
+
+
+def _prepare_gpu_libs() -> None:
+    """Make the bundled CUDA/cuDNN runtime DLLs loadable before a session opens.
+
+    onnxruntime-gpu's CUDA provider dlopen()s cudnn/cublas/nvrtc by bare name at
+    run time, and cuDNN 9 in turn loads its own split backend DLLs the same way.
+    Windows resolves all of those against PATH and the app directory, never
+    against the folder the provider DLL sits in - so co-locating them is not
+    enough; the directory has to be on PATH. add_dll_directory covers the
+    provider's own imports, PATH covers cuDNN's internal loads. A no-op on a
+    non-Windows or non-GPU build, so it is safe to call unconditionally.
+    """
+    if os.name != "nt":
+        return
+    lib_dir = _gpu_lib_dir()
+    if lib_dir is None:
+        return
+    d = str(lib_dir)
+    if d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.add_dll_directory(d)
+    except (OSError, AttributeError):  # already added, or not on Windows
+        pass
+
+
 def _providers() -> list[str]:
     """GPU first, CPU as the guaranteed fallback.
 
     The shipped app installs onnxruntime-gpu or -directml; the plain onnxruntime
     package only offers CPU. Whatever is actually present is used, in that order
     of preference, so the same code runs on any of them.
+
+    TensorRT is deliberately not requested: it needs the multi-hundred-MB
+    TensorRT libraries (nvinfer) that we do not bundle, and listing it only makes
+    onnxruntime probe for them and log a scary failure before falling back to
+    CUDA. CUDA is the target GPU path; DirectML is the vendor-neutral fallback.
     """
     import onnxruntime as ort
 
     available = set(ort.get_available_providers())
     preferred = [
-        "TensorrtExecutionProvider",
         "CUDAExecutionProvider",
         "DmlExecutionProvider",
         "CPUExecutionProvider",
@@ -138,6 +195,10 @@ class OnnxDepthEngine:
 
         if progress:
             progress("Preparing the depth model…")
+        # Put the bundled CUDA/cuDNN runtime on the DLL search path before we
+        # ask onnxruntime which providers it can offer - get_available_providers
+        # and the session both load those DLLs, and neither finds them otherwise.
+        _prepare_gpu_libs()
         providers = _providers()
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL

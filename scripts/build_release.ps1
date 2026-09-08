@@ -39,6 +39,46 @@ if (-not (Test-Path -LiteralPath $Harness)) {
     throw "native\bin\dlss5_eval.exe is missing. Run .\scripts\build_native.ps1 first."
 }
 
+# --- GPU prerequisites, checked before the long freeze so a mistake costs a
+# --- second, not five minutes. This is a GPU build: depth runs on ONNX Runtime's
+# --- CUDA execution provider. Two things have to be true in the build venv.
+$SitePackages = Join-Path (Split-Path -Parent (Split-Path -Parent $Python)) "Lib\site-packages"
+
+# 1. onnxruntime-gpu, not the CPU-only onnxruntime. They install under the same
+#    name, so the only honest test is whether the CUDA provider DLL is present.
+#    Getting this wrong is exactly how a "GPU build" silently ships as CPU-only.
+$OrtCapi = Join-Path $SitePackages "onnxruntime\capi"
+if (-not (Test-Path -LiteralPath (Join-Path $OrtCapi "onnxruntime_providers_cuda.dll"))) {
+    throw ("The build venv has CPU-only onnxruntime. This is a GPU build. Run:`n" +
+           "    $Python -m pip uninstall -y onnxruntime`n" +
+           "    $Python -m pip install onnxruntime-gpu`n" +
+           "then rebuild.")
+}
+
+# 2. The CUDA 13 / cuDNN 9 runtime DLLs onnxruntime-gpu loads at run time. The
+#    pip wheel does not carry them; the export extra's torch (cu130) does, in
+#    torch\lib, which is the reproducible source in this venv. These get copied
+#    beside onnxruntime's DLLs in the frozen app so the CUDA provider can load
+#    them with no CUDA toolkit installed on the user's machine.
+$CudaSrc = Join-Path $SitePackages "torch\lib"
+$CudaDlls = @(
+    "cudart64_13.dll", "cublas64_13.dll", "cublasLt64_13.dll",
+    "cufft64_12.dll", "curand64_10.dll",
+    "cudnn64_9.dll", "cudnn_graph64_9.dll", "cudnn_ops64_9.dll",
+    "cudnn_cnn64_9.dll", "cudnn_adv64_9.dll", "cudnn_heuristic64_9.dll",
+    "cudnn_engines_precompiled64_9.dll", "cudnn_engines_runtime_compiled64_9.dll",
+    # nvrtc lets cuDNN JIT its best kernels instead of warning and falling back.
+    "nvrtc64_130_0.dll", "nvrtc-builtins64_130.dll", "nvJitLink_130_0.dll"
+)
+$MissingCuda = @($CudaDlls | Where-Object { -not (Test-Path -LiteralPath (Join-Path $CudaSrc $_)) })
+if ($MissingCuda.Count -gt 0) {
+    throw ("The CUDA runtime DLLs are not in the build venv ($CudaSrc):`n" +
+           "    $($MissingCuda -join ', ')`n" +
+           "They ship with torch's CUDA build. Install the export extra:`n" +
+           "    $Python -m pip install -e .[export]`n" +
+           "then rebuild.")
+}
+
 # Not `2>$null`: redirecting a native command's stderr in Windows PowerShell
 # wraps each line in an ErrorRecord and trips $ErrorActionPreference = "Stop"
 # even when the exit code is 0. Same dance as Test-Interpreter in setup.ps1.
@@ -97,13 +137,12 @@ if (-not (Test-Path -LiteralPath $SmallOnnx)) {
 # scripts/export_onnx.py now. onnxruntime is collected whole so its execution
 # provider DLLs (CUDA/TensorRT + CPU) ship with the app.
 #
-# CUDA runtime note: onnxruntime-gpu needs the CUDA + cuDNN runtime DLLs at run
-# time. `--collect-all onnxruntime` bundles onnxruntime's own DLLs; when those
-# runtime DLLs come from the nvidia-*-cu12 pip packages they must be collected
-# too (add --collect-all nvidia_cudnn / nvidia_cublas / nvidia_cuda_runtime in
-# the build venv that has them). This build must be made in a venv with
-# onnxruntime-gpu installed, and verified on a real RTX GPU - the CUDA execution
-# provider cannot be exercised on the CI/build box alone.
+# CUDA runtime note: onnxruntime-gpu needs the CUDA 13 + cuDNN 9 runtime DLLs at
+# run time. `--collect-all onnxruntime` bundles onnxruntime's own DLLs but not
+# those; the CUDA-runtime copy step further down places them beside onnxruntime's
+# provider DLLs (from torch\lib in this venv, validated at the top of the script).
+# onnx_depth._prepare_gpu_libs then puts that folder on the DLL search path at
+# run time so the user needs no CUDA toolkit installed.
 #
 # The bundled ONNX depth model rides inside assets\ (see the export step above),
 # so the existing --add-data of the assets tree carries it into the release.
@@ -185,6 +224,29 @@ foreach ($RuntimeDll in @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll")) {
 $ForeignIcu = Join-Path $Internal "icuuc.dll"
 if (Test-Path -LiteralPath $ForeignIcu) {
     throw "A foreign icuuc.dll was bundled at $ForeignIcu. Check PATH contamination."
+}
+
+# The CUDA 13 / cuDNN 9 runtime, placed beside onnxruntime's own provider DLLs.
+# This is what turns onnxruntime-gpu into a self-contained GPU app: the CUDA
+# provider dlopen()s these by bare name, and onnx_depth._prepare_gpu_libs puts
+# this exact folder on the DLL search path at startup so they resolve. Without
+# them the provider silently falls back to CPU - the very bug this build fixes.
+$FrozenCapi = Join-Path $Internal "onnxruntime\capi"
+if (-not (Test-Path -LiteralPath (Join-Path $FrozenCapi "onnxruntime_providers_cuda.dll"))) {
+    throw ("onnxruntime's CUDA provider DLL is not in the frozen app at $FrozenCapi. " +
+           "The --collect-all onnxruntime step did not bundle onnxruntime-gpu as expected.")
+}
+Write-Host "Bundling the CUDA 13 / cuDNN 9 runtime for the GPU depth path..." -ForegroundColor Cyan
+foreach ($Dll in $CudaDlls) {
+    Copy-Item -LiteralPath (Join-Path $CudaSrc $Dll) -Destination (Join-Path $FrozenCapi $Dll) -Force
+}
+# We do not ship TensorRT (its nvinfer libraries are hundreds of MB and unused),
+# so drop its provider DLL. Left in place, onnxruntime lists TensorRT as
+# available and probes for nvinfer on every startup, logging a failure before it
+# falls back to CUDA. Removing the DLL is what keeps the launch clean.
+$TensorrtDll = Join-Path $FrozenCapi "onnxruntime_providers_tensorrt.dll"
+if (Test-Path -LiteralPath $TensorrtDll) {
+    Remove-Item -LiteralPath $TensorrtDll -Force
 }
 
 foreach ($Folder in $UserFolders) {
