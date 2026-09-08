@@ -14,11 +14,14 @@ dependencies = [
   "numpy>=1.26,<3",
   "opencv-python-headless>=4.10,<5",
   "Pillow>=10.4,<12",
-  # Depth runs on ONNX Runtime's CUDA provider, not PyTorch - see onnx_depth.py.
-  # This is what removes the 2.7 GB torch download. The 1.29 line targets the
-  # CUDA 13 / cuDNN 9 runtime the release bundles (from torch's cu130 build);
-  # keep them in step. CPU is the built-in fallback when no GPU is present.
-  "onnxruntime-gpu>=1.29,<2",
+  # Depth runs on ONNX Runtime, not PyTorch - see onnx_depth.py - which is what
+  # removes the 2.7 GB torch download. The shipped GPU path is DirectML: it runs
+  # on any DirectX 12 GPU (NVIDIA/AMD/Intel) through the driver the user already
+  # has, is a single ~18 MB DLL (no CUDA toolkit, no 1.5 GB cuDNN bundle, no
+  # download), and matches CUDA's speed on this workload. CPU is the built-in
+  # fallback. A user who wants CUDA can pip install onnxruntime-gpu instead;
+  # _providers() prefers it when present.
+  "onnxruntime-directml>=1.20,<2",
   "huggingface-hub>=0.25,<1",
   "truststore>=0.9,<1",
   "platformdirs>=4,<5",

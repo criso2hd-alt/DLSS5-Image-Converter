@@ -62,9 +62,9 @@ def run_gpu_check() -> int:
         _line(
             f"depth inference  : ok {depth.shape} in {elapsed * 1000:.0f} ms on {device}"
         )
-        if device != "cuda":
+        if device == "cpu":
             _line("")
-            _line("RESULT: running on " + device.upper() + ", not the GPU.")
+            _line("RESULT: running on CPU, not the GPU.")
             return 1
     except Exception as error:  # noqa: BLE001
         _line(f"depth inference  : FAILED - {type(error).__name__}: {error}")

@@ -204,9 +204,14 @@ class OnnxDepthEngine:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(str(path), options, providers=providers)
         active = self.session.get_providers()[0]
-        self.device = "cuda" if active in (
-            "TensorrtExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider",
-        ) else "cpu"
+        # Report the real backend rather than a blanket "gpu": the shipped build
+        # runs on DirectML (any DX12 GPU), a user who installs onnxruntime-gpu
+        # gets CUDA, and everyone else falls back to CPU.
+        self.device = {
+            "CUDAExecutionProvider": "cuda",
+            "TensorrtExecutionProvider": "cuda",
+            "DmlExecutionProvider": "directml",
+        }.get(active, "cpu")
         self.model_id = model_id
         return self.device
 
