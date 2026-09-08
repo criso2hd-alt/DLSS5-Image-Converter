@@ -22,7 +22,9 @@ $AssetsSrc = Join-Path $ProjectRoot "dlss5_converter\assets"
 # out a 400 MB model download or a folder of converted images, which is the
 # hazard that made CLAUDE.md keep weights out of the app directory in the first
 # place. Keeping them across rebuilds is what buys back that guarantee.
-$UserFolders = @("dlss_files", "models", "output", "pytorch")
+# No "pytorch" folder any more - depth is ONNX Runtime and the model is bundled,
+# so nothing large is downloaded on first run.
+$UserFolders = @("dlss_files", "models", "output")
 
 $Python = Join-Path $ProjectRoot ".venv-cuda\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python)) {
@@ -54,7 +56,7 @@ if ($Clean -and (Test-Path -LiteralPath $Staging)) {
     Remove-Item -LiteralPath $Staging -Recurse -Force
 }
 
-Write-Host "Freezing the application (lean: PyTorch is fetched on first run)." -ForegroundColor Cyan
+Write-Host "Freezing the application (ONNX Runtime; depth model bundled, no downloads)." -ForegroundColor Cyan
 
 # PyInstaller writes its whole progress log to stderr, and under
 # $ErrorActionPreference = "Stop" Windows PowerShell treats a native command's
@@ -75,22 +77,36 @@ $env:Path = (($env:Path -split ";") | Where-Object {
     $_ -and $_ -notmatch "[\\/]\.cache[\\/]codex-runtimes[\\/]"
 }) -join ";"
 
-# torch is excluded on purpose: it is 2.7 GB of the ~3 GB a bundled build used
-# to be, and dlss5_converter.bootstrap downloads the wheel on first launch
-# instead. Its own metadata comes from the wheel's dist-info, which lands on
-# sys.path with it.
+# Bundle the Apache-2.0 Small ONNX depth model. Exported from the Depth Anything
+# V2 weights (needs the `export` extra: torch + transformers, dev-only) into
+# assets\onnx, so the --add-data of the assets tree carries it into the release.
+# Reused if already present, so a normal rebuild does not re-export.
+$OnnxDir = Join-Path $AssetsSrc "onnx"
+$SmallOnnx = Join-Path $OnnxDir "Depth-Anything-V2-Small-hf.onnx"
+if (-not (Test-Path -LiteralPath $SmallOnnx)) {
+    Write-Host "Exporting the Small ONNX depth model (one-time)..." -ForegroundColor Cyan
+    & $Python (Join-Path $ProjectRoot "scripts\export_onnx.py") --model small --out $OnnxDir
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $SmallOnnx)) {
+        throw "Could not export the Small ONNX depth model. Install the export extra (pip install -e .[export]) and retry."
+    }
+}
+
+# Depth runs on ONNX Runtime now, not PyTorch (see dlss5_converter/onnx_depth.py),
+# which is what removed the old 2.7 GB torch download. So torch and the whole HF
+# transformers stack are EXCLUDED from the bundle - they are dev-only tooling for
+# scripts/export_onnx.py now. onnxruntime is collected whole so its execution
+# provider DLLs (CUDA/TensorRT + CPU) ship with the app.
 #
-# Its dependencies do have to stay bundled, though, and there are two kinds.
+# CUDA runtime note: onnxruntime-gpu needs the CUDA + cuDNN runtime DLLs at run
+# time. `--collect-all onnxruntime` bundles onnxruntime's own DLLs; when those
+# runtime DLLs come from the nvidia-*-cu12 pip packages they must be collected
+# too (add --collect-all nvidia_cudnn / nvidia_cublas / nvidia_cuda_runtime in
+# the build venv that has them). This build must be made in a venv with
+# onnxruntime-gpu installed, and verified on a real RTX GPU - the CUDA execution
+# provider cannot be exercised on the CI/build box alone.
 #
-# Third-party (sympy, networkx, jinja2...) are separate packages the torch wheel
-# does not carry. Standard library (pickletools, dis, tarfile...) are modules
-# that only torch reaches for - with torch out of the analysis, PyInstaller sees
-# nothing referencing them and leaves them out of the bundle entirely.
-#
-# Both failures look identical and both are invisible until the first
-# conversion, because bootstrap.is_ready only locates torch rather than
-# importing it. `DLSS5Converter.exe --selftest` is what catches them; it found
-# "No module named 'pickletools'" in the first lean build.
+# The bundled ONNX depth model rides inside assets\ (see the export step above),
+# so the existing --add-data of the assets tree carries it into the release.
 & $Python -m PyInstaller `
     --noconfirm `
     --windowed `
@@ -99,88 +115,23 @@ $env:Path = (($env:Path -split ";") | Where-Object {
     --workpath (Join-Path $ProjectRoot "build\pyinstaller-work") `
     --specpath (Join-Path $ProjectRoot "build") `
     --exclude-module torch `
+    --exclude-module transformers `
+    --exclude-module tokenizers `
+    --exclude-module safetensors `
     --exclude-module av `
-    --collect-all sympy `
-    --collect-all networkx `
-    --hidden-import jinja2 `
-    --hidden-import fsspec `
-    --hidden-import mpmath `
-    --hidden-import filelock `
-    --hidden-import typing_extensions `
-    --hidden-import pickletools `
-    --hidden-import dis `
-    --hidden-import ast `
-    --hidden-import tokenize `
-    --hidden-import inspect `
-    --hidden-import linecache `
-    --hidden-import difflib `
-    --hidden-import textwrap `
-    --hidden-import pprint `
-    --hidden-import copy `
-    --hidden-import copyreg `
-    --hidden-import weakref `
-    --hidden-import dataclasses `
-    --hidden-import contextlib `
-    --hidden-import sysconfig `
-    --hidden-import platform `
-    --hidden-import glob `
-    --hidden-import fnmatch `
-    --hidden-import tarfile `
-    --hidden-import gzip `
-    --hidden-import bz2 `
-    --hidden-import lzma `
-    --hidden-import zipfile `
-    --hidden-import shutil `
-    --hidden-import tempfile `
-    --hidden-import subprocess `
-    --hidden-import multiprocessing `
-    --hidden-import queue `
-    --hidden-import ctypes.util `
-    --hidden-import decimal `
-    --hidden-import fractions `
-    --hidden-import numbers `
-    --hidden-import statistics `
-    --hidden-import bisect `
-    --hidden-import heapq `
-    --hidden-import array `
-    --hidden-import mmap `
-    --hidden-import struct `
-    --hidden-import uuid `
-    --hidden-import string `
-    --hidden-import unicodedata `
-    --hidden-import csv `
-    --hidden-import logging.config `
-    --hidden-import logging.handlers `
-    --hidden-import unittest `
-    --hidden-import unittest.mock `
-    --hidden-import doctest `
-    --hidden-import argparse `
-    --hidden-import importlib.metadata `
-    --hidden-import importlib.machinery `
+    --exclude-module tkinter `
+    --exclude-module matplotlib `
+    --exclude-module pytest `
+    --collect-all onnxruntime `
     --hidden-import PySide6.QtMultimedia `
     --hidden-import PySide6.QtMultimediaWidgets `
     --collect-all PySide6.QtMultimedia `
     --collect-all PySide6.QtMultimediaWidgets `
-    --collect-all transformers `
-    --collect-submodules transformers `
-    --hidden-import transformers.models.auto.image_processing_auto `
-    --hidden-import transformers.models.auto.modeling_auto `
-    --collect-all tokenizers `
-    --collect-data safetensors `
-    --copy-metadata transformers `
-    --copy-metadata tokenizers `
-    --copy-metadata safetensors `
-    --copy-metadata huggingface-hub `
     --copy-metadata numpy `
     --copy-metadata packaging `
-    --copy-metadata pyyaml `
-    --copy-metadata regex `
     --copy-metadata requests `
     --copy-metadata filelock `
-    --copy-metadata tqdm `
-    --exclude-module tkinter `
-    --exclude-module matplotlib `
-    --exclude-module pytest `
+    --copy-metadata huggingface-hub `
     --add-data "$AssetsSrc;dlss5_converter/assets" `
     main.py
 $FrozenExit = $LASTEXITCODE
@@ -289,26 +240,15 @@ is where NGX and ReShade look. Use Diagnose in the app to check what it found.
 Set-Content -Path (Join-Path $Release "dlss_files\READ ME FIRST.txt") -Value $Readme -Encoding utf8
 
 Set-Content -Path (Join-Path $Release "models\READ ME.txt") -Encoding utf8 -Value @'
-Depth Anything V2 weights are downloaded here on first launch, about 400 MB for
-the default model. Switching model in the app downloads that one too.
+The default depth model (Depth Anything V2 Small, ONNX) ships inside the app, so
+it works out of the box with no download. Larger models (Base/Large) would be
+downloaded here if selected.
 
-Nothing here ships with the release. Deleting this folder only costs you the
-download; rebuilding the app does not touch it.
+Nothing here is required for the app to run. Rebuilding the app does not touch it.
 '@
 
 Set-Content -Path (Join-Path $Release "output\READ ME.txt") -Encoding utf8 -Value @'
 Converted images are saved here by default.
-'@
-
-Set-Content -Path (Join-Path $Release "pytorch\READ ME.txt") -Encoding utf8 -Value @'
-PyTorch is downloaded here on first launch, about 1.8 GB.
-
-It is not bundled with the release on purpose: it is by far the largest thing
-the app needs, and shipping it would put 2.7 GB into every copy. It is freely
-redistributable, so this is a size decision rather than a licensing one.
-
-Deleting this folder only costs you the download. Rebuilding the app does not
-touch it.
 '@
 
 # Belt and braces: nothing in the NVIDIA runtime may ever end up in the part of
@@ -383,7 +323,6 @@ Write-Host ""
 Write-Host "release\"
 Write-Host "  DLSS5Converter.exe"
 Write-Host "  dlss_files\   <- the user drops their own DLSS 5 binaries here"
-Write-Host "  models\       <- depth weights, downloaded on first run"
-Write-Host "  pytorch\      <- PyTorch, downloaded on first run"
+Write-Host "  models\       <- optional larger depth models (Small ships bundled)"
 Write-Host "  output\       <- converted images"
 Write-Host "  engine\       <- dlss5_eval.exe"

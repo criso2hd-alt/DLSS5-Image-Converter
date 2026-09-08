@@ -13,7 +13,6 @@ Output goes to stderr, which a windowed build still writes to a redirect, so:
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 
 def _line(text: str = "") -> None:
@@ -27,36 +26,30 @@ def run_selftest() -> int:
     _line("DLSS 5 Image & Video Converter - self test")
     _line("=" * 46)
 
-    from . import bootstrap, paths
+    from . import paths
 
     _line(f"frozen           : {paths.is_frozen()}")
     _line(f"app folder       : {paths.app_dir()}")
-    _line(f"pytorch folder   : {bootstrap.runtime_dir()}")
     _line(f"models folder    : {paths.model_cache_dir()}")
     _line("")
 
-    # --- the runtime, imported for real ---------------------------------
-    bootstrap.activate()
+    # --- the depth runtime (ONNX Runtime, not PyTorch) ------------------
     try:
-        import torch
+        import onnxruntime as ort
 
-        _line(f"torch            : {torch.__version__}")
-        _line(f"torch location   : {Path(torch.__file__).parent}")
-        cuda = torch.cuda.is_available()
-        _line(f"cuda available   : {cuda}")
-        if cuda:
-            _line(f"device           : {torch.cuda.get_device_name(0)}")
-            result = (torch.randn(256, 256, device="cuda") @ torch.randn(256, 256, device="cuda"))
-            _line(f"gpu matmul       : ok {tuple(result.shape)}")
-        else:
-            _line("gpu matmul       : SKIPPED - no CUDA device")
+        _line(f"onnxruntime      : {ort.__version__}")
+        providers = ort.get_available_providers()
+        _line(f"providers        : {', '.join(providers)}")
+        gpu = ("CUDAExecutionProvider", "TensorrtExecutionProvider", "DmlExecutionProvider")
+        if not any(p in providers for p in gpu):
+            _line("gpu provider     : SKIPPED - only CPU is available")
             failures += 1
     except Exception as error:  # noqa: BLE001 - reporting is the whole point
-        _line(f"torch            : FAILED - {type(error).__name__}: {error}")
+        _line(f"onnxruntime      : FAILED - {type(error).__name__}: {error}")
         failures += 1
 
     # --- everything the depth stage needs -------------------------------
-    for name in ("transformers", "safetensors", "huggingface_hub", "cv2", "numpy", "PIL"):
+    for name in ("cv2", "numpy", "PIL"):
         try:
             __import__(name)
             _line(f"{name:<17}: ok")
@@ -71,19 +64,19 @@ def run_selftest() -> int:
     # triggered when the model is absent: a diagnostic should not start a
     # 400 MB download behind the user's back.
     try:
-        from .depth_engine import DEFAULT_MODEL, DepthEngine
+        from .onnx_depth import OnnxDepthEngine
         from .settings import AppSettings
 
-        if not DepthEngine.is_downloaded(DEFAULT_MODEL):
-            _line("depth inference  : skipped - model not downloaded yet")
+        model_id = AppSettings().depth.model_id
+        if not OnnxDepthEngine.is_downloaded(model_id):
+            _line("depth inference  : skipped - model not installed")
         else:
             import numpy as np
 
-            settings = AppSettings()
-            engine = DepthEngine()
-            engine.load(DEFAULT_MODEL)
+            engine = OnnxDepthEngine()
+            engine.load(model_id)
             probe = (np.random.default_rng(0).random((256, 256, 3)) * 255).astype("uint8")
-            depth = engine.infer(probe, input_size=settings.depth.input_size)
+            depth = engine.infer(probe)
             _line(
                 f"depth inference  : ok {depth.shape} "
                 f"range [{float(depth.min()):.3f}, {float(depth.max()):.3f}] "
