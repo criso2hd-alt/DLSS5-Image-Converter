@@ -20,8 +20,8 @@ import numpy as np
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
 from . import creative, video
@@ -142,11 +142,13 @@ class CreativePage(QWidget):
             "QLabel { background: #0a0f18; border-radius: 8px; color: #6b7688; padding: 24px; }")
         row.addWidget(self.view, 1)
 
-        rail = QWidget()
-        rail.setFixedWidth(300)
-        col = QVBoxLayout(rail)
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(12)
+        # Controls live in a scroll area: there are enough of them now that a
+        # fixed rail would clip on a short window.
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(0, 0, 8, 0)
+        col.setSpacing(10)
+        self._controls: list[QWidget] = []
 
         blurb = QLabel("Bring the converted image to life: a gentle 2.5-D move "
                        "through its depth, with atmosphere. Loops seamlessly, "
@@ -155,40 +157,96 @@ class CreativePage(QWidget):
         blurb.setStyleSheet("color: #8a93a6;")
         col.addWidget(blurb)
 
+        disclaimer = QLabel(
+            "Heads up: this is a 2.5-D parallax effect, not true 3-D. It reshapes "
+            "the one photo along its estimated depth, so it is for experimenting "
+            "with depth and motion, and not every image will hold up. Keep the "
+            "moves gentle.")
+        disclaimer.setWordWrap(True)
+        disclaimer.setStyleSheet(
+            "color: #8590a3; font-size: 11px; font-style: italic; "
+            "background: #10151f; border: 1px solid #1c2534; border-radius: 6px; padding: 8px;")
+        col.addWidget(disclaimer)
+
         self.aspect_box = self._combo(list(creative.ASPECTS), self.settings.aspect,
                                       self._aspect_changed)
         self.preset_box = self._combo(list(creative.PRESETS), self.settings.preset,
                                       self._preset_changed)
         col.addLayout(self._labeled("Frame", self.aspect_box))
         col.addLayout(self._labeled("Motion", self.preset_box))
+        col.addLayout(self._labeled("Depth strength",
+                                    self._fslider("depth_intensity", 2.0)))
 
-        self.depth_slider = self._slider(int(self.settings.depth_intensity * 100),
-                                         lambda v: self._set("depth_intensity", v / 100), 200)
-        self.fog_slider = self._slider(int(self.settings.fog * 100),
-                                       lambda v: self._set("fog", v / 100))
-        self.embers_slider = self._slider(int(self.settings.embers * 100),
-                                          lambda v: self._set("embers", v / 100))
-        self.dust_slider = self._slider(int(self.settings.dust * 100),
-                                        lambda v: self._set("dust", v / 100))
-        col.addLayout(self._labeled("Depth", self.depth_slider))
-        col.addLayout(self._labeled("Fog", self.fog_slider))
-        col.addLayout(self._labeled("Embers", self.embers_slider))
-        col.addLayout(self._labeled("Dust", self.dust_slider))
+        col.addWidget(self._section("Fog"))
+        col.addLayout(self._labeled("Amount", self._fslider("fog", 1.0)))
+        col.addLayout(self._labeled("Plane (near → far)",
+                                    self._fslider("fog_plane", 1.0)))
+
+        col.addWidget(self._section("Embers"))
+        col.addLayout(self._labeled("Amount", self._fslider("embers", 1.0)))
+        col.addLayout(self._labeled("Plane (near → far)",
+                                    self._fslider("ember_plane", 1.0)))
+        col.addLayout(self._labeled("Direction", self._dirslider("ember_dir")))
+        col.addLayout(self._labeled("Speed", self._fslider("ember_speed", 1.0)))
+        col.addLayout(self._labeled("Size", self._fslider("ember_size", 1.0)))
+
+        col.addWidget(self._section("Dust"))
+        col.addLayout(self._labeled("Amount", self._fslider("dust", 1.0)))
+        col.addLayout(self._labeled("Plane (near → far)",
+                                    self._fslider("dust_plane", 1.0)))
+        col.addLayout(self._labeled("Direction", self._dirslider("dust_dir")))
+        col.addLayout(self._labeled("Speed", self._fslider("dust_speed", 1.0)))
+        col.addLayout(self._labeled("Size", self._fslider("dust_size", 1.0)))
 
         col.addStretch(1)
 
+        rail = QScrollArea()
+        rail.setWidget(inner)
+        rail.setWidgetResizable(True)
+        rail.setFrameShape(QFrame.Shape.NoFrame)
+        rail.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        rail.setFixedWidth(320)
+
+        railcol = QWidget()
+        rc = QVBoxLayout(railcol)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(10)
+        rc.addWidget(rail, 1)
         self.status = QLabel("")
         self.status.setStyleSheet("color: #8a93a6;")
         self.status.setWordWrap(True)
-        col.addWidget(self.status)
-
+        rc.addWidget(self.status)
         self.export_button = QPushButton("Export loop…")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._export)
-        col.addWidget(self.export_button)
+        rc.addWidget(self.export_button)
+        railcol.setFixedWidth(320)
 
-        row.addWidget(rail)
+        row.addWidget(railcol)
         self._set_controls_enabled(False)
+
+    def _section(self, title: str) -> QLabel:
+        lab = QLabel(title.upper())
+        lab.setStyleSheet("color: #6f7a8e; font-size: 11px; font-weight: 600; "
+                          "letter-spacing: 1px; margin-top: 6px;")
+        return lab
+
+    def _fslider(self, field: str, hi: float) -> QSlider:
+        """A slider over a float field 0..hi, mapped through 0..100 ticks."""
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(0, 100)
+        s.setValue(int(round(getattr(self.settings, field) / hi * 100)))
+        s.valueChanged.connect(lambda v: self._set(field, v / 100 * hi))
+        self._controls.append(s)
+        return s
+
+    def _dirslider(self, field: str) -> QSlider:
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(0, 360)
+        s.setValue(int(getattr(self.settings, field)))
+        s.valueChanged.connect(lambda v: self._set(field, float(v)))
+        self._controls.append(s)
+        return s
 
     def _empty_text(self) -> str:
         return ("Convert or open an image in the Single image tab.\n\n"
@@ -199,12 +257,6 @@ class CreativePage(QWidget):
         box.currentTextChanged.connect(on_change)
         return box
 
-    def _slider(self, value, on_change, hi: int = 100) -> QSlider:
-        s = QSlider(Qt.Orientation.Horizontal)
-        s.setRange(0, hi); s.setValue(value)
-        s.valueChanged.connect(on_change)
-        return s
-
     def _labeled(self, text, widget) -> QVBoxLayout:
         box = QVBoxLayout(); box.setSpacing(4)
         lab = QLabel(text); lab.setStyleSheet("color: #b9c1d1; font-size: 12px;")
@@ -212,8 +264,7 @@ class CreativePage(QWidget):
         return box
 
     def _set_controls_enabled(self, on: bool) -> None:
-        for w in (self.aspect_box, self.preset_box, self.depth_slider,
-                  self.fog_slider, self.embers_slider, self.dust_slider):
+        for w in [self.aspect_box, self.preset_box, *self._controls]:
             w.setEnabled(on)
 
     # -- source intake -------------------------------------------------------
