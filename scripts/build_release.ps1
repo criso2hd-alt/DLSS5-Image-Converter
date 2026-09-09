@@ -138,6 +138,8 @@ if (-not (Test-Path -LiteralPath $SmallOnnx)) {
     --exclude-module matplotlib `
     --exclude-module pytest `
     --collect-all onnxruntime `
+    --collect-all wgpu `
+    --collect-all rendercanvas `
     --hidden-import PySide6.QtMultimedia `
     --hidden-import PySide6.QtMultimediaWidgets `
     --collect-all PySide6.QtMultimedia `

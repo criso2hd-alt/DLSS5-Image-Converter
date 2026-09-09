@@ -26,29 +26,19 @@ from PySide6.QtWidgets import (
 
 from . import creative, video
 
-PREVIEW_LONG = 600      # long side used for the live preview render
+PREVIEW_LONG = 720      # long side used for the live preview render
 EXPORT_LONG = 1440      # long side used for the exported MP4
 
 
-def _fit(image: np.ndarray, depth: np.ndarray, long_side: int
-         ) -> tuple[np.ndarray, np.ndarray]:
-    """Scale image+depth so the long side is `long_side` (depth matched to it)."""
-    h, w = image.shape[:2]
-    scale = long_side / max(h, w)
-    if scale < 1.0:
-        nw, nh = int(round(w * scale)), int(round(h * scale))
-        nw -= nw % 2; nh -= nh % 2
-        image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
-    if depth.shape[:2] != image.shape[:2]:
-        depth = cv2.resize(depth, (image.shape[1], image.shape[0]),
-                           interpolation=cv2.INTER_LINEAR)
-    return image, depth
-
-
 class _Worker(QObject):
-    """Lives on a background thread. Renders loops from a held source image."""
+    """Lives on a background thread. Renders single frames on demand.
 
-    frames_ready = Signal(object)          # list[np.ndarray]
+    Rendering one frame per playback tick (rather than precomputing a whole
+    loop) is what keeps the preview responsive: a control change is reflected on
+    the very next frame, and the GPU readback cost is paid one frame at a time.
+    """
+
+    frame_ready = Signal(int, object)      # index, np.ndarray
     export_done = Signal(str)
     failed = Signal(str)
 
@@ -56,20 +46,29 @@ class _Worker(QObject):
         super().__init__()
         self._img: np.ndarray | None = None
         self._dep: np.ndarray | None = None
+        self._renderer = None
+        self._rkey = None
+        self._settings = creative.CreativeSettings()
 
     def set_source(self, image: object, depth: object) -> None:
-        # Stored full-resolution; preview and export scale from these. Copies,
-        # because the arrays belong to the main window and it may reuse them.
         self._img = None if image is None else np.ascontiguousarray(image)
         self._dep = None if depth is None else np.ascontiguousarray(depth)
+        self._renderer = None
 
-    def render(self, s: creative.CreativeSettings) -> None:
+    def set_settings(self, s: creative.CreativeSettings) -> None:
+        self._settings = s
+
+    def render_one(self, index: int) -> None:
         try:
             if self._img is None:
                 return
-            img, dep = _fit(self._img, self._dep, PREVIEW_LONG)
-            img, dep = creative.reframe(img, dep, creative.ASPECTS[s.aspect])
-            self.frames_ready.emit(creative.Renderer(img, dep).render_loop(s))
+            s = self._settings
+            if self._renderer is None or self._rkey != s.aspect:
+                img, dep = creative.reframe(self._img, self._dep,
+                                            creative.ASPECTS[s.aspect])
+                self._renderer = creative.Renderer(img, dep, long_side=PREVIEW_LONG)
+                self._rkey = s.aspect
+            self.frame_ready.emit(index, self._renderer.frame(s, index % s.frames))
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(str(error))
 
@@ -77,10 +76,13 @@ class _Worker(QObject):
         try:
             if self._img is None:
                 raise RuntimeError("No image to export.")
-            img, dep = _fit(self._img, self._dep, EXPORT_LONG)
-            img, dep = creative.reframe(img, dep, creative.ASPECTS[s.aspect])
-            frames = creative.Renderer(img, dep).render_loop(s)
+            img, dep = creative.reframe(self._img, self._dep,
+                                        creative.ASPECTS[s.aspect])
+            frames = creative.Renderer(img, dep, long_side=EXPORT_LONG).render_loop(s)
             fh, fw = frames[0].shape[:2]
+            # The cached preview mesh is now overwritten on the shared GPU
+            # renderer; force a rebuild on the next preview.
+            self._renderer = None
             writer = video.VideoWriter(Path(path), video.CODECS_BY_KEY["h264"],
                                        float(s.fps), (fw, fh))
             for _ in range(2):             # twice, so a short clip reads as a loop
@@ -96,34 +98,35 @@ class CreativePage(QWidget):
     """3D tab widget. Inherits the processed image from the main window."""
 
     _request_set_source = Signal(object, object)
-    _request_render = Signal(object)
+    _request_settings = Signal(object)
+    _request_frame = Signal(int)
     _request_export = Signal(object, str)
 
     def __init__(self) -> None:
         super().__init__()
         self.settings = creative.CreativeSettings()
-        self._frames: list[np.ndarray] = []
         self._play_index = 0
         self._has_source = False
+        self._in_flight = False
 
         self._thread = QThread(self)
         self._worker = _Worker()
         self._worker.moveToThread(self._thread)
         self._request_set_source.connect(self._worker.set_source)
-        self._request_render.connect(self._worker.render)
+        self._request_settings.connect(self._worker.set_settings)
+        self._request_frame.connect(self._worker.render_one)
         self._request_export.connect(self._worker.export)
-        self._worker.frames_ready.connect(self._on_frames)
+        self._worker.frame_ready.connect(self._on_frame)
         self._worker.export_done.connect(self._on_export_done)
         self._worker.failed.connect(self._on_failed)
         self._thread.start()
 
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        self._debounce.setInterval(90)
-        self._debounce.timeout.connect(self._render)
-
-        self._playback = QTimer(self)
-        self._playback.timeout.connect(self._advance)
+        # Pull-based playback: request the next frame only after the last one
+        # arrives, paced to the target fps. Playback runs at whatever rate the
+        # GPU sustains, and any control change is picked up on the next frame.
+        self._pacer = QTimer(self)
+        self._pacer.setSingleShot(True)
+        self._pacer.timeout.connect(self._next_frame)
 
         self._build()
 
@@ -296,59 +299,58 @@ class CreativePage(QWidget):
             self._has_source = False
             self._set_controls_enabled(False)
             self.export_button.setEnabled(False)
-            self._playback.stop()
+            self._pacer.stop()
             self.view.setText(self._empty_text())
             self._request_set_source.emit(None, None)
             return
         self._has_source = True
         self._set_controls_enabled(True)
+        self.export_button.setEnabled(True)
         self._request_set_source.emit(np.asarray(image), np.asarray(depth))
+        self._push_settings()
         self.status.setText("Rendering…")
-        self._request_render.emit(self._snapshot())
+        self._play_index = 0
+        if not self._in_flight:                     # kick the playback loop
+            self._next_frame()
 
     # -- events --------------------------------------------------------------
 
-    def _snapshot(self) -> creative.CreativeSettings:
-        return creative.CreativeSettings(**vars(self.settings))
+    def _push_settings(self) -> None:
+        self._request_settings.emit(creative.CreativeSettings(**vars(self.settings)))
 
     def _set(self, field, value) -> None:
         setattr(self.settings, field, value)
         if self._has_source:
-            self._debounce.start()
+            self._push_settings()
 
     def _aspect_changed(self, text) -> None:
         self.settings.aspect = text
         if self._has_source:
-            self._debounce.start()
+            self._push_settings()
 
     def _preset_changed(self, text) -> None:
         self.settings.preset = text
         if self._has_source:
-            self._debounce.start()
+            self._push_settings()
 
     def _view_changed(self, text) -> None:
         self.settings.view = text
         if self._has_source:
-            self._debounce.start()
+            self._push_settings()
 
-    def _render(self) -> None:
-        if self._has_source:
-            self.status.setText("Rendering…")
-            self._request_render.emit(self._snapshot())
-
-    def _on_frames(self, frames) -> None:
-        self._frames = list(frames)
-        self._play_index = 0
-        self.export_button.setEnabled(True)
-        self.status.setText("")
-        self._playback.start(int(1000 / max(1, self.settings.fps)))
-
-    def _advance(self) -> None:
-        if not self._frames:
+    def _next_frame(self) -> None:
+        if not self._has_source:
+            self._in_flight = False
             return
-        frame = self._frames[self._play_index % len(self._frames)]
-        self._play_index += 1
+        self._in_flight = True
+        self._request_frame.emit(self._play_index)
+
+    def _on_frame(self, index: int, frame) -> None:
+        self.status.setText("")
         self.view.setPixmap(self._to_pixmap(frame))
+        self._play_index = (index + 1) % max(1, self.settings.frames)
+        # Pace to the target fps; if a render already took longer, go again now.
+        self._pacer.start(int(1000 / max(1, self.settings.fps)))
 
     def _to_pixmap(self, frame: np.ndarray) -> QPixmap:
         data = np.ascontiguousarray((np.clip(frame, 0, 1) * 255).astype(np.uint8))
@@ -371,17 +373,18 @@ class CreativePage(QWidget):
             return
         self.status.setText("Exporting…")
         self.export_button.setEnabled(False)
-        self._request_export.emit(self._snapshot(), path)
+        self._request_export.emit(creative.CreativeSettings(**vars(self.settings)), path)
 
     def _on_export_done(self, path: str) -> None:
         self.export_button.setEnabled(True)
         self.status.setText(f"Saved {Path(path).name}")
 
     def _on_failed(self, message: str) -> None:
+        self._in_flight = False
         self.status.setText(message)
         self.export_button.setEnabled(self._has_source)
 
     def shutdown(self) -> None:
-        self._playback.stop()
+        self._pacer.stop()
         self._thread.quit()
         self._thread.wait(2000)
