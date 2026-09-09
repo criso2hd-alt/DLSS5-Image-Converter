@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from . import camera3d, mesh3d
+from . import camera3d, geometry3d, mesh3d
 
 ASPECTS: dict[str, float] = {
     "Square (1:1)": 1.0,
@@ -105,11 +105,26 @@ class Renderer:
         d = (d - d.min()) / (np.ptp(d) + 1e-6)
         if d.shape != (self.h, self.w):
             d = cv2.resize(d, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
+        # Relief: sharpen local depth so surfaces round out instead of reading
+        # as flat cards. A mild unsharp on the depth adds within-object
+        # curvature without inventing structure that is not there.
+        blur = cv2.GaussianBlur(d, (0, 0), max(1.0, self.w / 90.0))
+        d = np.clip(d + 0.6 * (d - blur), 0.0, 1.0)
         self.depth = d
 
+        # Silhouette-cut mesh: at a hard depth edge the quad is dropped, the near
+        # side is rebuilt to the true edge and extruded backward into a wall, and
+        # the background behind shows through, instead of one sheet stretching
+        # straight back. This is what stops the "cardboard" look.
         stride = max(1, int(round(math.sqrt(self.w * self.h / 200_000))))
-        pos, uv, tris, grid_hw = mesh3d.build_grid_mesh(d, stride, FOV, NEAR, FAR)
-        self._pos, self._uv, self._tris, self._grid_hw = pos, uv, tris, grid_hw
+        mesh = geometry3d.build_mesh(
+            d, fov_degrees=FOV, near=NEAR, far=FAR, stride=stride,
+            discontinuity=0.09, bridge=True, wall_extent=1.0, detail=1.0)
+        self._pos = mesh.positions
+        self._uv = mesh.uvs
+        self._tris = mesh.indices
+        self._grid_hw = (mesh.height, mesh.width)
+        pos = self._pos
         self.pivot_z = -float((NEAR + FAR) * 0.5)
         # Scene bounds at the pivot plane, for placing particles in the volume.
         self._xmax = float(np.abs(pos[:, 0]).max())

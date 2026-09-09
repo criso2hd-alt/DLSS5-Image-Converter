@@ -260,7 +260,7 @@ class MeshRenderer:
 
     def render(self, mvp: np.ndarray, size, mode: str,
                fog_color, fog_density: float, fog_start: float,
-               background=(0.04, 0.055, 0.085)) -> np.ndarray:
+               background=(0.02, 0.021, 0.026)) -> np.ndarray:
         wgpu = self._wgpu
         w, h = int(size[0]), int(size[1])
         self._ensure_targets(w, h)
