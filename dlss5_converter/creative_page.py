@@ -158,10 +158,10 @@ class CreativePage(QWidget):
         col.addWidget(blurb)
 
         disclaimer = QLabel(
-            "Heads up: this is a 2.5-D parallax effect, not true 3-D. It reshapes "
-            "the one photo along its estimated depth, so it is for experimenting "
-            "with depth and motion, and not every image will hold up. Keep the "
-            "moves gentle.")
+            "Heads up: this reconstructs 3-D from a single depth map, so it is a "
+            "real camera move but over one surface, not a full model. Hard edges "
+            "can stretch under big moves, and not every image holds up. Keep the "
+            "moves gentle and experiment.")
         disclaimer.setWordWrap(True)
         disclaimer.setStyleSheet(
             "color: #8590a3; font-size: 11px; font-style: italic; "
@@ -172,32 +172,35 @@ class CreativePage(QWidget):
                                       self._aspect_changed)
         self.preset_box = self._combo(list(creative.PRESETS), self.settings.preset,
                                       self._preset_changed)
-        col.addLayout(self._labeled("Frame", self.aspect_box))
-        col.addLayout(self._labeled("Motion", self.preset_box))
-        col.addLayout(self._labeled("Depth strength",
-                                    self._fslider("depth_intensity", 2.0)))
-
-        col.addWidget(self._section("Fog"))
-        col.addLayout(self._labeled("Amount", self._fslider("fog", 1.0)))
-        col.addLayout(self._labeled("Plane (near → far)",
-                                    self._fslider("fog_plane", 1.0)))
-
-        col.addWidget(self._section("Embers"))
-        col.addLayout(self._labeled("Amount", self._fslider("embers", 1.0)))
-        col.addLayout(self._labeled("Plane (near → far)",
-                                    self._fslider("ember_plane", 1.0)))
-        col.addLayout(self._labeled("Direction", self._dirslider("ember_dir")))
-        col.addLayout(self._labeled("Speed", self._fslider("ember_speed", 1.0)))
-        col.addLayout(self._labeled("Size", self._fslider("ember_size", 1.0)))
-
-        col.addWidget(self._section("Dust"))
-        col.addLayout(self._labeled("Amount", self._fslider("dust", 1.0)))
-        col.addLayout(self._labeled("Plane (near → far)",
-                                    self._fslider("dust_plane", 1.0)))
-        col.addLayout(self._labeled("Direction", self._dirslider("dust_dir")))
-        col.addLayout(self._labeled("Speed", self._fslider("dust_speed", 1.0)))
-        col.addLayout(self._labeled("Size", self._fslider("dust_size", 1.0)))
-
+        self.view_box = self._combo(list(creative.VIEW_MODES), self.settings.view,
+                                    self._view_changed)
+        col.addWidget(self._card("Scene", [
+            self._labeled("Frame", self.aspect_box),
+            self._labeled("Camera move", self.preset_box),
+            self._labeled("View", self.view_box),
+            self._labeled("Depth strength", self._fslider("depth_intensity", 2.0)),
+        ]))
+        col.addWidget(self._card("Fog", [
+            self._labeled("Amount", self._fslider("fog", 1.0)),
+            self._labeled("Plane (near → far)", self._fslider("fog_plane", 1.0)),
+        ]))
+        col.addWidget(self._card("Flare", [
+            self._labeled("Bloom", self._fslider("flare", 1.0)),
+        ]))
+        col.addWidget(self._card("Embers", [
+            self._labeled("Amount", self._fslider("embers", 1.0)),
+            self._labeled("Plane (near → far)", self._fslider("ember_plane", 1.0)),
+            self._labeled("Direction", self._dirslider("ember_dir")),
+            self._labeled("Speed", self._fslider("ember_speed", 1.0)),
+            self._labeled("Size", self._fslider("ember_size", 1.0)),
+        ]))
+        col.addWidget(self._card("Dust", [
+            self._labeled("Amount", self._fslider("dust", 1.0)),
+            self._labeled("Plane (near → far)", self._fslider("dust_plane", 1.0)),
+            self._labeled("Direction", self._dirslider("dust_dir")),
+            self._labeled("Speed", self._fslider("dust_speed", 1.0)),
+            self._labeled("Size", self._fslider("dust_size", 1.0)),
+        ]))
         col.addStretch(1)
 
         rail = QScrollArea()
@@ -225,11 +228,24 @@ class CreativePage(QWidget):
         row.addWidget(railcol)
         self._set_controls_enabled(False)
 
-    def _section(self, title: str) -> QLabel:
-        lab = QLabel(title.upper())
-        lab.setStyleSheet("color: #6f7a8e; font-size: 11px; font-weight: 600; "
-                          "letter-spacing: 1px; margin-top: 6px;")
-        return lab
+    def _card(self, title: str, rows: list) -> QFrame:
+        """A titled card grouping one effect's controls, so the rail reads as a
+        few tidy sections instead of a wall of sliders."""
+        card = QFrame()
+        card.setObjectName("creativeCard")
+        card.setStyleSheet(
+            "QFrame#creativeCard { background: #10151f; border: 1px solid #1c2534; "
+            "border-radius: 8px; }")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(12, 10, 12, 12)
+        box.setSpacing(8)
+        head = QLabel(title.upper())
+        head.setStyleSheet("color: #6f7a8e; font-size: 11px; font-weight: 600; "
+                           "letter-spacing: 1px; border: none;")
+        box.addWidget(head)
+        for r in rows:
+            box.addLayout(r)
+        return card
 
     def _fslider(self, field: str, hi: float) -> QSlider:
         """A slider over a float field 0..hi, mapped through 0..100 ticks."""
@@ -264,7 +280,7 @@ class CreativePage(QWidget):
         return box
 
     def _set_controls_enabled(self, on: bool) -> None:
-        for w in [self.aspect_box, self.preset_box, *self._controls]:
+        for w in [self.aspect_box, self.preset_box, self.view_box, *self._controls]:
             w.setEnabled(on)
 
     # -- source intake -------------------------------------------------------
@@ -307,6 +323,11 @@ class CreativePage(QWidget):
 
     def _preset_changed(self, text) -> None:
         self.settings.preset = text
+        if self._has_source:
+            self._debounce.start()
+
+    def _view_changed(self, text) -> None:
+        self.settings.view = text
         if self._has_source:
             self._debounce.start()
 
