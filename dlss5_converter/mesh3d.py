@@ -157,7 +157,7 @@ class MeshRenderer:
 
     # -- resources -----------------------------------------------------------
 
-    def set_texture(self, image_rgb: np.ndarray) -> None:
+    def _make_texture(self, image_rgb: np.ndarray):
         wgpu = self._wgpu
         img = np.ascontiguousarray(image_rgb, np.uint8)
         h, w = img.shape[:2]
@@ -176,35 +176,37 @@ class MeshRenderer:
             self.device.queue.write_texture(
                 {"texture": tex, "mip_level": lvl}, data,
                 {"bytes_per_row": dw * 4, "rows_per_image": dh}, (dw, dh, 1))
-        self._tex_view = tex.create_view()
-        self._bind = None
+        return tex.create_view()
 
-    def set_mesh(self, pos: np.ndarray, uv: np.ndarray, tris: np.ndarray,
-                 grid_hw, point_stride: int = 3) -> None:
+    def _make_layer(self, pos, uv, tris, grid_hw, texture_rgb, point_stride):
         wgpu = self._wgpu
         verts = np.ascontiguousarray(np.hstack([pos, uv]), np.float32)
-        self._vbuf = self.device.create_buffer_with_data(
+        vbuf = self.device.create_buffer_with_data(
             data=verts, usage=wgpu.BufferUsage.VERTEX)
         tri_idx = np.ascontiguousarray(tris.ravel(), np.uint32)
-        self._ibuf = self.device.create_buffer_with_data(
+        ibuf = self.device.create_buffer_with_data(
             data=tri_idx, usage=wgpu.BufferUsage.INDEX)
-        self._icount = int(tri_idx.size)
-        # Wireframe from a COARSE grid subset, not every triangle edge, so it
-        # reads as a wire lattice over the form instead of a solid fill.
         gh, gw = grid_hw
-        ws = max(1, min(gh, gw) // 60)
-        edges = _grid_edges(gh, gw, ws)
-        self._ebuf = self.device.create_buffer_with_data(
+        edges = _grid_edges(gh, gw, max(1, min(gh, gw) // 60))
+        ebuf = self.device.create_buffer_with_data(
             data=edges, usage=wgpu.BufferUsage.INDEX)
-        self._ecount = int(edges.size)
-        # Sparse points: a strided subset of the grid, so the cloud reads as
-        # dots (like the loading reveal) rather than a solid wall of pixels.
-        gh, gw = grid_hw
         pidx = np.arange(gh * gw, dtype=np.uint32).reshape(gh, gw)
-        pidx = pidx[::point_stride, ::point_stride].ravel()
-        self._pbuf = self.device.create_buffer_with_data(
-            data=np.ascontiguousarray(pidx), usage=wgpu.BufferUsage.INDEX)
-        self._pcount = int(pidx.size)
+        pidx = np.ascontiguousarray(pidx[::point_stride, ::point_stride].ravel())
+        pbuf = self.device.create_buffer_with_data(
+            data=pidx, usage=wgpu.BufferUsage.INDEX)
+        bind = self.device.create_bind_group(layout=self._layout(), entries=[
+            {"binding": 0, "resource": {"buffer": self._uniform, "offset": 0, "size": 96}},
+            {"binding": 1, "resource": self._make_texture(texture_rgb)},
+            {"binding": 2, "resource": self._sampler}])
+        return {"vbuf": vbuf, "ibuf": ibuf, "icount": int(tri_idx.size),
+                "ebuf": ebuf, "ecount": int(edges.size),
+                "pbuf": pbuf, "pcount": int(pidx.size), "bind": bind}
+
+    def set_scene(self, layers, point_stride: int = 1) -> None:
+        """layers: list of (pos, uv, tris, grid_hw, texture_rgb), farthest first.
+        The depth buffer sorts them, so a near slice correctly occludes the
+        filled backplate behind it."""
+        self._draws = [self._make_layer(*L, point_stride) for L in layers]
 
     # -- pipelines / targets -------------------------------------------------
 
@@ -270,11 +272,6 @@ class MeshRenderer:
         u[19] = max(0.0, fog_density)
         u[20] = fog_start
         self.device.queue.write_buffer(self._uniform, 0, u.tobytes())
-        if self._bind is None:
-            self._bind = self.device.create_bind_group(layout=self._layout(), entries=[
-                {"binding": 0, "resource": {"buffer": self._uniform, "offset": 0, "size": 96}},
-                {"binding": 1, "resource": self._tex_view},
-                {"binding": 2, "resource": self._sampler}])
         enc = self.device.create_command_encoder()
         rp = enc.begin_render_pass(
             color_attachments=[{
@@ -285,20 +282,20 @@ class MeshRenderer:
             depth_stencil_attachment={
                 "view": self._depth.create_view(), "depth_clear_value": 1.0,
                 "depth_load_op": wgpu.LoadOp.clear, "depth_store_op": wgpu.StoreOp.store})
-        rp.set_bind_group(0, self._bind)
-        rp.set_vertex_buffer(0, self._vbuf)
         if mode == "Wireframe":
             rp.set_pipeline(self._pipe(wgpu.PrimitiveTopology.line_list, "fs_wire"))
-            rp.set_index_buffer(self._ebuf, wgpu.IndexFormat.uint32)
-            rp.draw_indexed(self._ecount, 1, 0, 0, 0)
+            ikey, ckey = "ebuf", "ecount"
         elif mode == "Point cloud":
             rp.set_pipeline(self._pipe(wgpu.PrimitiveTopology.point_list, "fs_point"))
-            rp.set_index_buffer(self._pbuf, wgpu.IndexFormat.uint32)
-            rp.draw_indexed(self._pcount, 1, 0, 0, 0)
+            ikey, ckey = "pbuf", "pcount"
         else:
             rp.set_pipeline(self._pipe(wgpu.PrimitiveTopology.triangle_list, "fs_main"))
-            rp.set_index_buffer(self._ibuf, wgpu.IndexFormat.uint32)
-            rp.draw_indexed(self._icount, 1, 0, 0, 0)
+            ikey, ckey = "ibuf", "icount"
+        for dr in self._draws:
+            rp.set_bind_group(0, dr["bind"])
+            rp.set_vertex_buffer(0, dr["vbuf"])
+            rp.set_index_buffer(dr[ikey], wgpu.IndexFormat.uint32)
+            rp.draw_indexed(dr[ckey], 1, 0, 0, 0)
         rp.end()
         self.device.queue.submit([enc.finish()])
         raw = self.device.queue.read_texture(

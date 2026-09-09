@@ -86,8 +86,10 @@ def preset_rig(name: str, t: float, pivot_z: float, strength: float = 1.0,
     phase = t * math.tau
     distance = abs(pivot_z)
     pivot = (0.0, 0.0, -distance)
-    yaw_amp = 0.11 * strength
-    dolly_amp = distance * 0.14 * strength
+    # Deliberately gentle: a single depth map only holds up under small moves,
+    # and big orbits read as dizzy. `strength` still lets the user push it.
+    yaw_amp = 0.05 * strength
+    dolly_amp = distance * 0.07 * strength
 
     def rig(**kwargs) -> "OrbitRig":
         params = {"pivot": pivot, "distance": distance, "fov_degrees": base_fov}

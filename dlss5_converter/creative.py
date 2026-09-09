@@ -19,12 +19,13 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from . import camera3d, geometry3d, mesh3d
+from . import camera3d, layers, mesh3d
 
 ASPECTS: dict[str, float] = {
-    "Square (1:1)": 1.0,
+    "Original": 0.0,                      # 0 = keep the source's own aspect
     "Portrait (4:5)": 4 / 5,
     "Portrait (9:16)": 9 / 16,
+    "Square (1:1)": 1.0,
     "Landscape (16:9)": 16 / 9,
 }
 VIEW_MODES = ("Solid", "Wireframe", "Point cloud")
@@ -45,7 +46,7 @@ def get_renderer() -> mesh3d.MeshRenderer:
 
 @dataclass
 class CreativeSettings:
-    aspect: str = "Portrait (4:5)"
+    aspect: str = "Original"
     preset: str = "Orbit"
     view: str = "Solid"
     depth_intensity: float = 1.0          # camera-move strength
@@ -73,6 +74,8 @@ class CreativeSettings:
 
 
 def reframe(image_rgb: np.ndarray, inv_depth: np.ndarray, aspect: float):
+    if aspect <= 0:                       # "Original": keep the source framing
+        return np.ascontiguousarray(image_rgb), np.ascontiguousarray(inv_depth)
     h, w = image_rgb.shape[:2]
     if w / h > aspect:
         nw = int(round(h * aspect)); x0 = (w - nw) // 2
@@ -87,7 +90,7 @@ class Renderer:
     """One image's 3-D scene: builds the mesh once, renders any loop frame."""
 
     def __init__(self, image_rgb: np.ndarray, inv_depth: np.ndarray,
-                 long_side: int = 900):
+                 long_side: int = 900, inpainter=None):
         img = image_rgb.astype(np.float32)
         if img.max() > 1.5:
             img /= 255.0
@@ -112,23 +115,29 @@ class Renderer:
         d = np.clip(d + 0.6 * (d - blur), 0.0, 1.0)
         self.depth = d
 
-        # Silhouette-cut mesh: at a hard depth edge the quad is dropped, the near
-        # side is rebuilt to the true edge and extruded backward into a wall, and
-        # the background behind shows through, instead of one sheet stretching
-        # straight back. This is what stops the "cardboard" look.
+        # Layered slices: separate the image into depth-ordered layers, each its
+        # own isolated mesh at its depth (with rolled edges), and fill the hidden
+        # backplate. A near layer then parallaxes over the FILLED background
+        # instead of tearing a hole. layer_count is an upper bound: the builder
+        # collapses to as many layers as the depth actually supports (auto).
         stride = max(1, int(round(math.sqrt(self.w * self.h / 200_000))))
-        mesh = geometry3d.build_mesh(
-            d, fov_degrees=FOV, near=NEAR, far=FAR, stride=stride,
-            discontinuity=0.09, bridge=True, wall_extent=1.0, detail=1.0)
-        self._pos = mesh.positions
-        self._uv = mesh.uvs
-        self._tris = mesh.indices
-        self._grid_hw = (mesh.height, mesh.width)
-        pos = self._pos
+        scene = layers.build_layered_scene(
+            self.rgb8, d, layer_count=6, fov_degrees=FOV, near=NEAR, far=FAR,
+            stride=stride, detail=1.0, colour_inpainter=inpainter)
+        self._scene_layers = []
+        allpos = []
+        for layer, mesh in zip(scene.layers, scene.meshes):
+            if mesh.triangle_count == 0:
+                continue
+            self._scene_layers.append((mesh.positions, mesh.uvs, mesh.indices,
+                                       (mesh.height, mesh.width), layer.colour))
+            allpos.append(mesh.positions)
+        pos = np.concatenate(allpos) if allpos else np.zeros((1, 3), np.float32)
+        self.n_layers = len(self._scene_layers)
         self.pivot_z = -float((NEAR + FAR) * 0.5)
         # Scene bounds at the pivot plane, for placing particles in the volume.
-        self._xmax = float(np.abs(pos[:, 0]).max())
-        self._ymax = float(np.abs(pos[:, 1]).max())
+        self._xmax = float(np.abs(pos[:, 0]).max()) or 1.0
+        self._ymax = float(np.abs(pos[:, 1]).max()) or 1.0
 
         self._upload()
         self._rng = np.random.default_rng(7)
@@ -240,10 +249,7 @@ class Renderer:
         return np.clip(canvas, 0.0, 1.0)
 
     def _upload(self) -> None:
-        # Point stride keeps the cloud sparse (dots), like the loading reveal.
-        r = get_renderer()
-        r.set_texture(self.rgb8)
-        r.set_mesh(self._pos, self._uv, self._tris, self._grid_hw, point_stride=1)
+        get_renderer().set_scene(self._scene_layers, point_stride=1)
 
     def render_loop(self, s: CreativeSettings) -> list[np.ndarray]:
         return [self.frame(s, i) for i in range(s.frames)]
