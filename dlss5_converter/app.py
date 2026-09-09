@@ -4555,13 +4555,29 @@ class MainWindow(QMainWindow):
         # latest result and settings even if nothing changed while it was hidden.
         if self.tabs.currentWidget() is self.effects_page:
             self._update_effects_preview()
-        # Hand the 3D tab the current image the first time it comes forward with
-        # one loaded, so the user does not have to re-pick what they are working
-        # on. It tracks the last path it loaded, so re-entering does no work.
-        elif self.tabs.currentWidget() is self.creative_page and self.image_path:
-            if getattr(self, "_creative_loaded_path", None) != self.image_path:
-                self._creative_loaded_path = self.image_path
-                self.creative_page.load_image(self.image_path)
+        # Hand the 3D tab the image the main window already created, so it never
+        # reprocesses. The enhanced result if there is one, else the loaded
+        # source; depth is whatever was computed for it. The tab only renders
+        # parallax + effects over this, instantly.
+        elif self.tabs.currentWidget() is self.creative_page:
+            self._push_creative_source()
+
+    def _push_creative_source(self) -> None:
+        """Give the 3D tab the finished image + its depth (no reprocessing)."""
+        image = depth = None
+        if self.prepared is not None:
+            depth = self.prepared.inverse_depth
+            image = (self.result.enhanced if self.result is not None
+                     else self.prepared.source)
+        # Re-push only when the underlying image changed, so re-entering the tab
+        # while working on the same shot does no work.
+        sig = (id(self.result), id(self.prepared))
+        if image is None or depth is None:
+            self._creative_sig = None
+            self.creative_page.set_source(None, None)
+        elif getattr(self, "_creative_sig", None) != sig:
+            self._creative_sig = sig
+            self.creative_page.set_source(image, depth)
 
     def _video_fps(self) -> float:
         info = self.video_page.info
