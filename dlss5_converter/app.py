@@ -57,6 +57,7 @@ from . import (
 from . import __version__
 from . import hdr as hdr_mod
 from . import onnx_depth
+from .creative_page import CreativePage
 from .depth_engine import MODELS, DepthEngine
 from .onnx_depth import SMALL as SMALL_DEPTH_MODEL
 from .onnx_depth import OnnxDepthEngine
@@ -2799,6 +2800,7 @@ class MainWindow(QMainWindow):
         self.video_page = VideoPage()
         self.sequence_page = SequencePage()
         self.effects_page = EffectsPage(self.settings.effects, self._effects_changed)
+        self.creative_page = CreativePage()
         self.settings_page = self._settings_page()
 
         # The rail is the Single-image controls, so it lives *inside* that tab —
@@ -2837,6 +2839,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.video_page, "Video")
         self.tabs.addTab(self.sequence_page, "Image sequence")
         self.tabs.addTab(self.effects_page, "Effects")
+        self.tabs.addTab(self.creative_page, "3D")
         self.tabs.addTab(self.settings_page, "Settings")
 
         self.tab_apply = QPushButton("+  Apply to folder")
@@ -4552,6 +4555,13 @@ class MainWindow(QMainWindow):
         # latest result and settings even if nothing changed while it was hidden.
         if self.tabs.currentWidget() is self.effects_page:
             self._update_effects_preview()
+        # Hand the 3D tab the current image the first time it comes forward with
+        # one loaded, so the user does not have to re-pick what they are working
+        # on. It tracks the last path it loaded, so re-entering does no work.
+        elif self.tabs.currentWidget() is self.creative_page and self.image_path:
+            if getattr(self, "_creative_loaded_path", None) != self.image_path:
+                self._creative_loaded_path = self.image_path
+                self.creative_page.load_image(self.image_path)
 
     def _video_fps(self) -> float:
         info = self.video_page.info
@@ -5944,6 +5954,12 @@ class MainWindow(QMainWindow):
         self.settings.save(paths.settings_path())
         self._preview_timer.stop()
         self._preview_pending = False
+
+        # Stop the 3D tab's render thread so it does not outlive the window.
+        try:
+            self.creative_page.shutdown()
+        except Exception:  # noqa: BLE001 - shutdown must survive anything
+            pass
 
         # End a background DLSS check if one is still running, so a probe that
         # wedged the GPU is killed with the window rather than orphaned holding
