@@ -72,9 +72,15 @@ class NeuralSettings:
     preset: int = 0
     #: Default, Natural or Cinematic (index into NR_STYLES). Unlike the preset
     #: this is very much live: on a portrait, Cinematic moves the image about 50%
-    #: further from the source than Natural does at the same strengths. Default
-    #: (0) is the add-on's own starting look.
-    style: int = 0
+    #: further from the source than Natural does at the same strengths.
+    #:
+    #: We ship Cinematic (2), not the add-on's own Default (0), because Cinematic
+    #: is what reproduces the real in-game DLSS 5 look. Measured against genuine
+    #: Metro Exodus neural OFF/ON captures, Cinematic + max strengths matched the
+    #: game's face rework to ~5/255 in the skin region while Default stayed ~15
+    #: (i.e. barely changed from the untouched source). See the depth/neural
+    #: notes: the whole visible effect is colour + this style, at zero motion.
+    style: int = 2
     # Defaults are the maximum (2.0). The whole point of the tool is the neural
     # effect, so it opens fully on and obviously working — the commonest first
     # report on gentler defaults was "it does nothing" — and anyone who finds a
