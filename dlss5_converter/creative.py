@@ -125,11 +125,15 @@ class Renderer:
         d = (d - d.min()) / (np.ptp(d) + 1e-6)
         if d.shape != (self.h, self.w):
             d = cv2.resize(d, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-        # Relief: sharpen local depth so surfaces round out instead of reading
-        # as flat cards. A mild unsharp on the depth adds within-object
-        # curvature without inventing structure that is not there.
-        blur = cv2.GaussianBlur(d, (0, 0), max(1.0, self.w / 90.0))
-        d = np.clip(d + 0.6 * (d - blur), 0.0, 1.0)
+        # Depth Anything over-drives silhouettes: a thin brighter (nearer) rim
+        # around every object. Extruded to 3-D that rim floats in front of the
+        # object and reads as a halo of jumping pixels. A median filter deletes
+        # those 1-2px rim outliers while keeping the true edge (a plain blur
+        # would soften everything), and a light blur then rolls the depth step
+        # off so a slice sits flush against the one behind it rather than perched
+        # on a lip. (Sharpening the depth, which we used to do, made this worse.)
+        d = cv2.medianBlur(d, 5)
+        d = cv2.GaussianBlur(d, (0, 0), 1.2)
         self.depth = d
 
         # Layered slices: separate the image into depth-ordered layers, each a
