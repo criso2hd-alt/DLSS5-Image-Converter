@@ -20,7 +20,7 @@ import numpy as np
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
+    QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
@@ -40,6 +40,7 @@ class _Worker(QObject):
 
     frame_ready = Signal(int, object)      # index, np.ndarray
     export_done = Signal(str)
+    lama_ready = Signal(bool, str)         # ok, message
     failed = Signal(str)
 
     def __init__(self) -> None:
@@ -58,16 +59,31 @@ class _Worker(QObject):
     def set_settings(self, s: creative.CreativeSettings) -> None:
         self._settings = s
 
+    def _inpainter(self, s):
+        from . import inpaint
+        return inpaint.build_inpainter(s.use_lama)
+
+    def download_lama(self) -> None:
+        try:
+            from . import inpaint
+            inpaint.download(progress=lambda m: self.lama_ready.emit(True, m))
+            self._renderer = None                      # rebuild with LaMa next
+            self.lama_ready.emit(True, "")
+        except Exception as error:  # noqa: BLE001
+            self.lama_ready.emit(False, str(error))
+
     def render_one(self, index: int) -> None:
         try:
             if self._img is None:
                 return
             s = self._settings
-            if self._renderer is None or self._rkey != s.aspect:
+            key = (s.aspect, s.use_lama)
+            if self._renderer is None or self._rkey != key:
                 img, dep = creative.reframe(self._img, self._dep,
                                             creative.ASPECTS[s.aspect])
-                self._renderer = creative.Renderer(img, dep, long_side=PREVIEW_LONG)
-                self._rkey = s.aspect
+                self._renderer = creative.Renderer(
+                    img, dep, long_side=PREVIEW_LONG, inpainter=self._inpainter(s))
+                self._rkey = key
             self.frame_ready.emit(index, self._renderer.frame(s, index % s.frames))
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(str(error))
@@ -78,7 +94,8 @@ class _Worker(QObject):
                 raise RuntimeError("No image to export.")
             img, dep = creative.reframe(self._img, self._dep,
                                         creative.ASPECTS[s.aspect])
-            frames = creative.Renderer(img, dep, long_side=EXPORT_LONG).render_loop(s)
+            frames = creative.Renderer(img, dep, long_side=EXPORT_LONG,
+                                       inpainter=self._inpainter(s)).render_loop(s)
             fh, fw = frames[0].shape[:2]
             # The cached preview mesh is now overwritten on the shared GPU
             # renderer; force a rebuild on the next preview.
@@ -101,6 +118,7 @@ class CreativePage(QWidget):
     _request_settings = Signal(object)
     _request_frame = Signal(int)
     _request_export = Signal(object, str)
+    _request_download_lama = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -116,8 +134,10 @@ class CreativePage(QWidget):
         self._request_settings.connect(self._worker.set_settings)
         self._request_frame.connect(self._worker.render_one)
         self._request_export.connect(self._worker.export)
+        self._request_download_lama.connect(self._worker.download_lama)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.export_done.connect(self._on_export_done)
+        self._worker.lama_ready.connect(self._on_lama)
         self._worker.failed.connect(self._on_failed)
         self._thread.start()
 
@@ -177,11 +197,19 @@ class CreativePage(QWidget):
                                       self._preset_changed)
         self.view_box = self._combo(list(creative.VIEW_MODES), self.settings.view,
                                     self._view_changed)
+        self.lama_check = QCheckBox("Rebuild background (LaMa · ~207 MB)")
+        self.lama_check.setStyleSheet("color: #b9c1d1;")
+        self.lama_check.setToolTip(
+            "Reconstruct what's hidden behind foreground objects with a learned "
+            "model, instead of the built-in blur fill. Downloads once.")
+        self.lama_check.toggled.connect(self._lama_toggled)
+        lama_row = QVBoxLayout(); lama_row.addWidget(self.lama_check)
         col.addWidget(self._card("Scene", [
             self._labeled("Frame", self.aspect_box),
             self._labeled("Camera move", self.preset_box),
             self._labeled("View", self.view_box),
             self._labeled("Depth strength", self._fslider("depth_intensity", 2.0)),
+            lama_row,
         ]))
         col.addWidget(self._card("Fog", [
             self._labeled("Amount", self._fslider("fog", 1.0)),
@@ -283,7 +311,8 @@ class CreativePage(QWidget):
         return box
 
     def _set_controls_enabled(self, on: bool) -> None:
-        for w in [self.aspect_box, self.preset_box, self.view_box, *self._controls]:
+        for w in [self.aspect_box, self.preset_box, self.view_box,
+                  self.lama_check, *self._controls]:
             w.setEnabled(on)
 
     # -- source intake -------------------------------------------------------
@@ -335,6 +364,32 @@ class CreativePage(QWidget):
 
     def _view_changed(self, text) -> None:
         self.settings.view = text
+        if self._has_source:
+            self._push_settings()
+
+    def _lama_toggled(self, checked: bool) -> None:
+        self.settings.use_lama = checked
+        if checked:
+            from . import inpaint
+            if not inpaint.is_downloaded():
+                self.status.setText("Downloading LaMa background model "
+                                    "(~207 MB, one time)…")
+                self.lama_check.setEnabled(False)
+                self._request_download_lama.emit()
+        if self._has_source:
+            self._push_settings()               # cache key changes -> rebuild
+
+    def _on_lama(self, ok: bool, message: str) -> None:
+        if not ok:
+            self.lama_check.setEnabled(True)
+            self.lama_check.setChecked(False)
+            self.status.setText(f"LaMa unavailable: {message}")
+            return
+        if message:                             # progress text
+            self.status.setText(message)
+            return
+        self.lama_check.setEnabled(True)         # download finished
+        self.status.setText("Background model ready.")
         if self._has_source:
             self._push_settings()
 

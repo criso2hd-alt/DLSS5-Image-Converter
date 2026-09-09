@@ -50,6 +50,7 @@ class CreativeSettings:
     preset: str = "Orbit"
     view: str = "Solid"
     depth_intensity: float = 1.0          # camera-move strength
+    use_lama: bool = False                # LaMa backplate fill (needs download)
 
     fog: float = 0.25
     fog_plane: float = 0.5
