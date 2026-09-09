@@ -73,6 +73,22 @@ class CreativeSettings:
     fps: int = 24
 
 
+def _drop_stretched(pos: np.ndarray, tris: np.ndarray, max_span: float) -> np.ndarray:
+    """Remove triangles whose vertices straddle a big depth gap.
+
+    Those are the stretched "spikes"/halo that connect a foreground edge to the
+    background behind it. Dropping them leaves a clean silhouette hole, which the
+    filled backplate layer covers, so slices never visibly stretch into each
+    other.
+    """
+    if tris.size == 0:
+        return tris
+    z = pos[:, 2]
+    tz = z[tris]                                   # (M, 3)
+    span = tz.max(1) - tz.min(1)
+    return np.ascontiguousarray(tris[span <= max_span])
+
+
 def reframe(image_rgb: np.ndarray, inv_depth: np.ndarray, aspect: float):
     if aspect <= 0:                       # "Original": keep the source framing
         return np.ascontiguousarray(image_rgb), np.ascontiguousarray(inv_depth)
@@ -115,21 +131,29 @@ class Renderer:
         d = np.clip(d + 0.6 * (d - blur), 0.0, 1.0)
         self.depth = d
 
-        # Layered slices: separate the image into depth-ordered layers, each its
-        # own isolated mesh at its depth (with rolled edges), and fill the hidden
-        # backplate. A near layer then parallaxes over the FILLED background
-        # instead of tearing a hole. layer_count is an upper bound: the builder
-        # collapses to as many layers as the depth actually supports (auto).
+        # Layered slices: separate the image into depth-ordered layers, each a
+        # FULLY isolated mesh at its depth. wall_extent=0 means no wall bridges a
+        # slice back toward the layer behind it, so the slices are truly detached
+        # (their vertices never connect); `thickness` still rolls each slice's
+        # own edge for a little relief. The hidden backplate is filled, so a near
+        # slice parallaxes over a complete background rather than a hole.
+        # layer_count is an upper bound the builder collapses to what the depth
+        # supports (auto).
         stride = max(1, int(round(math.sqrt(self.w * self.h / 200_000))))
         scene = layers.build_layered_scene(
             self.rgb8, d, layer_count=6, fov_degrees=FOV, near=NEAR, far=FAR,
-            stride=stride, detail=1.0, colour_inpainter=inpainter)
+            stride=stride, detail=1.0, wall_extent=0.0, thickness=0.06,
+            colour_inpainter=inpainter)
         self._scene_layers = []
         allpos = []
+        # Drop stretched triangles so a slice cannot connect to the layer behind
+        # it (the halo/spikes). Threshold ~10% of the scene depth range.
+        max_span = 0.12 * (FAR - NEAR)
         for layer, mesh in zip(scene.layers, scene.meshes):
-            if mesh.triangle_count == 0:
+            tris = _drop_stretched(mesh.positions, mesh.indices, max_span)
+            if tris.shape[0] == 0:
                 continue
-            self._scene_layers.append((mesh.positions, mesh.uvs, mesh.indices,
+            self._scene_layers.append((mesh.positions, mesh.uvs, tris,
                                        (mesh.height, mesh.width), layer.colour))
             allpos.append(mesh.positions)
         pos = np.concatenate(allpos) if allpos else np.zeros((1, 3), np.float32)
@@ -249,7 +273,9 @@ class Renderer:
         return np.clip(canvas, 0.0, 1.0)
 
     def _upload(self) -> None:
-        get_renderer().set_scene(self._scene_layers, point_stride=1)
+        # Sparse cloud, like the loading reveal: draw roughly every 8th grid
+        # vertex as a single point, not every one (which read as a solid block).
+        get_renderer().set_scene(self._scene_layers, point_stride=8)
 
     def render_loop(self, s: CreativeSettings) -> list[np.ndarray]:
         return [self.frame(s, i) for i in range(s.frames)]

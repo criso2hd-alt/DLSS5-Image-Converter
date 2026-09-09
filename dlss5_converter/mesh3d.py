@@ -186,8 +186,14 @@ class MeshRenderer:
         tri_idx = np.ascontiguousarray(tris.ravel(), np.uint32)
         ibuf = self.device.create_buffer_with_data(
             data=tri_idx, usage=wgpu.BufferUsage.INDEX)
+        # Wireframe: coarse grid lattice, but drop any edge that crosses a depth
+        # gap, so the cuts/separation show honestly without the solid-blue fill
+        # of every triangle edge.
         gh, gw = grid_hw
-        edges = _grid_edges(gh, gw, max(1, min(gh, gw) // 60))
+        edges = _grid_edges(gh, gw, max(1, min(gh, gw) // 60)).reshape(-1, 2)
+        z = pos[:, 2]
+        espan = np.abs(z[edges[:, 0]] - z[edges[:, 1]])
+        edges = np.ascontiguousarray(edges[espan <= 0.3].ravel())
         ebuf = self.device.create_buffer_with_data(
             data=edges, usage=wgpu.BufferUsage.INDEX)
         pidx = np.arange(gh * gw, dtype=np.uint32).reshape(gh, gw)
