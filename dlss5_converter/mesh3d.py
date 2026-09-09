@@ -107,6 +107,18 @@ def build_grid_mesh(depth: np.ndarray, stride: int, fov_deg: float,
     return pos, uv, tris, (h, w)
 
 
+def _grid_edges(gh: int, gw: int, step: int) -> np.ndarray:
+    """Line-list edges of a coarse sub-grid: every `step`-th row and column,
+    connecting neighbours along that row/column. Reads as a clean wireframe."""
+    idx = np.arange(gh * gw, dtype=np.uint32).reshape(gh, gw)
+    segs = []
+    rows = idx[::step, :]
+    segs.append(np.stack([rows[:, :-1], rows[:, 1:]], -1).reshape(-1, 2))
+    cols = idx[:, ::step]
+    segs.append(np.stack([cols[:-1, :], cols[1:, :]], -1).reshape(-1, 2))
+    return np.concatenate(segs).astype(np.uint32).ravel()
+
+
 def _unique_edges(tris: np.ndarray) -> np.ndarray:
     t = tris.reshape(-1, 3).astype(np.uint32)
     pairs = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
@@ -177,7 +189,11 @@ class MeshRenderer:
         self._ibuf = self.device.create_buffer_with_data(
             data=tri_idx, usage=wgpu.BufferUsage.INDEX)
         self._icount = int(tri_idx.size)
-        edges = _unique_edges(tris)
+        # Wireframe from a COARSE grid subset, not every triangle edge, so it
+        # reads as a wire lattice over the form instead of a solid fill.
+        gh, gw = grid_hw
+        ws = max(1, min(gh, gw) // 60)
+        edges = _grid_edges(gh, gw, ws)
         self._ebuf = self.device.create_buffer_with_data(
             data=edges, usage=wgpu.BufferUsage.INDEX)
         self._ecount = int(edges.size)

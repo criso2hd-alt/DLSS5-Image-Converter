@@ -228,7 +228,7 @@ class Renderer:
         # Point stride keeps the cloud sparse (dots), like the loading reveal.
         r = get_renderer()
         r.set_texture(self.rgb8)
-        r.set_mesh(self._pos, self._uv, self._tris, self._grid_hw, point_stride=2)
+        r.set_mesh(self._pos, self._uv, self._tris, self._grid_hw, point_stride=1)
 
     def render_loop(self, s: CreativeSettings) -> list[np.ndarray]:
         return [self.frame(s, i) for i in range(s.frames)]
