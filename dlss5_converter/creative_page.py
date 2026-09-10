@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import creative, video
+from .widgets import Spinner
 
 PREVIEW_LONG = 720      # long side used for the live preview render
 EXPORT_LONG = 1440      # long side used for the exported MP4
@@ -41,6 +42,7 @@ class _Worker(QObject):
     frame_ready = Signal(int, object)      # index, np.ndarray
     export_done = Signal(str)
     lama_ready = Signal(bool, str)         # ok, message
+    lama_busy = Signal(bool)               # spinner on/off
     failed = Signal(str)
 
     def __init__(self) -> None:
@@ -64,12 +66,14 @@ class _Worker(QObject):
         return inpaint.build_inpainter(s.use_lama)
 
     def download_lama(self) -> None:
+        self.lama_busy.emit(True)                       # spinner stays on into build
         try:
             from . import inpaint
             inpaint.download(progress=lambda m: self.lama_ready.emit(True, m))
             self._renderer = None                      # rebuild with LaMa next
             self.lama_ready.emit(True, "")
         except Exception as error:  # noqa: BLE001
+            self.lama_busy.emit(False)
             self.lama_ready.emit(False, str(error))
 
     def render_one(self, index: int) -> None:
@@ -81,10 +85,15 @@ class _Worker(QObject):
             if self._renderer is None or self._rkey != key:
                 img, dep = creative.reframe(self._img, self._dep,
                                             creative.ASPECTS[s.aspect])
+                inp = self._inpainter(s)
+                if inp is not None:                    # a LaMa (re)build: ~20 s
+                    self.lama_busy.emit(True)
                 self._renderer = creative.Renderer(
-                    img, dep, long_side=PREVIEW_LONG, inpainter=self._inpainter(s),
+                    img, dep, long_side=PREVIEW_LONG, inpainter=inp,
                     depth_contrast=s.depth_contrast)
                 self._rkey = key
+                if inp is not None:
+                    self.lama_busy.emit(False)
             self.frame_ready.emit(index, self._renderer.frame(s, index % s.frames))
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
             self.failed.emit(str(error))
@@ -140,6 +149,7 @@ class CreativePage(QWidget):
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.export_done.connect(self._on_export_done)
         self._worker.lama_ready.connect(self._on_lama)
+        self._worker.lama_busy.connect(self._on_lama_busy)
         self._worker.failed.connect(self._on_failed)
         self._thread.start()
 
@@ -206,13 +216,21 @@ class CreativePage(QWidget):
                                       self._preset_changed)
         self.view_box = self._combo(list(creative.VIEW_MODES), self.settings.view,
                                     self._view_changed)
-        self.lama_check = QCheckBox("Rebuild background (LaMa · ~207 MB)")
+        self.lama_check = QCheckBox("Rebuild background (LaMa)")
         self.lama_check.setStyleSheet("color: #b9c1d1;")
         self.lama_check.setToolTip(
             "Reconstruct what's hidden behind foreground objects with a learned "
-            "model, instead of the built-in blur fill. Downloads once.")
+            "model, instead of the built-in blur fill. Needs a one-time ~207 MB "
+            "download the first time you use it.")
         self.lama_check.toggled.connect(self._lama_toggled)
-        lama_row = QVBoxLayout(); lama_row.addWidget(self.lama_check)
+        self.lama_spinner = Spinner(12)
+        self.lama_note = QLabel("")
+        self.lama_note.setStyleSheet("color: #7fae7f; font-size: 11px;")
+        lama_row = QHBoxLayout(); lama_row.setSpacing(6)
+        lama_row.addWidget(self.lama_check)
+        lama_row.addWidget(self.lama_spinner)
+        lama_row.addWidget(self.lama_note)
+        lama_row.addStretch(1)
         col.addWidget(self._card("Scene", [
             self._labeled("Frame", self.aspect_box),
             self._labeled("Camera move", self.preset_box),
@@ -359,6 +377,14 @@ class CreativePage(QWidget):
         self._has_source = True
         self._set_controls_enabled(True)
         self.export_button.setEnabled(True)
+        # Start each new image without LaMa: the user re-enables it to rebuild,
+        # which also guarantees the fill is recomputed for this image.
+        self.lama_spinner.stop()
+        self.lama_note.setText("")
+        self.settings.use_lama = False
+        self.lama_check.blockSignals(True)
+        self.lama_check.setChecked(False)
+        self.lama_check.blockSignals(False)
         self._request_set_source.emit(np.asarray(image), np.asarray(depth))
         self._push_settings()
         self.status.setText("Rendering…")
@@ -402,6 +428,14 @@ class CreativePage(QWidget):
                 self._request_download_lama.emit()
         if self._has_source:
             self._push_settings()               # cache key changes -> rebuild
+
+    def _on_lama_busy(self, busy: bool) -> None:
+        if busy:
+            self.lama_note.setText("")
+            self.lama_spinner.start()
+        else:
+            self.lama_spinner.stop()
+            self.lama_note.setText("Background rebuilt")
 
     def _on_lama(self, ok: bool, message: str) -> None:
         if not ok:
