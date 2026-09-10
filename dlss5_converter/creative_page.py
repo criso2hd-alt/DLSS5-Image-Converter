@@ -77,12 +77,13 @@ class _Worker(QObject):
             if self._img is None:
                 return
             s = self._settings
-            key = (s.aspect, s.use_lama)
+            key = (s.aspect, s.use_lama, round(s.depth_contrast, 3))
             if self._renderer is None or self._rkey != key:
                 img, dep = creative.reframe(self._img, self._dep,
                                             creative.ASPECTS[s.aspect])
                 self._renderer = creative.Renderer(
-                    img, dep, long_side=PREVIEW_LONG, inpainter=self._inpainter(s))
+                    img, dep, long_side=PREVIEW_LONG, inpainter=self._inpainter(s),
+                    depth_contrast=s.depth_contrast)
                 self._rkey = key
             self.frame_ready.emit(index, self._renderer.frame(s, index % s.frames))
         except Exception as error:  # noqa: BLE001 - surfaced in the UI
@@ -94,8 +95,9 @@ class _Worker(QObject):
                 raise RuntimeError("No image to export.")
             img, dep = creative.reframe(self._img, self._dep,
                                         creative.ASPECTS[s.aspect])
-            frames = creative.Renderer(img, dep, long_side=EXPORT_LONG,
-                                       inpainter=self._inpainter(s)).render_loop(s)
+            frames = creative.Renderer(
+                img, dep, long_side=EXPORT_LONG, inpainter=self._inpainter(s),
+                depth_contrast=s.depth_contrast).render_loop(s)
             fh, fw = frames[0].shape[:2]
             # The cached preview mesh is now overwritten on the shared GPU
             # renderer; force a rebuild on the next preview.
@@ -147,6 +149,13 @@ class CreativePage(QWidget):
         self._pacer = QTimer(self)
         self._pacer.setSingleShot(True)
         self._pacer.timeout.connect(self._next_frame)
+
+        # Structural changes (depth contrast, aspect) rebuild the mesh, so debounce
+        # them: only apply after the user pauses, not on every slider tick.
+        self._struct_debounce = QTimer(self)
+        self._struct_debounce.setSingleShot(True)
+        self._struct_debounce.setInterval(350)
+        self._struct_debounce.timeout.connect(self._push_settings)
 
         self._build()
 
@@ -209,6 +218,7 @@ class CreativePage(QWidget):
             self._labeled("Camera move", self.preset_box),
             self._labeled("View", self.view_box),
             self._labeled("Depth strength", self._fslider("depth_intensity", 2.0)),
+            self._labeled("Depth contrast", self._struct_slider("depth_contrast", 2.0)),
             lama_row,
         ]))
         col.addWidget(self._card("Fog", [
@@ -286,6 +296,20 @@ class CreativePage(QWidget):
         s.valueChanged.connect(lambda v: self._set(field, v / 100 * hi))
         self._controls.append(s)
         return s
+
+    def _struct_slider(self, field: str, hi: float) -> QSlider:
+        """Like _fslider, but for a field that rebuilds the mesh: debounced."""
+        s = QSlider(Qt.Orientation.Horizontal)
+        s.setRange(0, 100)
+        s.setValue(int(round(getattr(self.settings, field) / hi * 100)))
+        s.valueChanged.connect(lambda v: self._set_struct(field, v / 100 * hi))
+        self._controls.append(s)
+        return s
+
+    def _set_struct(self, field, value) -> None:
+        setattr(self.settings, field, value)
+        if self._has_source:
+            self._struct_debounce.start()
 
     def _dirslider(self, field: str) -> QSlider:
         s = QSlider(Qt.Orientation.Horizontal)

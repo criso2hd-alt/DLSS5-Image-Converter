@@ -50,6 +50,7 @@ class CreativeSettings:
     preset: str = "Orbit"
     view: str = "Solid"
     depth_intensity: float = 1.0          # camera-move strength
+    depth_contrast: float = 1.0           # depth-mask contrast (slice separation)
     use_lama: bool = False                # LaMa backplate fill (needs download)
 
     fog: float = 0.25
@@ -107,7 +108,7 @@ class Renderer:
     """One image's 3-D scene: builds the mesh once, renders any loop frame."""
 
     def __init__(self, image_rgb: np.ndarray, inv_depth: np.ndarray,
-                 long_side: int = 900, inpainter=None):
+                 long_side: int = 900, inpainter=None, depth_contrast: float = 1.0):
         img = image_rgb.astype(np.float32)
         if img.max() > 1.5:
             img /= 255.0
@@ -125,15 +126,23 @@ class Renderer:
         d = (d - d.min()) / (np.ptp(d) + 1e-6)
         if d.shape != (self.h, self.w):
             d = cv2.resize(d, (self.w, self.h), interpolation=cv2.INTER_LINEAR)
-        # Depth Anything over-drives silhouettes: a thin brighter (nearer) rim
-        # around every object. Extruded to 3-D that rim floats in front of the
-        # object and reads as a halo of jumping pixels. A median filter deletes
-        # those 1-2px rim outliers while keeping the true edge (a plain blur
-        # would soften everything), and a light blur then rolls the depth step
-        # off so a slice sits flush against the one behind it rather than perched
-        # on a lip. (Sharpening the depth, which we used to do, made this worse.)
-        d = cv2.medianBlur(d, 5)
-        d = cv2.GaussianBlur(d, (0, 0), 1.2)
+        # Depth contrast (user-tunable): expand or compress the depth around its
+        # midpoint. >1 separates the slices more, <1 flattens. Some images need
+        # more, some less, so it is a control in the 3D tab.
+        if depth_contrast != 1.0:
+            d = np.clip((d - 0.5) * depth_contrast + 0.5, 0.0, 1.0)
+
+        # Depth Anything over-drives silhouettes with a thin brighter (nearer)
+        # rim; extruded to 3-D it floats in front as a halo. Clean it, but ONLY
+        # in a narrow band along the strong depth edges, so the face interior
+        # keeps its detail instead of being eaten by a global median.
+        gx = cv2.Sobel(d, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(d, cv2.CV_32F, 0, 1, ksize=3)
+        band = (np.hypot(gx, gy) > 0.03).astype(np.uint8)
+        band = cv2.dilate(band, np.ones((3, 3), np.uint8)) > 0
+        cleaned = cv2.medianBlur(d, 3)
+        d = np.where(band, cleaned, d).astype(np.float32)
+        d = cv2.GaussianBlur(d, (0, 0), 0.6)
         self.depth = d
 
         # Layered slices: separate the image into depth-ordered layers, each a
