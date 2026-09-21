@@ -33,7 +33,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import splat3d, video
-from .animation3d import CameraKey, CameraTrack, Easing, key_to_camera, track_from_preset
+from .animation3d import (KEY_EASES, CameraKey, CameraTrack, Easing, key_ease_label,
+                          key_to_camera, set_key_ease, track_from_preset)
 from .effects3d import (EffectsState, EffectsTrack, emitter_preset, plane_preset,
                         volume_preset)
 from .timeline3d import TimelineWidget
@@ -398,8 +399,11 @@ class CreativePage(QWidget):
         del_key = QPushButton("Delete key")
         del_key.clicked.connect(self._delete_key)
         self.easing = QComboBox()
-        self.easing.addItems([e.label for e in Easing])
-        self.easing.setToolTip("Easing out of the selected keyframe")
+        self.easing.addItems(list(KEY_EASES))
+        self.easing.setToolTip(
+            "Easing of the selected keyframe, as in After Effects: Ease In slows the "
+            "arrival into it, Ease Out the departure, Easy Ease both, Hold freezes "
+            "until the next key. The key's shape on the timeline shows it.")
         self.easing.currentTextChanged.connect(self._easing_changed)
         self.preset = QComboBox()
         self.preset.addItems(PRESETS)
@@ -861,14 +865,14 @@ class CreativePage(QWidget):
         key = self.track.nearest(t, 1e-3)
         if key is not None:
             self.easing.blockSignals(True)
-            self.easing.setCurrentText(key.easing.label)
+            self.easing.setCurrentText(key_ease_label(self.track, key))
             self.easing.blockSignals(False)
 
     def _easing_changed(self, label: str) -> None:
         for t in self.timeline.selection:
             key = self.track.nearest(t, 1e-3)
             if key is not None:
-                key.easing = Easing(label)
+                set_key_ease(self.track, key, label)
         self._keys_changed()
 
     def _keys_changed(self) -> None:

@@ -25,6 +25,44 @@ PROPERTY_ROWS = (
 )
 
 
+def key_sides(prev, key) -> tuple[str, str]:
+    """How the move arrives at and leaves a key: "linear", "ease" or "hold".
+
+    A key's easing shapes the segment AFTER it. Ease In starts that segment
+    slowly (so the key's right side is eased); Ease Out ends it slowly (so the
+    NEXT key's left side is eased); Hold freezes it."""
+    right = "linear"
+    if key.easing is Easing.STEP:
+        right = "hold"
+    elif key.easing in (Easing.EASE_IN, Easing.EASE_IN_OUT):
+        right = "ease"
+    left = "linear"
+    if prev is not None:
+        if prev.easing is Easing.STEP:
+            left = "hold"
+        elif prev.easing in (Easing.EASE_OUT, Easing.EASE_IN_OUT):
+            left = "ease"
+    return left, right
+
+
+def key_shape(x: int, y: int, r: int, left: str, right: str) -> list[QPoint]:
+    """Keyframe glyph, After Effects style, built from two halves:
+    linear = the diamond's point, ease = the hourglass half (flat outside,
+    pinched at the centre), hold = a square half."""
+    def half(sign: int, kind: str) -> list[QPoint]:
+        # Points from the top centre, round the outside, to the bottom centre.
+        if kind == "ease":
+            return [QPoint(x + sign * r, y - r), QPoint(x, y), QPoint(x + sign * r, y + r)]
+        if kind == "hold":
+            return [QPoint(x, y - r), QPoint(x + sign * r, y - r),
+                    QPoint(x + sign * r, y + r), QPoint(x, y + r)]
+        return [QPoint(x, y - r), QPoint(x + sign * r, y), QPoint(x, y + r)]
+
+    right_pts = half(1, right)
+    left_pts = list(reversed(half(-1, left)))
+    return right_pts + left_pts
+
+
 class TimelineWidget(QWidget):
     """Scrubbable ruler with a collapsible Camera property group.
 
@@ -203,10 +241,12 @@ class TimelineWidget(QWidget):
                 painter.setPen(QPen(QColor("#ffffff") if chosen else QColor("#b7adff"), 1))
                 painter.setBrush(QColor("#8b79ff") if chosen else QColor("#2a2450"))
                 radius = KEY_RADIUS if row_index == 0 else KEY_RADIUS - 1
-                painter.drawPolygon([
-                    QPoint(x, y - radius), QPoint(x + radius, y),
-                    QPoint(x, y + radius), QPoint(x - radius, y),
-                ])
+                if property_name == "effects":
+                    left = right = "linear"
+                else:
+                    prev = keys[index - 1] if index > 0 else None
+                    left, right = key_sides(prev, key)
+                painter.drawPolygon(key_shape(x, y, radius + 1, left, right))
 
     def _paint_playhead(self, painter: QPainter, area: QRect) -> None:
         x = self._x_for(self.time)

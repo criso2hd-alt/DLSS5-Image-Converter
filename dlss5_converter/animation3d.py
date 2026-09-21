@@ -250,3 +250,59 @@ def track_from_preset(
             tolerance=0.0,
         )
     return track
+
+
+# -- per-key easing, After Effects style ------------------------------------
+#
+# The data model stores one easing per SEGMENT (on the key that starts it):
+# whether that segment starts slow and whether it ends slow. Animators think
+# per KEY instead: Ease In slows the arrival into this key, Ease Out slows the
+# departure from it. These helpers translate, so the dropdown and the timeline
+# glyphs both speak per key while evaluation stays unchanged.
+
+KEY_EASES = ("Linear", "Ease In", "Ease Out", "Easy Ease", "Hold")
+
+_SEGMENT = {
+    Easing.LINEAR: (False, False),
+    Easing.EASE_IN: (True, False),     # t^2: the segment starts slow
+    Easing.EASE_OUT: (False, True),    # the segment ends slow
+    Easing.EASE_IN_OUT: (True, True),
+}
+
+
+def _segment(slow_start: bool, slow_end: bool) -> Easing:
+    for easing, flags in _SEGMENT.items():
+        if flags == (slow_start, slow_end):
+            return easing
+    return Easing.LINEAR
+
+
+def _neighbours(track: CameraTrack, key: CameraKey):
+    keys = track.sorted_keys()
+    index = next((i for i, k in enumerate(keys) if k is key), None)
+    prev = keys[index - 1] if index else None
+    return prev
+
+
+def key_ease_label(track: CameraTrack, key: CameraKey) -> str:
+    if key.easing is Easing.STEP:
+        return "Hold"
+    prev = _neighbours(track, key)
+    slow_in = prev is not None and prev.easing is not Easing.STEP and _SEGMENT[prev.easing][1]
+    slow_out = _SEGMENT[key.easing][0]
+    return {(False, False): "Linear", (True, False): "Ease In",
+            (False, True): "Ease Out", (True, True): "Easy Ease"}[(slow_in, slow_out)]
+
+
+def set_key_ease(track: CameraTrack, key: CameraKey, label: str) -> None:
+    """Apply a per-key easing by editing the segments either side of it."""
+    if label == "Hold":
+        key.easing = Easing.STEP
+        return
+    slow_in = label in ("Ease In", "Easy Ease")
+    slow_out = label in ("Ease Out", "Easy Ease")
+    prev = _neighbours(track, key)
+    if prev is not None and prev.easing is not Easing.STEP:
+        prev.easing = _segment(_SEGMENT[prev.easing][0], slow_in)
+    end = False if key.easing is Easing.STEP else _SEGMENT[key.easing][1]
+    key.easing = _segment(slow_out, end)

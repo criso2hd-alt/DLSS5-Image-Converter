@@ -94,3 +94,24 @@ def test_floor_plane_redefines_up_and_collides(qt_app):
     before = floor.position[1]
     _drag_toward_tip(vp, floor, "y")
     assert floor.position[1] > before
+
+
+def test_key_easing_is_per_key_like_after_effects():
+    from dlss5_converter.animation3d import (
+        CameraKey, CameraTrack, Easing, key_ease_label, set_key_ease)
+    from dlss5_converter.timeline3d import key_sides
+
+    t = CameraTrack()
+    keys = [t.add(CameraKey(time=float(i), easing=Easing.LINEAR), tolerance=0.0) for i in range(3)]
+    mid = keys[1]
+    set_key_ease(t, mid, "Ease In")          # slow arrival into the middle key only
+    assert key_ease_label(t, mid) == "Ease In"
+    assert key_sides(keys[0], mid) == ("ease", "linear")
+    assert key_ease_label(t, keys[0]) == "Linear"
+    set_key_ease(t, mid, "Easy Ease")
+    assert key_sides(keys[0], mid) == ("ease", "ease")
+    set_key_ease(t, mid, "Ease Out")
+    assert key_sides(keys[0], mid) == ("linear", "ease")
+    set_key_ease(t, mid, "Hold")
+    assert key_ease_label(t, mid) == "Hold"
+    assert key_sides(mid, keys[2])[0] == "hold"
