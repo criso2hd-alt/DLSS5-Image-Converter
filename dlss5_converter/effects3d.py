@@ -69,6 +69,9 @@ class ParticleEmitter:
     rate: float = 1.0
     lifetime: float = 3.0
     particle_size: float = 0.10
+    #: How solid each particle is, 0..1. Separate from `count`, so a sparse
+    #: emitter can still be faint and a dense one bold.
+    opacity: float = 1.0
     speed: float = 0.65
     spread: float = 0.65
     gravity: float = -0.05

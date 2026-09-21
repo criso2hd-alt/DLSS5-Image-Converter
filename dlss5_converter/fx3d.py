@@ -147,6 +147,7 @@ struct PU {
     colour: vec4<f32>,       // rgb, w emission
     ambient_kind: vec4<f32>, // rgb ambient, w kind
     view_z: vec4<f32>,       // row 2 of the view matrix
+    style: vec4<f32>,        // x opacity
 };
 @group(0) @binding(0) var<uniform> u: PU;
 @group(0) @binding(1) var scene_depth: texture_2d<f32>;
@@ -182,7 +183,7 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@loca
     let soft=pow(1.0-smoothstep(.15,1.0,r),1.4)*in.fade*occl;
     let lit=u.ambient_kind.rgb+vec3(0.25);
     let rgb=u.colour.rgb*(lit+vec3(u.colour.w));
-    return vec4(rgb,soft*0.72);
+    return vec4(rgb,soft*0.72*u.style.x);
 }
 """
 
@@ -303,7 +304,7 @@ class FxPass:
         for em in effects.emitters:
             if not em.enabled or em.count <= 0:
                 continue
-            v = np.zeros(52, np.float32)
+            v = np.zeros(56, np.float32)
             v[:16] = np.ascontiguousarray(vp.T).ravel()
             v[16:19] = view[0, :3]
             v[20:23] = view[1, :3]
@@ -316,6 +317,7 @@ class FxPass:
             v[44:47] = ambient * em.light_response
             v[47] = PARTICLE_KINDS.get(em.kind, 0.0)
             v[48:52] = view[2]
+            v[52] = float(np.clip(getattr(em, "opacity", 1.0), 0.0, 1.0))
             rp.set_bind_group(0, self._group("p", slot, v, depth_view))
             slot += 1
             rp.draw(min(int(em.count), MAX_PARTICLES) * 6, 1, 0, 0)

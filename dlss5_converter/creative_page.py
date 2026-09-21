@@ -483,6 +483,12 @@ class CreativePage(QWidget):
         self.fx_amount = self._spin(fp, "Amount", 0.0, 5000.0, 0.05, "amount")
         self.fx_speed = self._spin(fp, "Speed", -3.0, 3.0, 0.02, "speed")
         self.fx_scale = self._spin(fp, "Size", 0.05, 20.0, 0.05, "scale")
+        # Particles only: the size of each individual dot (Size above is the
+        # emitter's box) and how solid they are.
+        self.fx_psize = self._spin(fp, "Particle size", 0.002, 1.0, 0.005, "particle_size")
+        self.fx_psize.setDecimals(3)
+        self.fx_opacity = self._spin(fp, "Opacity", 0.0, 1.0, 0.05, "opacity")
+        self._particle_rows = [self.fx_psize, self.fx_opacity]
         self.fx_glow = self._spin(fp, "Glow", 0.0, 10.0, 0.1, "emission")
         row = QHBoxLayout()
         colour = QPushButton("Colour…")
@@ -533,13 +539,20 @@ class CreativePage(QWidget):
         scroll.setFixedWidth(340)
         return scroll
 
+    @staticmethod
+    def _row_visible(spin, visible: bool) -> None:
+        spin.setVisible(visible)
+        spin._label.setVisible(visible)
+
     def _spin(self, layout, label: str, lo: float, hi: float, step: float, field: str):
         row = QHBoxLayout()
-        row.addWidget(QLabel(label))
+        text = QLabel(label)
+        row.addWidget(text)
         sp = QDoubleSpinBox()
         sp.setRange(lo, hi)
         sp.setSingleStep(step)
         sp.setDecimals(2)
+        sp._label = text
         sp.valueChanged.connect(lambda v, f=field: self._fx_set(f, v))
         row.addStretch()
         row.addWidget(sp)
@@ -844,7 +857,8 @@ class CreativePage(QWidget):
         if item is None:
             return
         is_volume = hasattr(item, "density")
-        widgets = (self.fx_enabled, self.fx_amount, self.fx_speed, self.fx_scale, self.fx_glow)
+        widgets = (self.fx_enabled, self.fx_amount, self.fx_speed, self.fx_scale, self.fx_glow,
+                   self.fx_psize, self.fx_opacity)
         for wdg in widgets:
             wdg.blockSignals(True)
         self.fx_enabled.setChecked(item.enabled)
@@ -853,6 +867,11 @@ class CreativePage(QWidget):
         self.fx_speed.setValue(item.speed)
         self.fx_scale.setValue(float(np.mean(item.size)))
         self.fx_glow.setValue(item.emission)
+        if not is_volume:
+            self.fx_psize.setValue(item.particle_size)
+            self.fx_opacity.setValue(getattr(item, "opacity", 1.0))
+        for wdg in self._particle_rows:
+            self._row_visible(wdg, not is_volume)
         for wdg in widgets:
             wdg.blockSignals(False)
 
