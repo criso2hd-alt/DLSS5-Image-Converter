@@ -188,9 +188,31 @@ class _Worker(QObject):
         except Exception as error:  # noqa: BLE001
             self.lama_ready.emit(False, str(error))
 
+    def _ensure_video_support(self) -> None:
+        """Fetch the video add-on (PyAV) here if it is missing.
+
+        It is normally installed the first time the Video tab is used, but a
+        new user can go straight from converting an image to the 3D tab; asking
+        them to visit another tab first, just to download a component, was a
+        dead end. Same installer the Video tab uses."""
+        if video.is_available():
+            return
+        from . import bootstrap
+
+        def on_bytes(done, total):
+            if total:
+                self.progress.emit(f"Downloading video support… {100 * done // total}%")
+
+        bootstrap.install_av(on_bytes=on_bytes, on_text=self.progress.emit)
+        bootstrap.activate_av()
+        if not video.is_available():
+            raise RuntimeError("Video support was downloaded but could not be loaded. "
+                               "Restart the app and try the export again.")
+
     def export(self, scene, job: dict) -> None:
         try:
             self.cancel = False
+            self._ensure_video_support()
             r = self._get_renderer()
             r.set_scene(scene)
             w, h = job["size"]
@@ -971,12 +993,6 @@ class CreativePage(QWidget):
         if self._scene is None:
             return
         codec = video.CODECS_BY_KEY[self.codec_box.currentData()]
-        if not video.is_available():
-            QMessageBox.information(
-                self, "Video support needed",
-                "Exporting needs the video add-on. Open the Video tab once to set it up, "
-                "then export here.")
-            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export video", f"scene{codec.suffix}", f"{codec.label} (*{codec.suffix})")
         if not path:
