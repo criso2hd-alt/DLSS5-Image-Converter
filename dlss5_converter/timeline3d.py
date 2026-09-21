@@ -1,6 +1,7 @@
-"""Expandable camera keyframe timeline."""
+"""Expandable camera keyframe timeline.
 
 Ported from Depth Animator (timeline.py).
+"""
 
 from __future__ import annotations
 
