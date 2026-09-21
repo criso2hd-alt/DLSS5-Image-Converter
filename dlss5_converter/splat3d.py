@@ -713,7 +713,7 @@ def fill_view(scene: SplatScene, renderer: "SplatRenderer", view: np.ndarray,
     rgb, alpha, dist = renderer.render_coverage(view, proj, (w, h))
     # 0.85, not 0.5: a pixel only partly covered shows the dark background
     # through it as a speck, so it counts as a hole to fill.
-    hole = alpha < 0.85
+    hole = alpha < (0.85 if _is_grid(scene) else 0.5)
     # Past the photo's own frame edges is a hole too; the far-side depth
     # handles it the same way, which extends the picture as the camera swings.
     hole = cv2.morphologyEx(hole.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
@@ -784,6 +784,13 @@ def fill_view(scene: SplatScene, renderer: "SplatRenderer", view: np.ndarray,
     return int(len(ys))
 
 
+def _is_grid(scene: SplatScene) -> bool:
+    """True for our own one-splat-per-pixel scenes. A model-predicted scene
+    (SHARP) has soft, semi-transparent edges by design; treating those as
+    holes painted dark smears along every silhouette."""
+    return scene.photo_z is not None and scene.n_front == scene.photo_z.size
+
+
 def remove_floaters(scene: SplatScene, cell_px: float = 3.0, depth_step: float = 0.015,
                     min_neighbours: int = 12) -> int:
     """Drop splats that have almost nothing around them in 3-D.
@@ -817,6 +824,10 @@ def remove_floaters(scene: SplatScene, cell_px: float = 3.0, depth_step: float =
                 hit = uniq[pos] == nk
                 total += np.where(hit, counts[pos], 0)
     keep = total[inv] >= min_neighbours
+    if not _is_grid(scene):
+        # A model-predicted scene (SHARP) is sparser and uneven by design, so
+        # density says nothing about its own splats; only fills are judged.
+        keep[: scene.n_front] = True
     removed = int((~keep).sum())
     if removed:
         scene.keep(keep)
