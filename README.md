@@ -6,6 +6,10 @@ here rather than reuploading.
 
 This is the real model — `nvngx_dlssnr.dll` — not a diffusion imitation of the look.
 
+**New in 0.4.0: the 3D tab.** Turn the converted image into a 3D scene, fly a
+keyframed camera through it, add fog, smoke, fire and particles, and export a
+video up to 4K, including ProRes.
+
 > **Bring your own DLSS files.** None of NVIDIA's binaries are included here, and
 > this project will not help you obtain them. You point it at the copies you
 > already have.
@@ -53,6 +57,21 @@ alongside — every pane shares one zoom and pan.
 editor takes.
 
 ![The video tab, an In/Out range set on the timeline](app_images_examples/videotrimmed.png)
+
+**3D.** The converted image becomes a Gaussian-splat scene. Direct a camera
+through it with keyframes, place volumetric fog and particles with gizmos, and
+export the shot. The camera view on the left is exactly what gets exported; the
+scene view on the right shows the camera, its path and every effect in 3D.
+
+![The 3D tab: camera view, 3D scene view with a fog volume, keyframe timeline](app_images_examples/3d/3d_tab.png)
+
+Three shots made in the 3D tab (click for the full clip):
+
+[![A car on a country road with smoke, fire and snow](app_images_examples/3d/car_smoke_fire_snow.webp)](app_images_examples/3d/car_smoke_fire_snow.mp4)
+
+[![An underground interior in 2.39:1 scope](app_images_examples/3d/metro_interior_scope.webp)](app_images_examples/3d/metro_interior_scope.mp4)
+
+[![A camera move through an architectural atrium](app_images_examples/3d/atrium_architecture.webp)](app_images_examples/3d/atrium_architecture.mp4)
 
 **Depth mask**, estimated the moment you open an image, so you can judge it —
 and tune its contrast live — before spending a DLSS pass. Near is red.
@@ -285,8 +304,9 @@ The same sidebar controls apply — neural strengths, style, colour — plus:
 
 - **Output codec.** **H.264/MP4** by default, hardware-encoded on your GPU
   (NVENC) — the one format every editor and player ingests. H.265/MP4 for
-  smaller files; VP9/WebM for web upload, *not* editing (editors do not import
-  WebM cleanly).
+  smaller files; ProRes 422 HQ or ProRes 4444 (10-bit .mov) as editing masters;
+  VP9/WebM for web upload, *not* editing (editors do not import WebM cleanly).
+  Every format encodes at visually lossless constant quality.
 - **Effort.** *Quick* (1 pass) or *Quality* (4 passes). The neural pass is ~0.1 s
   a frame either way, so a 10-second clip converts in well under a minute.
 - **Range.** Convert the first few seconds to check the look before committing to
@@ -324,6 +344,60 @@ Output is a PNG sequence, plus an MP4 if you want one. That is encoded with mp4v
 rather than H.264, because OpenCV ships no H.264 encoder — the frames are always
 written, so re-encode them with anything you prefer. All frames must be the same
 size: one harness means one set of NGX buffers.
+
+### 3D scenes
+
+The **3D** tab works on the image you just converted on the Single image tab.
+Convert, switch tabs, and the scene is built from the result and its depth. It
+never reprocesses the image, so every control responds straight away.
+
+**Scene quality.** *Standard* builds the scene from the app's own depth map, with
+nothing to download. *High quality* uses Apple's SHARP model, which predicts the
+3D scene itself: much cleaner around people and objects, more solid from other
+angles, and it already fills in a little of what sits behind each edge. It is a
+one-time 1.3 GB download (research licence, see Credits) and takes about 20
+seconds per image.
+
+**The two views.** The camera view shows exactly the exported frame. The 3D scene
+view is a free view of the whole scene: right-drag orbits, middle-drag pans,
+the wheel zooms. It draws the camera, its path and every effect.
+
+**Camera.** Start from a preset (Orbit, Drift, Push in, Pull out, Vertigo, Static)
+and it becomes ordinary keyframes you can edit. Move and rotate the camera with
+the gizmo in the scene view (Space cycles Move, Rotate and Scale; G, R and S jump
+straight there). Keyframes show their easing on the timeline the way After
+Effects does: a diamond for linear, an hourglass for eased, a square for hold.
+**Lens** sets the focal length and keys it at the playhead, so two keys with
+different lenses make an animated zoom.
+
+**Aspect.** Pick the shape of the video: source, 16:9, 9:16 vertical, 4:3, 1:1,
+4:5, 1.85:1 flat, 2.39:1 CinemaScope or 2.76:1 Ultra Panavision. The aspect crops
+the camera's frame rather than changing the camera, and the export follows video
+standards for the chosen resolution (1080p scope is 1920x804, vertical is
+1080x1920).
+
+**Filling what the camera reveals.** Move the camera sideways and it sees behind
+things the photo never showed. *Fill background for this move* walks the camera
+along its path, finds every gap, and paints it in as part of the scene. It
+understands the scene as surfaces: the road carries on under a car, the wall
+carries on behind a head. With the optional LaMa model (207 MB) the fill
+continues real structure; it runs on the GPU. Run it again after changing the
+camera move.
+
+**Atmosphere.** Add fog, smoke, fire, cloud or god-ray volumes, raymarched on the
+GPU and stopping softly at surfaces. Add particles (embers, dust, snow, smoke,
+fire, clouds) with their own size, opacity, turbulence and direction; the photo
+decides what "up" is, so you choose it. Particles collide with the floor and
+walls: smoke pools along the ground, embers and snow bounce. Add your own
+**Floor**, **Ceiling** or **Wall** planes when the depth came out tilted; a floor
+shows a gravity arrow and tilts "up" for every particle with it. Key FX
+keyframes the effects over time.
+
+**Export.** 720p up to 4K, in H.264, H.265, ProRes 422 HQ, ProRes 4444 or VP9, at
+visually lossless quality. Video support downloads by itself the first time you
+export, if it is not there yet.
+
+Needs a GPU with Vulkan or DirectX 12 (any recent NVIDIA, AMD or Intel card).
 
 ### Detail recovery and Boost
 
@@ -531,6 +605,29 @@ beauty and depth sequences for trying out sequence mode.
 This is free, and staying free. If it saved you time and you feel like it, there
 is a **Sponsor** button at the top of the repository. Entirely optional — bug
 reports and screenshots of what you made are worth just as much.
+
+## Credits
+
+This app stands on other people's work:
+
+- **Depth Anything V2** (Yang et al.): depth estimation. Apache-2.0 (Small, bundled).
+- **RenoDX DLSS 5 add-on** by clshortfuse: the colour and neural composition the
+  harness drives.
+- **SHARP** by Apple ("Sharp Monocular View Synthesis in Less Than a Second",
+  Mescheder et al., 2025): the optional *High quality* 3D scenes. Apple's model
+  licence is **research / non-commercial**. The weights are downloaded on request
+  from a community ONNX export by
+  [pearsonkyle](https://huggingface.co/pearsonkyle/Sharp-onnx) and are not
+  distributed with this app. Original release:
+  [apple/ml-sharp](https://github.com/apple/ml-sharp).
+- **LaMa** (Suvorov et al., Samsung AI): background fill in the 3D tab.
+  Apache-2.0; ONNX export by [Carve](https://huggingface.co/Carve/LaMa-ONNX),
+  downloaded on request.
+- The AI upscale models listed on the Settings page, with their own licences.
+- Runtimes: ONNX Runtime (MIT), wgpu-py (BSD-2), PySide6 / Qt, OpenCV, tifffile.
+
+NVIDIA's `nvngx_dlss` / `nvngx_dlssnr` files are NVIDIA's own and are supplied by
+you; this project does not distribute them.
 
 ## Licence
 

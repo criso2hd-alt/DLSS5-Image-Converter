@@ -19,6 +19,8 @@
 //   <- READY <notes>
 //   -> DEPTH <depth.bin>                     (optional, sequence mode)
 //   <- DEPTH_OK
+//   -> MOTION <motion.bin>                   (optional, sequence mode; per-frame MVs)
+//   <- MOTION_OK
 //   -> FRAME <colour.bin> <jitter_x> <jitter_y> <reset 0|1>
 //   <- FRAME_OK <index>
 //   -> WRITE <out.bin>
@@ -189,6 +191,7 @@ public:
     void Initialise(const Options& options);
     void UploadColour(const std::wstring& path);
     void UploadDepth(const std::wstring& path);
+    void UploadMotion(const std::wstring& path);
     void Evaluate(float jitter_x, float jitter_y, bool reset);
     size_t WriteOutput(const std::wstring& path);
     void ProbeWarmUp();
@@ -630,6 +633,16 @@ void Harness::UploadDepth(const std::wstring& path) {
     Execute();
 }
 
+void Harness::UploadMotion(const std::wstring& path) {
+    // Sequence mode may also replace the motion plane between frames, so a
+    // synthetic camera move (e.g. depth-driven parallax) can hand DLSS a
+    // different reprojection field per frame. The motion texture is R16G16_FLOAT
+    // (two float16 per pixel, in pixels), hence pixels * 4 bytes.
+    const size_t pixels = static_cast<size_t>(options_.width) * options_.height;
+    UploadTexture(motion_, ReadFile(path, pixels * 4));
+    Execute();
+}
+
 void Harness::Evaluate(float jitter_x, float jitter_y, bool reset) {
     NVSDK_NGX_D3D12_DLSS_Eval_Params eval{};
     eval.Feature.pInColor = colour_.resource.Get();
@@ -977,6 +990,13 @@ int main(int /*argc*/, char** /*argv*/) {
             if (path.empty()) Fail("Malformed DEPTH: expected a depth plane path.");
             harness.UploadDepth(Widen(path));
             Emit("DEPTH_OK");
+        } else if (command == "MOTION") {
+            std::string rest;
+            std::getline(parts, rest);
+            const std::string path = Trim(rest);
+            if (path.empty()) Fail("Malformed MOTION: expected a motion plane path.");
+            harness.UploadMotion(Widen(path));
+            Emit("MOTION_OK");
         } else if (command == "WRITE") {
             std::string rest;
             std::getline(parts, rest);

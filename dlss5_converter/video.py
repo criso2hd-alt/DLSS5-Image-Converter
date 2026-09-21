@@ -60,15 +60,42 @@ class Codec:
     pix_fmt: str
     note: str
 
+    @property
+    def ten_bit(self) -> bool:
+        return "10" in self.pix_fmt
+
+
+#: Quality settings per encoder. Without these every encoder runs at its own
+#: default, which for NVENC is a ~2 Mbit/s target: fine detail and grain smear
+#: into blocks, which is what users reported as "low quality exports". These
+#: are visually lossless constant-quality modes; files are larger, and that is
+#: the point of an export.
+ENCODER_OPTIONS: dict[str, dict[str, str]] = {
+    "h264_nvenc": {"preset": "p7", "tune": "hq", "rc": "vbr", "cq": "16", "b": "0"},
+    "libx264": {"crf": "16", "preset": "slow"},
+    "hevc_nvenc": {"preset": "p7", "tune": "hq", "rc": "vbr", "cq": "18", "b": "0"},
+    "libx265": {"crf": "18", "preset": "slow"},
+    "libvpx-vp9": {"crf": "20", "b": "0", "row-mt": "1"},
+    # prores_ks profiles: 3 = 422 HQ, 4 = 4444. FFmpeg's own implementation,
+    # not Apple's; Resolve, Premiere and Final Cut all ingest it.
+    "prores_ks": {"profile": "3", "vendor": "apl0"},
+    "prores_ks:4444": {"profile": "4", "vendor": "apl0"},
+}
+
 
 #: Offered in the UI in this order. H.264 first, because it is the one format
-#: every editor and player ingests; VP9 is last because WebM is a web-delivery
+#: every editor and player ingests; ProRes are the editing masters; VP9 is last because WebM is a web-delivery
 #: format that Premiere, Resolve and Final Cut do not import cleanly.
 CODECS: tuple[Codec, ...] = (
     Codec("h264", "H.264 / MP4", ".mp4", "h264_nvenc", "libx264", "yuv420p",
           "Universal - every editor and player. Hardware-encoded on your GPU."),
     Codec("h265", "H.265 / MP4", ".mp4", "hevc_nvenc", "libx265", "yuv420p",
           "Smaller files, modern editors. Also hardware-encoded."),
+    Codec("prores", "ProRes 422 HQ / MOV", ".mov", "prores_ks", "prores_ks", "yuv422p10le",
+          "Editing master, 10-bit. Large files, encoded on the CPU."),
+    Codec("prores4444", "ProRes 4444 / MOV", ".mov", "prores_ks:4444", "prores_ks:4444",
+          "yuv444p10le",
+          "Highest-quality master, 10-bit full colour. Very large files."),
     Codec("vp9", "VP9 / WebM", ".webm", "libvpx-vp9", "libvpx-vp9", "yuv420p",
           "For web upload. Not for editors - WebM does not import cleanly."),
 )
@@ -116,6 +143,11 @@ def probe(path: str | Path) -> VideoInfo:
         )
 
 
+def _encoder_name(name: str) -> str:
+    """"prores_ks:4444" -> "prores_ks": the suffix only selects ENCODER_OPTIONS."""
+    return name.split(":", 1)[0]
+
+
 def _encoder_opens(name: str, codec: Codec, fps: float, size: tuple[int, int]) -> bool:
     """Whether this encoder will actually open and take a frame, here and now.
 
@@ -132,10 +164,11 @@ def _encoder_opens(name: str, codec: Codec, fps: float, size: tuple[int, int]) -
 
     width, height = size
     try:
-        ctx = av.CodecContext.create(name, "w")
+        ctx = av.CodecContext.create(_encoder_name(name), "w")
         ctx.width, ctx.height = width, height
         ctx.pix_fmt = codec.pix_fmt
         ctx.framerate = Fraction(fps).limit_denominator(90000)
+        ctx.options = dict(ENCODER_OPTIONS.get(name, {}))
         ctx.open()
         probe = av.VideoFrame(width, height, codec.pix_fmt)
         ctx.encode(probe)  # forces avcodec_open2 and one real encode
@@ -160,11 +193,13 @@ def _pick_encoder(container, codec: Codec, fps: float, size: tuple[int, int]):
         if name != codec.fallback and not _encoder_opens(name, codec, fps, size):
             continue
         try:
-            stream = container.add_stream(name, rate=Fraction(fps).limit_denominator(90000))
+            stream = container.add_stream(_encoder_name(name),
+                                          rate=Fraction(fps).limit_denominator(90000))
             stream.width = width
             stream.height = height
             stream.pix_fmt = codec.pix_fmt
-            return stream, name
+            stream.options = dict(ENCODER_OPTIONS.get(name, {}))
+            return stream, _encoder_name(name)
         except Exception:  # noqa: BLE001 - fall through to the software floor
             continue
     raise RuntimeError(
@@ -342,10 +377,20 @@ class VideoWriter:
         self._container = av.open(str(path), mode="w")
         self._stream, self.encoder_used = _pick_encoder(self._container, codec, fps, size)
         self._av = av
+        self._deep = codec.ten_bit
 
     def write(self, image_rgb: np.ndarray) -> None:
-        data = (np.clip(image_rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
-        frame = self._av.VideoFrame.from_ndarray(np.ascontiguousarray(data), format="rgb24")
+        if self._deep and image_rgb.dtype != np.uint8:
+            # 10-bit masters get 16-bit input, so smooth gradients (skies, fog)
+            # are not banded to 8 bits before the encoder ever sees them.
+            data = (np.clip(image_rgb, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+            frame = self._av.VideoFrame.from_ndarray(np.ascontiguousarray(data), format="rgb48le")
+        else:
+            if image_rgb.dtype == np.uint8:
+                data = image_rgb
+            else:
+                data = (np.clip(image_rgb, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+            frame = self._av.VideoFrame.from_ndarray(np.ascontiguousarray(data), format="rgb24")
         for packet in self._stream.encode(frame):
             self._container.mux(packet)
 

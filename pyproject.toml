@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dlss5-converter"
-version = "0.3.3"
+version = "0.4.0"
 description = "Run NVIDIA's DLSS 5 neural renderer over still images."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
@@ -29,6 +29,12 @@ dependencies = [
   "huggingface-hub>=0.25,<1",
   "truststore>=0.9,<1",
   "platformdirs>=4,<5",
+  # The 3D tab renders a real depth mesh on the GPU (Vulkan/D3D12/Metal) via
+  # wgpu. No new model, just a rasteriser; see mesh3d.py.
+  "wgpu>=0.32,<0.33",
+  # Rewrites the LaMa graph once so it runs on DirectML (see inpaint.py). Pure
+  # graph editing, no inference; a few MB.
+  "onnx>=1.16",
 ]
 
 [project.optional-dependencies]
@@ -39,7 +45,6 @@ test = ["pytest>=8,<9"]
 export = [
   "torch>=2.4,<3",
   "transformers>=4.56,<5",
-  "onnx>=1.16",
   "onnxconverter-common>=1.14",
 ]
 
