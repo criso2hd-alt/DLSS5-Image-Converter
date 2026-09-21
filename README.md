@@ -591,8 +591,10 @@ runtime when it finds a problem.
 Start with:
 
 ```powershell
-DLSS5Converter.exe --selftest 2> report.txt
+DLSS5Converter.exe --selftest
 ```
+
+The report is saved as `report.txt` next to the exe.
 
 That runs a real conversion end to end and prints your GPU, driver, add-on
 version and what the add-on said. Most questions answer themselves from it.

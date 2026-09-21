@@ -105,6 +105,31 @@ def unpack_archives(extra: Path | None = None) -> list[str]:
     return recovered
 
 
+#: The standard (non add-on) ReShade build injects fine and then refuses every
+#: add-on, so the harness quietly runs plain DLAA while every other check passes
+#: (issue #10). It says so only in ReShade.log ("Skipped loading add-on ...
+#: because this build of ReShade has only limited add-on functionality"). The
+#: DLL itself cannot tell us: both builds carry that sentence as UI text, since
+#: the add-on build also shows it when add-ons are disabled for multiplayer.
+LIMITED_ADDON_MARKER = "limited add-on functionality"
+LIMITED_ADDON_ADVICE = (
+    "This ReShade build cannot load add-ons: it is the standard build, which "
+    "skips the RenoDX add-on, so the neural pass never runs and the result looks "
+    "like a mild sharpen. Install the ReShade variant \"with full add-on "
+    "support\" and use its dxgi.dll (or ReShade64.dll) instead."
+)
+
+
+def reshade_log_refused_addons(log: str | Path) -> bool:
+    """Whether ReShade.log says it skipped an add-on for being a limited build."""
+    try:
+        text = Path(log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any("Skipped loading add-on" in line and LIMITED_ADDON_MARKER in line
+               for line in text.splitlines())
+
+
 def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     """Find every piece the harness needs, without loading any of them."""
     extra = Path(runtime_dir) if runtime_dir else None
@@ -195,6 +220,9 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
             f"installer. {where} It is what loads the add-on; without it the "
             "harness silently falls back to plain DLAA."
         )
+    if status.harness is not None and reshade_log_refused_addons(
+            status.harness.parent / "ReShade.log"):
+        status.problems.append(LIMITED_ADDON_ADVICE)
     return status
 
 

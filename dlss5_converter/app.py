@@ -2505,7 +2505,13 @@ class EffectsPage(QWidget):
         )
         self._rows["lut_amount"] = row
         group.add(row)
+        # Restoring the saved state must not fire `toggled`: this runs inside
+        # MainWindow.__init__, before `effects_page` exists, and the handler it
+        # would reach (_validate_lut) needs the page. That was issue #9: a saved
+        # lut_enabled=true crashed every launch, and the crash re-saved it.
+        group.blockSignals(True)
         group.setChecked(bool(self._settings.lut_enabled))
+        group.blockSignals(False)
         return group
 
     # -- behaviour -----------------------------------------------------------
@@ -2731,8 +2737,18 @@ class ExportDialog(QDialog):
         self.hint.setText(resample.describe(self._source, self.chosen()))
 
 
+def _alive(widget) -> bool:
+    """False once Qt has destroyed the C++ side of a widget. A modal dialog
+    runs a nested event loop, and a deferred deleteLater can land inside it."""
+    try:
+        import shiboken6
+        return shiboken6.isValid(widget)
+    except Exception:  # noqa: BLE001 - if we cannot tell, assume alive
+        return True
+
+
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, first_run_setup: bool = True) -> None:
         super().__init__()
         self.setWindowTitle("DLSS 5 Image & Video Converter")
         # Sized to the screen rather than fixed: 1280x820 does not fit on a
@@ -2973,7 +2989,12 @@ class MainWindow(QMainWindow):
 
         # After the event loop starts, so the window is painted behind the
         # dialog rather than the app appearing to hang on a bare download box.
-        QTimer.singleShot(0, self._start_initial_setup)
+        # The self-test builds a throwaway window with first_run_setup=False:
+        # running onboarding there crashed on the already-deleted window and
+        # also marked the introduction as done for the real first launch
+        # (issue #12).
+        if first_run_setup:
+            QTimer.singleShot(0, self._start_initial_setup)
 
     # -- command bar ---------------------------------------------------------
 
@@ -4718,13 +4739,14 @@ class MainWindow(QMainWindow):
     def _validate_lut(self) -> None:
         """Say whether the chosen LUT actually loads, so a bad .cube is obvious."""
         e = self.settings.effects
-        if not (e.lut_enabled and e.lut_name):
+        page = getattr(self, "effects_page", None)
+        if page is None or not (e.lut_enabled and e.lut_name):
             return
         try:
             effects.load_cube(paths.luts_dir() / e.lut_name)
-            self.effects_page.set_lut_status(f"Using {e.lut_name}.")
-        except ValueError as error:
-            self.effects_page.set_lut_status(f"Cannot use {e.lut_name}: {error}")
+            page.set_lut_status(f"Using {e.lut_name}.")
+        except (ValueError, OSError) as error:    # bad or deleted .cube
+            page.set_lut_status(f"Cannot use {e.lut_name}: {error}")
 
     def _effects_changed(self) -> None:
         """An effect toggled or a slider moved: persist, redraw, keep it live.
@@ -5261,6 +5283,8 @@ class MainWindow(QMainWindow):
         model is the last required download, so this callback is the first point
         where the complete first-run sequence can safely continue.
         """
+        if not _alive(self):
+            return
         self.ensure_model_downloaded()
         if self.settings.onboarding_version >= ONBOARDING_VERSION:
             return
@@ -5365,7 +5389,10 @@ class MainWindow(QMainWindow):
         dialog = onboarding.FirstConversionDialog(
             paths.onboarding_before(), paths.onboarding_after(), self, palette=palette
         )
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        if not _alive(self):
+            return
+        if not accepted:
             self._complete_onboarding()
             return
 
@@ -5446,6 +5473,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._tour_overlay.refresh_target)
 
     def _complete_onboarding(self) -> None:
+        if not _alive(self):
+            return
         self.settings.onboarding_version = ONBOARDING_VERSION
         self.settings.save(paths.settings_path())
         self._tour_overlay = None

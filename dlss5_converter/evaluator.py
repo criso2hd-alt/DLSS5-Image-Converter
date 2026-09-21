@@ -507,11 +507,20 @@ def interpret_probe(report: str) -> list[str]:
             "ReShade renamed to dxgi.dll; a stub or a 32-bit build will not load."
         )
     elif is_on("neural_addon_loaded") is False:
-        problems.append(
-            "ReShade loaded but the RenoDX DLSS 5 add-on did not "
-            "(neural_addon_loaded: 0). Check renodx-dlss5.addon64 is present "
-            "beside the harness and is a current build."
-        )
+        from . import paths, runtime
+        try:
+            refused = runtime.reshade_log_refused_addons(paths.native_exe().parent / "ReShade.log")
+        except Exception:  # noqa: BLE001 - diagnosis must never raise
+            refused = False
+        if refused:
+            problems.append("ReShade loaded but refused the add-on "
+                            "(neural_addon_loaded: 0). " + runtime.LIMITED_ADDON_ADVICE)
+        else:
+            problems.append(
+                "ReShade loaded but the RenoDX DLSS 5 add-on did not "
+                "(neural_addon_loaded: 0). Check renodx-dlss5.addon64 is present "
+                "beside the harness and is a current build."
+            )
     elif is_on("dlssnr_module_loaded") is False:
         problems.append(
             "The add-on loaded but the neural renderer did not attach "

@@ -3,10 +3,10 @@
 Start here, always:
 
 ```powershell
-DLSS5Converter.exe --selftest 2> report.txt
+DLSS5Converter.exe --selftest
 ```
 
-That runs a real conversion end to end — imports PyTorch, checks CUDA, estimates
+It writes `report.txt` next to the exe. That runs a real conversion end to end — imports PyTorch, checks CUDA, estimates
 depth, evaluates DLSS, and prints what the RenoDX add-on said, including its
 version. Paste `report.txt` into any bug report and most of the questions below
 answer themselves.
@@ -15,14 +15,20 @@ answer themselves.
 
 ## The result looks identical to the input
 
-By far the most common report, and it has two completely different causes that
+By far the most common report, and it has three completely different causes that
 produce the same symptom.
 
-**First, update your RenoDX add-on.** An out-of-date `renodx-dlss5.addon64` was
+**Check you have the add-on build of ReShade.** The standard ReShade build loads
+fine and then refuses every add-on, so the neural pass never runs and the result
+is a plain DLAA resolve that looks like a mild sharpen. The runtime check and
+`--selftest` now say so when this happens. Install ReShade "with full add-on
+support" and use its `dxgi.dll`.
+
+**Update your RenoDX add-on.** An out-of-date `renodx-dlss5.addon64` was
 the cause on an RTX 5070 — every indicator green, no error, image unchanged.
 Updating it fixed it. `--selftest` prints the version it loaded.
 
-**Second, it may have worked and you cannot see it.** The defaults sit at 1.0
+**It may have worked and you cannot see it.** The defaults sit at 1.0
 of a possible 2.00 — visible on most content, but on a render that is already
 photographic even a real change can be hard to spot side by side.
 
