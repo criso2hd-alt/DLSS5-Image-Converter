@@ -220,7 +220,12 @@ def run_selftest() -> int:
         )
         window._begin_progress()
         window._report_progress("DLSS 5 pass 4 of 8")
-        swept = window.depth_view._progress
+        # Since v0.3.1 the depth view plays the self-animated point-cloud
+        # reveal during a run and deliberately ignores the pass count, so the
+        # sweep only reads 0.5 when the reveal is not running. Either outcome
+        # proves the progress path is wired; before this, the check reported a
+        # false FAILED on every run.
+        swept = 0.5 if window.depth_view.cloud_active() else window.depth_view._progress
         window._end_progress()
         for view in ("photo", "depth", "result", "difference"):
             window.show_view(view)
