@@ -29,6 +29,9 @@ dependencies = [
   "huggingface-hub>=0.25,<1",
   "truststore>=0.9,<1",
   "platformdirs>=4,<5",
+  # The 3D tab renders a real depth mesh on the GPU (Vulkan/D3D12/Metal) via
+  # wgpu. No new model, just a rasteriser; see mesh3d.py.
+  "wgpu>=0.32,<0.33",
 ]
 
 [project.optional-dependencies]

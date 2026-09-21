@@ -61,6 +61,7 @@ from . import (
 from . import __version__
 from . import hdr as hdr_mod
 from . import onnx_depth
+from .creative_page import CreativePage
 from .depth_engine import MODELS, DepthEngine
 from .onnx_depth import SMALL as SMALL_DEPTH_MODEL
 from .onnx_depth import OnnxDepthEngine
@@ -2888,6 +2889,7 @@ class MainWindow(QMainWindow):
         self.video_page = VideoPage()
         self.sequence_page = SequencePage()
         self.effects_page = EffectsPage(self.settings.effects, self._effects_changed)
+        self.creative_page = CreativePage()
         self.settings_page = self._settings_page()
 
         # The rail is the Single-image controls, so it lives *inside* that tab —
@@ -2926,6 +2928,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.video_page, "Video")
         self.tabs.addTab(self.sequence_page, "Image sequence")
         self.tabs.addTab(self.effects_page, "Effects")
+        self.tabs.addTab(self.creative_page, "3D")
         self.tabs.addTab(self.settings_page, "Settings")
 
         self.tab_apply = QPushButton("+  Apply to folder")
@@ -4742,6 +4745,29 @@ class MainWindow(QMainWindow):
         # latest result and settings even if nothing changed while it was hidden.
         if self.tabs.currentWidget() is self.effects_page:
             self._update_effects_preview()
+        # Hand the 3D tab the image the main window already created, so it never
+        # reprocesses. The enhanced result if there is one, else the loaded
+        # source; depth is whatever was computed for it. The tab only renders
+        # parallax + effects over this, instantly.
+        elif self.tabs.currentWidget() is self.creative_page:
+            self._push_creative_source()
+
+    def _push_creative_source(self) -> None:
+        """Give the 3D tab the finished image + its depth (no reprocessing)."""
+        image = depth = None
+        if self.prepared is not None:
+            depth = self.prepared.inverse_depth
+            image = (self.result.enhanced if self.result is not None
+                     else self.prepared.source)
+        # Re-push only when the underlying image changed, so re-entering the tab
+        # while working on the same shot does no work.
+        sig = (id(self.result), id(self.prepared))
+        if image is None or depth is None:
+            self._creative_sig = None
+            self.creative_page.set_source(None, None)
+        elif getattr(self, "_creative_sig", None) != sig:
+            self._creative_sig = sig
+            self.creative_page.set_source(image, depth)
 
     def _video_fps(self) -> float:
         info = self.video_page.info
@@ -6299,6 +6325,12 @@ class MainWindow(QMainWindow):
         self.settings.save(paths.settings_path())
         self._preview_timer.stop()
         self._preview_pending = False
+
+        # Stop the 3D tab's render thread so it does not outlive the window.
+        try:
+            self.creative_page.shutdown()
+        except Exception:  # noqa: BLE001 - shutdown must survive anything
+            pass
 
         # End a background DLSS check if one is still running, so a probe that
         # wedged the GPU is killed with the window rather than orphaned holding
