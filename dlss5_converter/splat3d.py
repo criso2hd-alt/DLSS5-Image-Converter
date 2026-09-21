@@ -407,27 +407,126 @@ def build_splats(rgb8: np.ndarray, disp: np.ndarray, inpainter=None,
 
 # -- fill as the camera moves ---------------------------------------------------
 
-def _far_side_depth(dist: np.ndarray, hole: np.ndarray, steps: int = 64) -> np.ndarray:
-    """Give every hole pixel the distance of the FARTHEST surface around it.
+def _push_pull(values: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """Fill every pixel from the weighted known ones, smoothly and fast.
 
-    A disocclusion is by definition something behind the foreground, so the
-    near side of the hole's border (the face, the fence wire) is the wrong
-    depth to borrow; the far side (the wall) is right. Repeated max-filtering
-    grows the far surface inward until the hole is covered."""
-    d = np.where(hole, 0.0, dist).astype(np.float32)
-    known = ~hole
-    k = np.ones((3, 3), np.uint8)
-    for _ in range(steps):
-        if known.all():
-            break
-        grown = cv2.dilate(d, k)
-        newly = ~known & (grown > 0)
-        d[newly] = grown[newly]
-        known |= newly
-    d[~known] = dist[~hole].max() if (~hole).any() else FAR
-    # Soften the staircase the max-filter leaves, inside the hole only.
-    smooth = cv2.GaussianBlur(d, (0, 0), 3.0)
-    return np.where(hole, smooth, dist).astype(np.float32)
+    Weighted image pyramid: average known values down to a tiny image where
+    everything is covered, then walk back up, keeping real values where they
+    exist and taking the coarser estimate where they do not."""
+    levels = [(values * weight, weight)]
+    while min(levels[-1][1].shape) > 4:
+        vw, w = levels[-1]
+        levels.append((cv2.pyrDown(vw), cv2.pyrDown(w)))
+    vw, w = levels[-1]
+    filled = vw / np.maximum(w, 1e-6)
+    if (w <= 1e-6).any():
+        filled[w <= 1e-6] = float(filled[w > 1e-6].mean()) if (w > 1e-6).any() else FAR
+    for vw, w in reversed(levels[:-1]):
+        up = cv2.resize(filled, (w.shape[1], w.shape[0]), interpolation=cv2.INTER_LINEAR)
+        own = vw / np.maximum(w, 1e-6)
+        a = np.clip(w * 4.0, 0.0, 1.0)
+        filled = own * a + up * (1.0 - a)
+    return filled.astype(np.float32)
+
+
+def _far_side_depth(dist: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    """Give every hole pixel the depth of the surface BEHIND it.
+
+    A disocclusion is by definition something behind the foreground. Its border
+    has two sides: the subject it slipped out from behind, and the wall it
+    reveals. Only the wall is the right depth. Growing from the whole border
+    gave the pixels next to the subject the subject's depth, and those fills
+    stuck out backwards from it as long streaks when seen from the side.
+
+    So the sources are only pixels within 10% of the deepest surface nearby,
+    and the hole is filled smoothly from those alone."""
+    back = _wall_depth(dist, ~hole)
+    return np.where(hole, back, dist).astype(np.float32)
+
+
+def _wall_depth(dist: np.ndarray, known: np.ndarray) -> np.ndarray:
+    """Estimated depth of the backmost surface under EVERY pixel, from the
+    known pixels within 10% of the deepest surface near them."""
+    h, w = dist.shape
+    r = max(8, int(0.03 * max(h, w)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    local_far = cv2.dilate(np.where(known, dist, 0.0).astype(np.float32), kernel)
+    far_src = known & (dist >= local_far * 0.9)
+    if not far_src.any():
+        return np.full(dist.shape, float(dist[known].max()) if known.any() else FAR, np.float32)
+    back = _push_pull(np.where(far_src, dist, 0.0).astype(np.float32),
+                      far_src.astype(np.float32))
+    # Never nearer than the far sources around it: a hole can only reveal
+    # what is behind, so the estimate is held at the local far surface.
+    return np.maximum(back, np.where(known, 0.0, local_far * 0.9)).astype(np.float32)
+
+
+def fill_backplate(scene: SplatScene, renderer: "SplatRenderer", inpainter=None,
+                   reach: float = 0.12) -> int:
+    """Paint the wall behind every subject, from the original viewpoint.
+
+    The path fill only covers what the camera move actually reveals; a gentle
+    move never looks far behind a subject, so seen from any other angle the
+    back wall shows a black subject-shaped shadow. This pass fills a band
+    behind each silhouette up front: every photo pixel that has something at
+    least 10% deeper within `reach` of the image is treated as covering a
+    hidden wall there. Depth comes from the far side only (`_far_side_depth`),
+    and the inpainter sees nothing nearer than the wall, so it continues the
+    background instead of copying the subject into it."""
+    if scene.photo_z is None:
+        return 0
+    z = scene.photo_z
+    h, w = z.shape
+    if scene.n_front != h * w:
+        return 0          # already baked or cleaned: the photo splats are not a grid now
+    rgb8 = (np.clip(scene.colors[: h * w].reshape(h, w, 3), 0, 1) * 255 + 0.5).astype(np.uint8)
+    r = max(8, int(reach * max(h, w)))
+    # A max filter this wide is slow at full size; the band is smooth, so it is
+    # found at quarter resolution and scaled back up.
+    small = cv2.resize(z, (max(1, w // 4), max(1, h // 4)), interpolation=cv2.INTER_AREA)
+    rs = max(2, r // 4)
+    far_ref = cv2.dilate(small, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rs + 1, 2 * rs + 1)))
+    far_ref = cv2.resize(far_ref, (w, h), interpolation=cv2.INTER_LINEAR)
+    hole = z < far_ref * 0.9
+    hole = cv2.morphologyEx(hole.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
+    if int(hole.sum()) < 64:
+        return 0
+    depth = _far_side_depth(z, hole)
+    # Hide every subject from the inpainter, not just the band behind its
+    # edge. With only the band masked it could see the rest of the person and
+    # continued their skin and clothes into the wall: a ghost of the subject
+    # that peeks out from behind them as the camera moves.
+    wall = _wall_depth(z, ~hole)
+    # 0.95 and a margin of ~1% of the image: hair and the soft depth halo
+    # round a silhouette sit just outside a tight mask, and a dark rim left in
+    # the context is extended across the wall as a shadow of the subject.
+    paint = hole | (z < wall * 0.95)
+    m = max(9, int(0.012 * max(h, w))) | 1
+    paint = cv2.dilate(paint.astype(np.uint8),
+                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m))) > 0
+    if inpainter is not None:
+        try:
+            filled = inpainter(rgb8, paint)
+        except Exception:  # noqa: BLE001 - the classical fill is the floor
+            filled = cv2.inpaint(rgb8, paint.astype(np.uint8) * 255, 7, cv2.INPAINT_TELEA)
+    else:
+        filled = cv2.inpaint(rgb8, paint.astype(np.uint8) * 255, 7, cv2.INPAINT_TELEA)
+    ys, xs = np.nonzero(hole)
+    tz = depth[ys, xs]
+    f = scene.focal
+    world = np.stack([(xs - (w - 1) * 0.5) * tz / f, -(ys - (h - 1) * 0.5) * tz / f, -tz],
+                     -1).astype(np.float32)
+    foot = (tz / f) * 0.8
+    base = np.diag([1.0, 1.0, 0.12 ** 2]).astype(np.float32)
+    cov3 = (foot[:, None, None] ** 2) * base[None]
+    cov = np.stack([cov3[:, 0, 0], cov3[:, 0, 1], cov3[:, 0, 2],
+                    cov3[:, 1, 1], cov3[:, 1, 2], cov3[:, 2, 2]], -1).astype(np.float32)
+    scene.positions = np.concatenate([scene.positions, world])
+    scene.colors = np.concatenate([scene.colors, filled[ys, xs].astype(np.float32) / 255.0])
+    scene.opacity = np.concatenate([scene.opacity, np.ones(len(ys), np.float32)])
+    scene.cov = np.concatenate([scene.cov, cov])
+    renderer.set_scene(scene)
+    return int(len(ys))
 
 
 def _occludes_photo(scene: SplatScene, world: np.ndarray, margin: float = 0.03) -> np.ndarray:
@@ -568,6 +667,9 @@ def fill_along_path(scene: SplatScene, renderer: "SplatRenderer", poses, size,
         cam = -v[:3, :3].T @ v[:3, 3]
         return float(np.linalg.norm(cam)) + float(np.linalg.norm(v[2, :3] - (0, 0, 1)))
     ordered = sorted(poses, key=reach, reverse=True)
+    if progress is not None:
+        progress(0, 2 * len(ordered))
+    fill_backplate(scene, renderer, inpainter)
     # Two rounds. The first fills everything, then strays are removed; that
     # cleanup also takes out a few good fills that happened to be isolated, so
     # the second round (cheap: little is left) patches exactly those gaps.

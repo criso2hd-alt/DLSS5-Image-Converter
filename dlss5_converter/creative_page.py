@@ -205,6 +205,10 @@ class CreativePage(QWidget):
         self._rgb8: np.ndarray | None = None
         self._depth: np.ndarray | None = None
         self._scene: splat3d.SplatScene | None = None
+        # The scene as built from the photo, before any fill. Every bake starts
+        # from this, so re-baking after a camera change replaces the old fill
+        # instead of stacking a second one on top of it.
+        self._base_scene: splat3d.SplatScene | None = None
         self._gen = 0
         self._renderer: splat3d.SplatRenderer | None = None
         self._renderer_error = ""
@@ -514,7 +518,7 @@ class CreativePage(QWidget):
     def set_source(self, image: object, depth: object) -> None:
         self._stop()
         if image is None or depth is None:
-            self._rgb8 = self._depth = self._scene = None
+            self._rgb8 = self._depth = self._scene = self._base_scene = None
             self.preview.setPixmap(QPixmap())
             self.preview.setText(self._empty_text())
             self.viewport.set_renderer(None, PIVOT_Z)
@@ -549,6 +553,7 @@ class CreativePage(QWidget):
         if gen != self._gen or not self._ensure_renderer():
             return
         self._scene = scene
+        self._base_scene = scene
         self._baked = False
         self._renderer.set_scene(scene)
         self.viewport.set_renderer(_SceneView(self._renderer), PIVOT_Z)
@@ -592,7 +597,7 @@ class CreativePage(QWidget):
             return out
 
         self._set_enabled(False)
-        self._request_bake.emit(self._copy_scene(self._scene), poses, size, self._gen)
+        self._request_bake.emit(self._copy_scene(self._base_scene), poses, size, self._gen)
 
     @staticmethod
     def _copy_scene(s: splat3d.SplatScene) -> splat3d.SplatScene:
