@@ -51,6 +51,105 @@ def download(progress=None, bytes_progress=None) -> str:
     return hf_hub_download(REPO, FILENAME, cache_dir=_cache_dir())
 
 
+def _rewrite_for_dml(folded_path: str, out_path: str) -> None:
+    """Make the folded LaMa graph acceptable to DirectML.
+
+    The export implements its FFT as MatMuls of a constant [K, K] DFT matrix
+    against a rank-5 [1, C, H, K, 1] tensor. DirectML rejects that broadcast at
+    session creation ("The parameter is incorrect"). A @ B with B's last axis of
+    size 1 equals squeeze(B) @ A^T with the axis put back, which is a plain
+    rank-4 by rank-2 MatMul every backend accepts. Nothing else changes."""
+    import onnx
+    from onnx import helper, numpy_helper, shape_inference
+
+    model = shape_inference.infer_shapes(onnx.load(folded_path))
+    g = model.graph
+    shapes = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+              for v in list(g.value_info) + list(g.input)}
+    inits = {i.name: i for i in g.initializer}
+    for i in g.initializer:
+        shapes[i.name] = list(i.dims)
+    g.initializer.append(numpy_helper.from_array(np.array([-1], np.int64), "dml_axis_last"))
+    transposed: dict[str, str] = {}
+    nodes = []
+    for n in g.node:
+        if n.op_type == "MatMul":
+            a, b = n.input
+            sb = shapes.get(b, [])
+            if a in inits and len(shapes[a]) == 2 and len(sb) == 5 and sb[-1] == 1:
+                if a not in transposed:
+                    at = numpy_helper.from_array(
+                        numpy_helper.to_array(inits[a]).T.copy(), a + "_T")
+                    g.initializer.append(at)
+                    transposed[a] = at.name
+                nodes += [
+                    helper.make_node("Squeeze", [b, "dml_axis_last"], [n.name + "_sq"]),
+                    helper.make_node("MatMul", [n.name + "_sq", transposed[a]], [n.name + "_mm"]),
+                    helper.make_node("Unsqueeze", [n.name + "_mm", "dml_axis_last"], [n.output[0]]),
+                ]
+                continue
+        nodes.append(n)
+    del g.node[:]
+    g.node.extend(nodes)
+    onnx.save(model, out_path)
+
+
+def dml_model(path: str) -> str | None:
+    """A DirectML-ready copy of the LaMa graph, built once and cached beside it.
+
+    Two steps: ONNX Runtime constant-folds the graph at the fixed 512 tile (the
+    export builds its DFT matrices at run time from Range/Cos/Sin, so no shape
+    is known until folded), then `_rewrite_for_dml` fixes the MatMuls. The
+    result is checked once against the CPU on a random tile; a driver that gets
+    it wrong is recorded and never tried again. ~40 ms a tile on the GPU
+    against ~2.4 s on the CPU."""
+    import os
+    import onnxruntime as ort
+
+    base = os.path.join(os.path.dirname(path), "lama_dml")
+    out, ok_flag, bad_flag = base + ".onnx", base + ".verified", base + ".failed"
+    if os.path.exists(bad_flag):
+        return None
+    if os.path.exists(out) and os.path.exists(ok_flag):
+        return out
+    folded = base + "_folded.onnx"
+    try:
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        so.add_free_dimension_override_by_name("batch", 1)
+        so.optimized_model_filepath = folded
+        cpu = ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+        _rewrite_for_dml(folded, out)
+
+        rng = np.random.default_rng(0)
+        mask = np.zeros((1, 1, TILE, TILE), np.float32)
+        mask[..., 160:352, 160:352] = 1.0
+        feed = {"image": rng.random((1, 3, TILE, TILE), np.float32), "mask": mask}
+        ref = cpu.run(None, feed)[0]
+        so = ort.SessionOptions()
+        so.log_severity_level = 3
+        so.enable_mem_pattern = False
+        got = ort.InferenceSession(out, sess_options=so,
+                                   providers=["DmlExecutionProvider"]).run(None, feed)[0]
+        scale = max(float(np.abs(ref).max()), 1e-6)
+        if not np.isfinite(got).all() or float(np.abs(got - ref).max()) > 0.02 * scale:
+            raise RuntimeError("DirectML LaMa output does not match the CPU")
+        open(ok_flag, "w").close()
+        return out
+    except Exception:  # noqa: BLE001 - remember, so every launch does not retry
+        try:
+            open(bad_flag, "w").close()
+        except OSError:
+            pass
+        return None
+    finally:
+        try:
+            os.remove(folded)
+        except OSError:
+            pass
+
+
 def _bounding_boxes(mask: np.ndarray, pad: int = 24) -> list[tuple[int, int, int, int]]:
     """Native-scale context windows covering each masked region."""
     import cv2
@@ -95,6 +194,7 @@ class LamaInpainter:
     def __init__(self, model_path: str | None = None) -> None:
         self.model_path = model_path
         self._session = None
+        self.provider = ""
 
     def _ensure_session(self):
         if self._session is None:
@@ -107,15 +207,29 @@ class LamaInpainter:
         import onnxruntime as ort
         from .onnx_depth import _providers
         path = self.model_path or download()
+        self.model_path = path
+        provs = _providers()
+        if "CUDAExecutionProvider" not in provs and "DmlExecutionProvider" in provs:
+            try:
+                dml_path = dml_model(path)
+                if dml_path is not None:
+                    so = ort.SessionOptions()
+                    so.log_severity_level = 3
+                    so.enable_mem_pattern = False     # DirectML requires it off
+                    self._session = ort.InferenceSession(
+                        dml_path, sess_options=so, providers=["DmlExecutionProvider"])
+                    self.provider = "DirectML"
+                    return
+            except Exception:  # noqa: BLE001 - CPU below is the floor
+                pass
         so = ort.SessionOptions()
         so.log_severity_level = 3
-        # DirectML mis-runs LaMa's spectral (FFC) ops ("MatMul parameter is
-        # incorrect"), so drop DML and use CUDA (if the user installed the GPU
-        # runtime) or CPU. It runs once per image, so CPU's ~2 s/tile is fine.
-        provs = [p for p in _providers() if p != "DmlExecutionProvider"]
+        # The stock export only runs on CUDA or CPU; DirectML needs the
+        # rewritten graph from dml_model().
+        provs = [p for p in provs if p != "DmlExecutionProvider"]
         self._session = ort.InferenceSession(
             path, sess_options=so, providers=provs or ["CPUExecutionProvider"])
-        self.model_path = path
+        self.provider = "CUDA" if "CUDAExecutionProvider" in provs else "CPU"
 
     def __call__(self, image_rgb: np.ndarray, holes: np.ndarray) -> np.ndarray:
         import cv2
