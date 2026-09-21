@@ -406,7 +406,9 @@ class CreativePage(QWidget):
     def _build_rail(self) -> QWidget:
         inner = QWidget()
         col = QVBoxLayout(inner)
-        col.setContentsMargins(0, 0, 6, 0)
+        # Right margin wider than the app's scrollbar: it overlays the content,
+        # and at 6 px it sat on the combo arrows and spin buttons.
+        col.setContentsMargins(0, 0, 16, 0)
         col.setSpacing(10)
         self._controls: list[QWidget] = []
 
@@ -527,7 +529,8 @@ class CreativePage(QWidget):
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setFixedWidth(300)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(340)
         return scroll
 
     def _spin(self, layout, label: str, lo: float, hi: float, step: float, field: str):

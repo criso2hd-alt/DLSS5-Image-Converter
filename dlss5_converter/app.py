@@ -4284,7 +4284,14 @@ class MainWindow(QMainWindow):
         credit_lines += [m.attribution for m in _upscale.MODELS.values()]
         credit_lines += [
             "Colour/neural composition: RenoDX DLSS 5 add-on by clshortfuse.",
-            "Runtimes: ONNX Runtime (MIT), tifffile (BSD-3), OpenCV, PySide6/Qt.",
+            "3D High quality scenes: SHARP by Apple (Mescheder et al., \"Sharp Monocular "
+            "View Synthesis in Less Than a Second\", 2025), Apple research licence, "
+            "non-commercial. ONNX export by pearsonkyle. Downloaded on request, not "
+            "distributed with this app.",
+            "3D background fill: LaMa (Suvorov et al., Samsung AI) — Apache-2.0; ONNX "
+            "export by Carve. Downloaded on request.",
+            "Runtimes: ONNX Runtime (MIT), wgpu-py (BSD-2), tifffile (BSD-3), OpenCV, "
+            "PySide6/Qt.",
             "nvngx_dlss / nvngx_dlssnr are NVIDIA's own files, supplied by you; "
             "not distributed with this app.",
         ]

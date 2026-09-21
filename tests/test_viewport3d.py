@@ -1,0 +1,76 @@
+"""The 3D tab's effect gizmo: handles follow the arrow on screen, and scale."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+pytest.importorskip("PySide6")
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def _viewport_with_volume(qt_app, yaw: float):
+    from dlss5_converter.effects3d import EffectsState, volume_preset
+    from dlss5_converter.viewport3d import EditorViewport
+
+    vp = EditorViewport()
+    vp.resize(800, 600)
+    vp.yaw = yaw
+    fx = EffectsState()
+    item = volume_preset("fog", -3.5)
+    fx.volumes.append(item)
+    vp.effects = fx
+    vp.show_effect_widgets = True
+    vp.selected_effect_id = item.id
+    return vp, item
+
+
+def _drag_toward_tip(vp, item, axis: str, pixels: int = 20):
+    """Drag along the axis handle as it is drawn on screen."""
+    cam = vp._editor_camera()
+    m = cam.view_projection(vp.width() / vp.height())
+    handles = vp._gizmo_handles(m, vp.size(), np.asarray(item.position, np.float32))
+    c, t = handles["view"], handles[axis]
+    d = np.array([t.x() - c.x(), t.y() - c.y()], float)
+    d = d / np.linalg.norm(d) * pixels
+    vp._fx_handle = axis
+    vp._drag_effect_handle(int(round(d[0])), int(round(d[1])))
+
+
+@pytest.mark.parametrize("yaw", [0.55, -0.55, 2.4])
+def test_every_axis_handle_moves_toward_its_arrow(qt_app, yaw):
+    # The blue (Z) handle used to follow the horizontal drag whatever way its
+    # arrow pointed, so from most angles it moved the effect the wrong way.
+    vp, item = _viewport_with_volume(qt_app, yaw)
+    for i, axis in enumerate("xyz"):
+        before = item.position[i]
+        _drag_toward_tip(vp, item, axis)
+        assert item.position[i] > before, axis
+
+
+def test_space_cycles_move_rotate_scale(qt_app):
+    vp, _item = _viewport_with_volume(qt_app, 0.55)
+    seen = []
+    for _ in range(3):
+        seen.append(vp.gizmo_mode)
+        vp.cycle_gizmo_mode()
+    assert seen == ["move", "rotate", "scale"]
+    assert vp.gizmo_mode == "move"
+
+
+def test_scale_axis_and_uniform(qt_app):
+    vp, item = _viewport_with_volume(qt_app, 0.55)
+    vp.set_gizmo_mode("scale")
+    sx, sy, sz = item.size
+    _drag_toward_tip(vp, item, "z")
+    assert item.size[2] > sz and item.size[0] == sx and item.size[1] == sy
+    before = item.size
+    vp._fx_handle = "view"
+    vp._drag_effect_handle(15, -15)          # right and up grows uniformly
+    assert all(a > b for a, b in zip(item.size, before))
+    ratio_before = before[0] / before[1]
+    assert abs(item.size[0] / item.size[1] - ratio_before) < 1e-6

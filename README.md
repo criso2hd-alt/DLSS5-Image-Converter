@@ -532,6 +532,29 @@ This is free, and staying free. If it saved you time and you feel like it, there
 is a **Sponsor** button at the top of the repository. Entirely optional — bug
 reports and screenshots of what you made are worth just as much.
 
+## Credits
+
+This app stands on other people's work:
+
+- **Depth Anything V2** (Yang et al.): depth estimation. Apache-2.0 (Small, bundled).
+- **RenoDX DLSS 5 add-on** by clshortfuse: the colour and neural composition the
+  harness drives.
+- **SHARP** by Apple ("Sharp Monocular View Synthesis in Less Than a Second",
+  Mescheder et al., 2025): the optional *High quality* 3D scenes. Apple's model
+  licence is **research / non-commercial**. The weights are downloaded on request
+  from a community ONNX export by
+  [pearsonkyle](https://huggingface.co/pearsonkyle/Sharp-onnx) and are not
+  distributed with this app. Original release:
+  [apple/ml-sharp](https://github.com/apple/ml-sharp).
+- **LaMa** (Suvorov et al., Samsung AI): background fill in the 3D tab.
+  Apache-2.0; ONNX export by [Carve](https://huggingface.co/Carve/LaMa-ONNX),
+  downloaded on request.
+- The AI upscale models listed on the Settings page, with their own licences.
+- Runtimes: ONNX Runtime (MIT), wgpu-py (BSD-2), PySide6 / Qt, OpenCV, tifffile.
+
+NVIDIA's `nvngx_dlss` / `nvngx_dlssnr` files are NVIDIA's own and are supplied by
+you; this project does not distribute them.
+
 ## Licence
 
 **Source-available, not open source.** See [LICENSE](LICENSE).

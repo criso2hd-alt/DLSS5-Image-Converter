@@ -237,9 +237,11 @@ class EditorViewport(QWidget):
                 # and rotated in place rather than only slid across the view.
                 previous = self.active_handle
                 self.active_handle = self._fx_handle
+                self._painting_effect = True
                 self._paint_transform_gizmo(
                     painter, vp, self.size(), np.asarray(item.position, np.float32)
                 )
+                self._painting_effect = False
                 self.active_handle = previous
             painter.drawEllipse(centre, radius, radius)
             painter.drawLine(centre-QPoint(radius+5, 0), centre+QPoint(radius+5, 0))
@@ -302,12 +304,46 @@ class EditorViewport(QWidget):
         vp = camera.view_projection(self.width() / max(self.height(), 1))
         handles = self._gizmo_handles(vp, self.size(), origin)
         best, best_distance = None, 1e9
+        # Whole shaft, not just the tip, as for the camera gizmo.
+        centre = handles.get("view")
+        if centre is not None and float((centre - point).manhattanLength()) < 14:
+            return "view"
+        px, py = float(point.x()), float(point.y())
+        for name in ("x", "y", "z"):
+            tip = handles.get(name)
+            if centre is None or tip is None:
+                continue
+            vx, vy = tip.x() - centre.x(), tip.y() - centre.y()
+            length2 = vx * vx + vy * vy
+            if length2 <= 1e-6:
+                continue
+            along = max(0.0, min(1.0, ((px - centre.x()) * vx + (py - centre.y()) * vy) / length2))
+            distance = math.hypot(px - (centre.x() + along * vx), py - (centre.y() + along * vy))
+            if distance < 12 and distance < best_distance:
+                best, best_distance = name, distance
+        if best is not None:
+            return best
         for name, position in handles.items():
             distance = float((position - point).manhattanLength())
             limit = 16 if name != "view" else 14
             if distance < limit and distance < best_distance:
                 best, best_distance = name, distance
         return best
+
+    def _along_handle(self, dx: int, dy: int, origin, axis: str) -> float:
+        """Mouse movement projected onto an axis handle's on-screen direction,
+        in pixels: positive when dragging toward the arrow tip."""
+        camera = self._editor_camera()
+        vp = camera.view_projection(self.width() / max(self.height(), 1))
+        handles = self._gizmo_handles(vp, self.size(), np.asarray(origin, np.float32))
+        centre, tip = handles.get("view"), handles.get(axis)
+        if centre is None or tip is None:
+            return 0.0
+        vx, vy = tip.x() - centre.x(), tip.y() - centre.y()
+        length = math.hypot(vx, vy)
+        if length < 1e-6:
+            return 0.0
+        return (dx * vx + dy * vy) / length
 
     def _drag_effect_handle(self, dx: int, dy: int) -> None:
         """Apply a constrained drag to the selected effect."""
@@ -327,18 +363,37 @@ class EditorViewport(QWidget):
                 ry += dx * step
                 rx -= dy * step
             item.rotation = (rx, ry, rz)
+        elif self.gizmo_mode == "scale":
+            # Axis handle stretches that axis only; the centre scales all three.
+            # Dragging along the handle's on-screen direction grows it, against
+            # it shrinks, exponentially so it feels the same at any size.
+            size = list(item.size)
+            if self._fx_handle in ("x", "y", "z"):
+                i = "xyz".index(self._fx_handle)
+                amount = self._along_handle(dx, dy, item.position, self._fx_handle)
+                size[i] = max(0.02, size[i] * math.exp(amount * 0.01))
+            else:
+                amount = (dx - dy) * 0.01
+                size = [max(0.02, s * math.exp(amount)) for s in size]
+            item.size = tuple(size)
         else:
             speed = abs(self.pivot_z) * 0.0025 * self.distance_scale
             x, y, z = item.position
-            if self._fx_handle == "x":
-                x += dx * speed
-            elif self._fx_handle == "y":
-                y -= dy * speed
-            elif self._fx_handle == "z":
-                z += dx * speed
-            else:  # view plane
-                x += dx * speed
-                y -= dy * speed
+            if self._fx_handle in ("x", "y", "z"):
+                # Follow the arrow as drawn on screen. The old code moved Z by
+                # the horizontal drag whatever the arrow's direction, so the
+                # blue handle went the wrong way from most angles.
+                amount = self._along_handle(dx, dy, item.position, self._fx_handle) * speed
+                pos = [x, y, z]
+                pos["xyz".index(self._fx_handle)] += amount
+                x, y, z = pos
+            else:
+                # Centre handle: move in the plane facing the editor camera.
+                cam = self._editor_camera()
+                view = cam.view_matrix()
+                right, up = view[0, :3], view[1, :3]
+                delta = right * dx * speed - up * dy * speed
+                x, y, z = x + float(delta[0]), y + float(delta[1]), z + float(delta[2])
             item.position = (x, y, z)
         self.effect_moved.emit(item.id)
         self.invalidate()
@@ -518,7 +573,11 @@ class EditorViewport(QWidget):
             painter.drawLine(centre, tip)
             painter.setBrush(colours[axis])
             painter.setPen(QPen(colours[axis], 1))
-            painter.drawEllipse(tip, 6 if active else 5, 6 if active else 5)
+            r = 6 if active else 5
+            if self.gizmo_mode == "scale" and getattr(self, "_painting_effect", False):
+                painter.drawRect(tip.x() - r, tip.y() - r, 2 * r, 2 * r)   # scale: cubes
+            else:
+                painter.drawEllipse(tip, r, r)
         centre_active = self.active_handle == "view" or self.hovered_handle == "view"
         painter.setBrush(QColor(235, 240, 250, 90 if centre_active else 40))
         painter.setPen(QPen(QColor(220, 226, 240, 200), 2))
@@ -566,13 +625,14 @@ class EditorViewport(QWidget):
         painter.setFont(QFont("Segoe UI", 8))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(8, 11, 17, 190))
-        box = QRect(8, self.height() - 26, 250, 18)
+        box = QRect(8, self.height() - 26, 430, 18)
         painter.drawRoundedRect(box, 5, 5)
         painter.setPen(QColor("#8e99ad"))
         painter.drawText(
             box.adjusted(6, 0, 0, 0),
             Qt.AlignmentFlag.AlignVCenter,
-            "Right drag orbit · Middle drag pan · Wheel zoom",
+            f"{self.gizmo_mode.title()} (Space / G R S) · Right drag orbit · "
+            "Middle drag pan · Wheel zoom",
         )
 
     # -- interaction ---------------------------------------------------------
@@ -617,21 +677,25 @@ class EditorViewport(QWidget):
         return best
 
     def set_gizmo_mode(self, mode: str) -> None:
-        self.gizmo_mode = "rotate" if mode == "rotate" else "move"
+        self.gizmo_mode = mode if mode in ("move", "rotate", "scale") else "move"
         self.update()
 
     def cycle_gizmo_mode(self) -> None:
-        self.set_gizmo_mode("rotate" if self.gizmo_mode == "move" else "move")
+        order = ("move", "rotate", "scale")
+        self.set_gizmo_mode(order[(order.index(self.gizmo_mode) + 1) % len(order)])
 
     def keyPressEvent(self, event) -> None:
-        # Space cycles move/rotate as in Unreal; G/R jump straight there as in
-        # Blender, so either muscle memory works.
+        # Space cycles move/rotate/scale as in Unreal; G/R/S jump straight there
+        # as in Blender, so either muscle memory works. The camera has no size,
+        # so for it Scale behaves as Move; only effects get scale handles.
         if event.key() == Qt.Key.Key_Space:
             self.cycle_gizmo_mode()
         elif event.key() == Qt.Key.Key_G:
             self.set_gizmo_mode("move")
         elif event.key() == Qt.Key.Key_R:
             self.set_gizmo_mode("rotate")
+        elif event.key() == Qt.Key.Key_S:
+            self.set_gizmo_mode("scale")
         else:
             super().keyPressEvent(event)
 
