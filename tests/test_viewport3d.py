@@ -115,3 +115,24 @@ def test_key_easing_is_per_key_like_after_effects():
     set_key_ease(t, mid, "Hold")
     assert key_ease_label(t, mid) == "Hold"
     assert key_sides(mid, keys[2])[0] == "hold"
+
+
+@pytest.mark.parametrize("yaw", [0.0, 1.2, 2.6])
+def test_middle_drag_pans_along_the_screen(qt_app, yaw):
+    """Dragging right moves the view's pivot left on screen, from any angle."""
+    from PySide6.QtCore import QPoint, Qt
+
+    vp, _item = _viewport_with_volume(qt_app, yaw)
+    right = vp._editor_camera().view_matrix()[0, :3].copy()
+    vp._button = Qt.MouseButton.MiddleButton
+    vp._last = QPoint(100, 100)
+
+    class Ev:
+        def position(self):
+            from PySide6.QtCore import QPointF
+            return QPointF(140, 100)
+
+    vp.mouseMoveEvent(Ev())
+    moved = vp.pan
+    assert float(moved @ right) < 0          # along the camera's own right axis
+    assert abs(float(np.linalg.norm(moved) - abs(moved @ right))) < 1e-5

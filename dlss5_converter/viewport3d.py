@@ -73,7 +73,7 @@ class EditorViewport(QWidget):
         self.yaw = 0.55
         self.pitch = 0.30
         self.distance_scale = 1.9
-        self.pan = np.zeros(2, dtype=np.float32)
+        self.pan = np.zeros(3, dtype=np.float32)   # world-space offset of the pivot
 
         self._last: QPoint | None = None
         self._button = None
@@ -147,7 +147,7 @@ class EditorViewport(QWidget):
 
     def _editor_camera(self) -> Camera:
         distance = abs(self.pivot_z) * self.distance_scale
-        pivot = np.array([self.pan[0], self.pan[1], self.pivot_z], np.float32)
+        pivot = np.array([0.0, 0.0, self.pivot_z], np.float32) + self.pan
         eye = pivot + np.array(
             [
                 distance * math.sin(self.yaw) * math.cos(self.pitch),
@@ -856,8 +856,13 @@ class EditorViewport(QWidget):
             return
         if self._button == Qt.MouseButton.MiddleButton:
             scale = abs(self.pivot_z) * 0.002
-            self.pan[0] -= dx * scale
-            self.pan[1] += dy * scale
+            # Pan in the plane of the screen, along the editor camera's own
+            # right and up. Moving world X/Y instead only worked while looking
+            # straight down -Z; from the side, a sideways drag went nowhere
+            # useful.
+            view = self._editor_camera().view_matrix()
+            right, up = view[0, :3], view[1, :3]
+            self.pan += (-right * dx + up * dy) * scale
         elif self._button == Qt.MouseButton.RightButton:
             self.yaw -= dx * 0.008
             self.pitch = float(np.clip(self.pitch + dy * 0.008, -1.35, 1.35))
