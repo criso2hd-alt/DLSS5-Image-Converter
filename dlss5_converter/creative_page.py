@@ -53,12 +53,70 @@ SHARP_LONG = 1600
 SOURCES = {"Standard": "standard", "High quality (SHARP)": "sharp"}
 PIVOT_Z = -(splat3d.NEAR + splat3d.FAR) * 0.5
 PRESETS = ["Orbit", "Drift", "Push in", "Pull out", "Vertigo", "Static"]
+#: Resolution classes: (width, height) of the 16:9 frame in each class. The
+#: aspect ratio then sets the shape within the class (see output_size).
 RESOLUTIONS = {
-    "4K  3840 x 2160": (3840, 2160),
-    "1440p  2560 x 1440": (2560, 1440),
-    "1080p  1920 x 1080": (1920, 1080),
-    "720p  1280 x 720": (1280, 720),
+    "4K / UHD": (3840, 2160),
+    "1440p / QHD": (2560, 1440),
+    "1080p / Full HD": (1920, 1080),
+    "720p / HD": (1280, 720),
 }
+#: Output aspect ratios, width / height. None follows the source image.
+ASPECTS = {
+    "Source image": None,
+    "16:9 HD": 16 / 9,
+    "9:16 Vertical": 9 / 16,
+    "4:3": 4 / 3,
+    "3:4 Vertical": 3 / 4,
+    "1:1 Square": 1.0,
+    "4:5 Vertical (social)": 4 / 5,
+    "1.85:1 Flat (cinema)": 1.85,
+    "2.39:1 CinemaScope": 2.39,
+    "2.76:1 Ultra Panavision": 2.76,
+}
+
+
+def output_size(aspect: float, klass: tuple[int, int]) -> tuple[int, int]:
+    """Standard video frame for an aspect within a resolution class.
+
+    Mastering convention: ratios wider than 16:9 keep the class width and
+    letterbox the height (1080p scope is 1920x804, flat 1920x1038); narrower
+    landscape keeps the class height (4:3 is 1440x1080); vertical and square
+    frames use the class height as their width (9:16 is 1080x1920, 4:5 is
+    1080x1350). Even numbers throughout, as encoders require."""
+    cw, ch = klass
+    if aspect >= cw / ch:
+        w, h = cw, cw / aspect
+    elif aspect >= 1.0:
+        w, h = ch * aspect, ch
+    else:
+        w, h = ch, ch / aspect
+    # Nearest EVEN size (1920 / 2.39 = 803.3 -> 804, the standard scope frame).
+    return max(2, 2 * int(round(w / 2))), max(2, 2 * int(round(h / 2)))
+
+
+def lens_mm(vfov_degrees: float) -> float:
+    """Full-frame-equivalent focal length for a vertical field of view."""
+    return 12.0 / math.tan(math.radians(vfov_degrees) * 0.5)
+
+
+def lens_fov(mm: float) -> float:
+    return math.degrees(2.0 * math.atan(12.0 / max(mm, 1e-3)))
+
+
+def shot_matrices(key, size, source_aspect: float) -> tuple[np.ndarray, np.ndarray]:
+    """View and projection for the camera at `key`, framed to `size`.
+
+    The aspect ratio crops the camera's frame, it never changes the camera:
+    the key's field of view describes the frame at the SOURCE image's shape,
+    and a wider output trims top and bottom (a taller one, the sides) instead
+    of reaching past the photo's edges."""
+    cam = key_to_camera(key)
+    out_aspect = size[0] / max(size[1], 1)
+    if out_aspect > source_aspect:
+        half = math.tan(math.radians(cam.fov_degrees) * 0.5) * source_aspect / out_aspect
+        cam.fov_degrees = math.degrees(2.0 * math.atan(half))
+    return camera_matrices(cam, size)
 VOLUME_TYPES = ["Fog", "Smoke", "Fire", "Cloud", "Godrays"]
 PARTICLE_TYPES = ["Embers", "Dust", "Snow", "Smoke", "Fire", "Clouds"]
 BACKGROUND = (0.02, 0.021, 0.026)
@@ -263,8 +321,7 @@ class _Worker(QObject):
                         raise RuntimeError("Export cancelled.")
                     t = i / fps
                     key = job["track"].evaluate(t)
-                    cam = key_to_camera(key)
-                    view, proj = camera_matrices(cam, (w, h))
+                    view, proj = shot_matrices(key, (w, h), job["source_aspect"])
                     fx = job["effects_track"].evaluate(t, job["effects"])
                     writer.write(r.render_u8(view, proj, (w, h), BACKGROUND, fx, t))
                     if i % 4 == 0:
@@ -354,7 +411,32 @@ class CreativePage(QWidget):
         cam_box = QWidget()
         cam_col = QVBoxLayout(cam_box)
         cam_col.setContentsMargins(0, 0, 0, 0)
-        cam_col.addWidget(self._heading("Camera"))
+        cam_head = QHBoxLayout()
+        cam_head.addWidget(self._heading("Camera"))
+        cam_head.addStretch()
+        cam_head.addWidget(QLabel("Aspect"))
+        self.aspect_box = QComboBox()
+        self.aspect_box.addItems(list(ASPECTS))
+        self.aspect_box.setToolTip(
+            "Shape of the video. The camera view shows exactly this frame; a wider "
+            "ratio trims top and bottom, a taller one the sides. Export sizes follow "
+            "video standards for the chosen resolution.")
+        self.aspect_box.currentTextChanged.connect(lambda _t: self._request_redraw())
+        cam_head.addWidget(self.aspect_box)
+        cam_head.addWidget(QLabel("Lens"))
+        self.lens_spin = QDoubleSpinBox()
+        self.lens_spin.setRange(8.0, 300.0)
+        self.lens_spin.setDecimals(1)
+        self.lens_spin.setSingleStep(1.0)
+        self.lens_spin.setSuffix(" mm")
+        self.lens_spin.setToolTip(
+            "Focal length (full-frame equivalent). Changing it keys the lens at the "
+            "playhead, so two keys with different lenses make an animated zoom.")
+        self.lens_spin.valueChanged.connect(self._lens_changed)
+        cam_head.addWidget(self.lens_spin)
+        cam_col.addLayout(cam_head)
+        self.frame_label = QLabel("")
+        self.frame_label.setStyleSheet("color: #8a93a6;")
         self.preview = QLabel(self._empty_text())
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setWordWrap(True)
@@ -362,6 +444,7 @@ class CreativePage(QWidget):
         self.preview.setStyleSheet(
             "QLabel { background: #090c12; border-radius: 8px; color: #6b7688; padding: 16px; }")
         cam_col.addWidget(self.preview, 1)
+        cam_col.addWidget(self.frame_label)
         views.addWidget(cam_box)
 
         scene_box = QWidget()
@@ -621,6 +704,7 @@ class CreativePage(QWidget):
         self.res_box = QComboBox()
         self.res_box.addItems(list(RESOLUTIONS))
         self.res_box.setCurrentIndex(2)
+        self.res_box.currentTextChanged.connect(lambda _t: self._request_redraw())
         self.codec_box = QComboBox()
         for cd in video.CODECS:
             self.codec_box.addItem(cd.label, cd.key)
@@ -837,6 +921,7 @@ class CreativePage(QWidget):
         self._track_changed()
 
     def _track_changed(self) -> None:
+        self._sync_lens()
         self.timeline.set_track(self.track)
         self.timeline.set_duration(self.duration, self.fps)
         self.viewport.set_track(self.track, self.duration)
@@ -907,7 +992,28 @@ class CreativePage(QWidget):
     def _seek(self, t: float) -> None:
         self.time = float(t)
         self.viewport.set_time(self.time)
+        self._sync_lens()
         self._request_redraw()
+
+    def _sync_lens(self) -> None:
+        key = self.track.evaluate(self.time)
+        if key is None:
+            return
+        self.lens_spin.blockSignals(True)
+        self.lens_spin.setValue(lens_mm(key.fov_degrees))
+        self.lens_spin.blockSignals(False)
+
+    def _lens_changed(self, mm: float) -> None:
+        # Auto-key: write the lens into the key at the playhead, making one
+        # from the current pose if there is none, as editing any keyed value
+        # does in After Effects.
+        key = self.track.nearest(self.time, tolerance=0.5 / max(self.fps, 1))
+        if key is None:
+            key = self.track.evaluate(self.time) or CameraKey(time=self.time)
+            key.time = self.time
+            key = self.track.add(key)
+        key.fov_degrees = lens_fov(mm)
+        self._keys_changed()
 
     def _toggle_play(self) -> None:
         if self._playing:
@@ -1098,15 +1204,18 @@ class CreativePage(QWidget):
             return
         ratio = max(1.0, float(self.preview.devicePixelRatioF()))
         box = (max(64, int(self.preview.width() * ratio)), max(64, int(self.preview.height() * ratio)))
-        aspect = self._rgb8.shape[1] / self._rgb8.shape[0]
-        # Fit the image aspect inside the label; the render is the display size.
+        src_aspect = self._rgb8.shape[1] / self._rgb8.shape[0]
+        aspect = self._output_aspect()
+        out_w, out_h = output_size(aspect, RESOLUTIONS[self.res_box.currentText()])
+        self.frame_label.setText(f"{self.aspect_box.currentText()}  ·  export {out_w} x {out_h}")
+        # Fit the output frame inside the label; the render is the display size.
         w = box[0]
         h = int(w / aspect)
         if h > box[1]:
             h = box[1]
             w = int(h * aspect)
         w, h = max(2, w - w % 2), max(2, h - h % 2)
-        view, proj = camera_matrices(key_to_camera(key), (w, h))
+        view, proj = shot_matrices(key, (w, h), src_aspect)
         frame = self._renderer.render_u8(view, proj, (w, h), BACKGROUND,
                                          self._effects_at(self.time), self.time)
         img = QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
@@ -1129,10 +1238,10 @@ class CreativePage(QWidget):
             self, "Export video", f"scene{codec.suffix}", f"{codec.label} (*{codec.suffix})")
         if not path:
             return
-        aspect = self._rgb8.shape[1] / self._rgb8.shape[0]
         job = {
             "path": path, "codec": codec.key, "fps": self.fps, "duration": self.duration,
-            "size": fit_size(aspect, RESOLUTIONS[self.res_box.currentText()]),
+            "size": output_size(self._output_aspect(), RESOLUTIONS[self.res_box.currentText()]),
+            "source_aspect": self._rgb8.shape[1] / self._rgb8.shape[0],
             "track": CameraTrack(keys=[CameraKey(**{f: getattr(k, f) for f in (
                 "time", "x", "y", "z", "yaw", "pitch", "roll", "fov_degrees", "easing")})
                 for k in self.track.keys], smooth=self.track.smooth),
@@ -1142,6 +1251,12 @@ class CreativePage(QWidget):
         self._stop()
         self._set_enabled(False)
         self._request_export.emit(self._copy_scene(self._scene), job)
+
+    def _output_aspect(self) -> float:
+        chosen = ASPECTS.get(self.aspect_box.currentText())
+        if chosen is None and self._rgb8 is not None:
+            return self._rgb8.shape[1] / self._rgb8.shape[0]
+        return chosen or 16 / 9
 
     def _on_exported(self, path: str) -> None:
         self._set_enabled(True)
