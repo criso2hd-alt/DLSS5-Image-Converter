@@ -222,6 +222,7 @@ class SplatScene:
     n_front: int             # splats from the visible photo; the rest is backfill
     photo_z: np.ndarray | None = None   # the photo's view-Z map, for culling fills
     focal: float = 0.0
+    planes: list = None                  # [(normal, offset)] from fit_planes
 
     def __len__(self) -> int:
         return int(self.positions.shape[0])
@@ -402,10 +403,96 @@ def build_splats(rgb8: np.ndarray, disp: np.ndarray, inpainter=None,
     return SplatScene(np.concatenate(positions).astype(np.float32),
                       np.concatenate(colors).astype(np.float32),
                       np.concatenate(opac), np.concatenate(covs), n_front,
-                      photo_z=z, focal=focal)
+                      photo_z=z, focal=focal,
+                      planes=fit_planes(pos, ~edge & (z < FAR * 0.98)))
 
 
 # -- fill as the camera moves ---------------------------------------------------
+
+# -- scene layout: planes ---------------------------------------------------------
+
+def _pixel_normals(pos: np.ndarray) -> np.ndarray:
+    dx = np.gradient(pos, axis=1)
+    dy = np.gradient(pos, axis=0)
+    n = np.cross(dx, dy)
+    return n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-9)
+
+
+def fit_planes(pos: np.ndarray, valid: np.ndarray, max_planes: int = 4,
+               min_share: float = 0.06, seed: int = 0) -> list[tuple[np.ndarray, float]]:
+    """Find the big flat surfaces of the scene: the ground, walls, a backdrop.
+
+    Sequential RANSAC on a sample of the photo's 3-D points. Each round tries
+    random three-point planes, keeps the one most points agree with, refines
+    it by least squares, removes its points and looks again. A plane must hold
+    at least `min_share` of the scene to count, so clutter never becomes one.
+
+    Agreement is RELATIVE to depth (2% of the distance): depth from a single
+    image is only good to a proportion, so a fixed tolerance would accept
+    everything far away and nothing near. Points must also face the same way
+    as the plane, so a wall is not swallowed by the floor it touches.
+
+    Returns planes as (unit normal n, offset c) with n . p + c = 0, in the
+    photo camera's frame (the scene's world frame)."""
+    rng = np.random.default_rng(seed)
+    normals = _pixel_normals(pos)
+    idx = np.flatnonzero(valid.reshape(-1))
+    if idx.size < 500:
+        return []
+    take = rng.choice(idx, size=min(idx.size, 30000), replace=False)
+    P = pos.reshape(-1, 3)[take].astype(np.float64)
+    N = normals.reshape(-1, 3)[take].astype(np.float64)
+    scale = np.abs(P[:, 2]) + 1e-6
+    alive = np.ones(len(P), bool)
+    planes: list[tuple[np.ndarray, float]] = []
+    far_cut = float(np.percentile(P[:, 2], 30))    # z is negative: 30th pct = far 70%
+    for _ in range(max_planes + 3):
+        live = np.flatnonzero(alive)
+        if live.size < min_share * len(P):
+            break
+        best, best_count = None, 0
+        for _ in range(400):
+            a, b, c = P[rng.choice(live, 3, replace=False)]
+            n = np.cross(b - a, c - a)
+            ln = np.linalg.norm(n)
+            if ln < 1e-9:
+                continue
+            n /= ln
+            d = -n @ a
+            res = np.abs(P[live] @ n + d) / scale[live]
+            agree = (res < 0.02) & (np.abs(N[live] @ n) > 0.8)
+            count = int(agree.sum())
+            if count > best_count:
+                best, best_count = (n, d), count
+        if best is None or best_count < min_share * len(P):
+            break
+        n, d = best
+        res = np.abs(P @ n + d) / scale
+        inl = alive & (res < 0.02) & (np.abs(N @ n) > 0.8)
+        # Least-squares refit on the inliers: centroid plus smallest singular
+        # vector, which is the plane closest to all of them at once.
+        Q = P[inl]
+        cen = Q.mean(0)
+        _u, _s, vt = np.linalg.svd(Q - cen, full_matrices=False)
+        n = vt[-1]
+        if n @ cen > 0:
+            n = -n          # normal faces the camera, which sits at the origin
+        alive &= ~inl
+        # Only STRUCTURE counts as a plane: the ground, or a wall standing
+        # behind things. Random alignments pass RANSAC too (a torso and a car
+        # bumper at the same depth, a slanted band across trees and sky), and
+        # treating those as planes stops anything being filled behind them.
+        # (Normals are in camera space, so "horizontal" assumes a roughly
+        # level camera, which is what photos almost always are.)
+        ground = abs(n[1]) > 0.85
+        wall = (abs(n[1]) < 0.35 and float(np.median(Q[:, 2])) <= far_cut
+                and len(Q) >= 0.10 * len(P))
+        if ground or wall:
+            planes.append((n.astype(np.float32), float(-n @ cen)))
+            if len(planes) >= max_planes:
+                break
+    return planes
+
 
 def _push_pull(values: np.ndarray, weight: np.ndarray) -> np.ndarray:
     """Fill every pixel from the weighted known ones, smoothly and fast.
@@ -461,6 +548,39 @@ def _wall_depth(dist: np.ndarray, known: np.ndarray) -> np.ndarray:
     return np.maximum(back, np.where(known, 0.0, local_far * 0.9)).astype(np.float32)
 
 
+def _disc_cov(normals: np.ndarray, sigma: np.ndarray, thin: float = 0.12) -> np.ndarray:
+    """Flat discs of radius `sigma` lying in the plane of each normal."""
+    nn = normals[:, :, None] * normals[:, None, :]
+    eye = np.eye(3, dtype=np.float32)[None]
+    cov3 = (sigma[:, None, None] ** 2) * ((eye - nn) + (thin ** 2) * nn)
+    return np.stack([cov3[:, 0, 0], cov3[:, 0, 1], cov3[:, 0, 2],
+                     cov3[:, 1, 1], cov3[:, 1, 2], cov3[:, 2, 2]], -1).astype(np.float32)
+
+
+def _on_planes(pos: np.ndarray, planes, tol: float = 0.025) -> np.ndarray:
+    """Which photo pixels lie on one of the scene planes (relative tolerance)."""
+    on = np.zeros(pos.shape[:2], bool)
+    scale = np.abs(pos[..., 2]) + 1e-6
+    for n, c in planes or []:
+        on |= np.abs(pos @ n + c) / scale < tol
+    return on
+
+
+def _planes_behind(origin, dirs, planes, t_min):
+    """(depth, normal) of the first plane behind t_min per ray; depth 0 = none."""
+    best = np.zeros(len(dirs), np.float32)
+    normal = np.zeros((len(dirs), 3), np.float32)
+    for n, c in planes or []:
+        denom = dirs @ n
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = -(origin @ n + c) / denom
+        ok = np.isfinite(t) & (t > t_min) & (t < FAR * 2.5)
+        take = ok & ((best == 0) | (t < best))
+        best[take] = t[take]
+        normal[take] = n
+    return best, normal
+
+
 def fill_backplate(scene: SplatScene, renderer: "SplatRenderer", inpainter=None,
                    reach: float = 0.12) -> int:
     """Paint the wall behind every subject, from the original viewpoint.
@@ -488,10 +608,31 @@ def fill_backplate(scene: SplatScene, renderer: "SplatRenderer", inpainter=None,
     far_ref = cv2.dilate(small, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rs + 1, 2 * rs + 1)))
     far_ref = cv2.resize(far_ref, (w, h), interpolation=cv2.INTER_LINEAR)
     hole = z < far_ref * 0.9
+
+    # Scene layout: every pixel that is not on one of the scene's planes is an
+    # object, and wherever a plane continues behind an object, that is what
+    # the object hides. This is what fills the road under a car: the old rule
+    # only knew "the far wall", so the floor behind objects was left open.
+    f = scene.focal
+    ys_all, xs_all = np.mgrid[0:h, 0:w].astype(np.float32)
+    dirs = np.stack([(xs_all - (w - 1) * 0.5) / f, -(ys_all - (h - 1) * 0.5) / f,
+                     -np.ones_like(xs_all)], -1).reshape(-1, 3)
+    plane_t = np.zeros(h * w, np.float32)
+    plane_n = np.zeros((h * w, 3), np.float32)
+    if scene.planes:
+        pos = _unproject(z, f)
+        obj = ~_on_planes(pos, scene.planes)
+        plane_t, plane_n = _planes_behind(np.zeros(3, np.float32), dirs, scene.planes,
+                                          z.reshape(-1) * 1.05)
+        plane_t[~obj.reshape(-1)] = 0.0
+        hole |= plane_t.reshape(h, w) > 0
+
     hole = cv2.morphologyEx(hole.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
     if int(hole.sum()) < 64:
         return 0
     depth = _far_side_depth(z, hole)
+    use_plane = (plane_t.reshape(h, w) > 0) & hole
+    depth = np.where(use_plane, plane_t.reshape(h, w), depth)
     # Hide every subject from the inpainter, not just the band behind its
     # edge. With only the band masked it could see the rest of the person and
     # continued their skin and clothes into the wall: a ghost of the subject
@@ -500,7 +641,7 @@ def fill_backplate(scene: SplatScene, renderer: "SplatRenderer", inpainter=None,
     # 0.95 and a margin of ~1% of the image: hair and the soft depth halo
     # round a silhouette sit just outside a tight mask, and a dark rim left in
     # the context is extended across the wall as a shadow of the subject.
-    paint = hole | (z < wall * 0.95)
+    paint = hole | (z < wall * 0.95) | use_plane
     m = max(9, int(0.012 * max(h, w))) | 1
     paint = cv2.dilate(paint.astype(np.uint8),
                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (m, m))) > 0
@@ -513,20 +654,34 @@ def fill_backplate(scene: SplatScene, renderer: "SplatRenderer", inpainter=None,
         filled = cv2.inpaint(rgb8, paint.astype(np.uint8) * 255, 7, cv2.INPAINT_TELEA)
     ys, xs = np.nonzero(hole)
     tz = depth[ys, xs]
-    f = scene.focal
     world = np.stack([(xs - (w - 1) * 0.5) * tz / f, -(ys - (h - 1) * 0.5) * tz / f, -tz],
                      -1).astype(np.float32)
-    foot = (tz / f) * 0.8
-    base = np.diag([1.0, 1.0, 0.12 ** 2]).astype(np.float32)
-    cov3 = (foot[:, None, None] ** 2) * base[None]
-    cov = np.stack([cov3[:, 0, 0], cov3[:, 0, 1], cov3[:, 0, 2],
-                    cov3[:, 1, 1], cov3[:, 1, 2], cov3[:, 2, 2]], -1).astype(np.float32)
+    cov = _fill_cov(world, tz / f, plane_n.reshape(h, w, 3)[ys, xs], np.array([0.0, 0.0, 1.0]))
     scene.positions = np.concatenate([scene.positions, world])
     scene.colors = np.concatenate([scene.colors, filled[ys, xs].astype(np.float32) / 255.0])
     scene.opacity = np.concatenate([scene.opacity, np.ones(len(ys), np.float32)])
     scene.cov = np.concatenate([scene.cov, cov])
     renderer.set_scene(scene)
     return int(len(ys))
+
+
+def _fill_cov(world: np.ndarray, pixel: np.ndarray, plane_n: np.ndarray,
+              facing: np.ndarray, cam=None) -> np.ndarray:
+    """Covariances for fill splats.
+
+    On a scene plane the disc lies IN the plane, sized to the pixel's
+    footprint on that plane (larger when the plane is seen at a grazing angle,
+    so a far stretch of road is still covered). Elsewhere it faces the camera
+    that made it. Camera-facing discs are what looked like stripes of cards
+    from the side; plane-aligned ones stay a continuous floor or wall."""
+    on_plane = np.abs(plane_n).sum(-1) > 0.5
+    normals = np.where(on_plane[:, None], plane_n, facing[None, :]).astype(np.float32)
+    origin = np.zeros(3, np.float32) if cam is None else np.asarray(cam, np.float32)
+    ray = world - origin
+    ray /= np.linalg.norm(ray, axis=-1, keepdims=True) + 1e-9
+    cos = np.abs((ray * normals).sum(-1))
+    sigma = pixel * 0.8 / np.clip(np.where(on_plane, cos, 1.0), 0.3, 1.0)
+    return _disc_cov(normals, sigma.astype(np.float32))
 
 
 def _occludes_photo(scene: SplatScene, world: np.ndarray, margin: float = 0.03) -> np.ndarray:
@@ -572,6 +727,27 @@ def fill_view(scene: SplatScene, renderer: "SplatRenderer", view: np.ndarray,
     solid = (alpha > 0.95) & ~hole
     depth = _far_side_depth(np.where(solid, dist, 0.0), ~solid)
 
+    # The first scene plane behind the foreground next to the hole wins over
+    # the far-wall estimate: a gap opening beside a car shows more road, not
+    # the backdrop. Rays run through THIS camera in world space.
+    fx, fy = proj[0, 0] * w * 0.5, proj[1, 1] * h * 0.5
+    inv = np.linalg.inv(view)
+    plane_n_map = np.zeros((h, w, 3), np.float32)
+    if scene.planes:
+        near_src = np.where(solid, dist, 1e9).astype(np.float32)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        local_near = cv2.erode(near_src, k)
+        local_near = np.where(local_near > 1e8, 0.0, local_near)
+        hy, hx = np.nonzero(hole)
+        d_cam = np.stack([(hx - (w - 1) * 0.5) / fx, -(hy - (h - 1) * 0.5) / fy,
+                          -np.ones(len(hx), np.float32)], -1)
+        d_world = (inv[:3, :3] @ d_cam.T).T.astype(np.float32)
+        t, nrm = _planes_behind(inv[:3, 3].astype(np.float32), d_world, scene.planes,
+                                local_near[hy, hx] * 1.03)
+        ok = (t > 0) & (t <= depth[hy, hx] * 1.1)
+        depth[hy[ok], hx[ok]] = t[ok]
+        plane_n_map[hy[ok], hx[ok]] = nrm[ok]
+
     # What LaMa may look at: only surfaces at least as far as the hole. Anything
     # nearer (a fence wire crossing the gap, the edge of the face) is masked out
     # as well, otherwise it is copied into the background as a streak.
@@ -588,27 +764,18 @@ def fill_view(scene: SplatScene, renderer: "SplatRenderer", view: np.ndarray,
         filled = cv2.inpaint(rgb8, paint.astype(np.uint8) * 255, 7, cv2.INPAINT_TELEA)
 
     # Unproject the hole pixels through THIS camera into world space.
-    fx, fy = proj[0, 0] * w * 0.5, proj[1, 1] * h * 0.5
     ys, xs = np.nonzero(hole)
     tz = depth[ys, xs]
     cam_pts = np.stack([(xs - (w - 1) * 0.5) * tz / fx,
                         -(ys - (h - 1) * 0.5) * tz / fy,
                         -tz, np.ones_like(tz)], -1)
-    world = (np.linalg.inv(view) @ cam_pts.T).T[:, :3].astype(np.float32)
+    world = (inv @ cam_pts.T).T[:, :3].astype(np.float32)
     keep = ~_occludes_photo(scene, world)
     ys, xs, tz, world = ys[keep], xs[keep], tz[keep], world[keep]
     if len(ys) == 0:
         return 0
-    # Camera-facing discs about 1.6 px across the sigma, so that seen from a
-    # neighbouring pose (where they spread apart) they still overlap rather
-    # than breaking into a stipple of dots.
-    foot = (tz / fx) * 1.1
-    n = view[2, :3] / (np.linalg.norm(view[2, :3]) + 1e-9)
-    nn = np.outer(n, n)
-    base = np.eye(3, dtype=np.float32) - nn + (0.12 ** 2) * nn
-    cov3 = (foot[:, None, None] ** 2) * base[None]
-    cov = np.stack([cov3[:, 0, 0], cov3[:, 0, 1], cov3[:, 0, 2],
-                    cov3[:, 1, 1], cov3[:, 1, 2], cov3[:, 2, 2]], -1).astype(np.float32)
+    cov = _fill_cov(world, tz / fx * 1.4, plane_n_map[ys, xs],
+                    view[2, :3] / (np.linalg.norm(view[2, :3]) + 1e-9), cam=inv[:3, 3])
     scene.positions = np.concatenate([scene.positions, world])
     scene.colors = np.concatenate([scene.colors, filled[ys, xs].astype(np.float32) / 255.0])
     scene.opacity = np.concatenate([scene.opacity, np.ones(len(ys), np.float32)])

@@ -602,7 +602,7 @@ class CreativePage(QWidget):
     @staticmethod
     def _copy_scene(s: splat3d.SplatScene) -> splat3d.SplatScene:
         return splat3d.SplatScene(s.positions.copy(), s.colors.copy(), s.opacity.copy(),
-                                  s.cov.copy(), s.n_front, s.photo_z, s.focal)
+                                  s.cov.copy(), s.n_front, s.photo_z, s.focal, s.planes)
 
     def _on_baked(self, scene, gen: int) -> None:
         if gen != self._gen:
