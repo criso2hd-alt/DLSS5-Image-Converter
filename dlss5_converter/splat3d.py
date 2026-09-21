@@ -960,6 +960,7 @@ class SplatRenderer:
             size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._targets = None
         self._n = 0
+        self._planes: list = []
         sort_mod = device.create_shader_module(code=SORT_SHADER)
         st = wgpu.BufferBindingType.storage
         self._sort_layout = device.create_bind_group_layout(entries=[
@@ -1003,6 +1004,7 @@ class SplatRenderer:
         self._centre = pos.mean(0) if len(scene) else np.zeros(3, np.float32)
         self._radius = float(np.linalg.norm(pos - self._centre, axis=1).max()) if len(scene) else 1.0
         self._n = len(scene)
+        self._planes = list(scene.planes or [])
 
     def _encode_sort(self, enc, view: np.ndarray) -> None:
         cam = -view[:3, :3].T @ view[:3, 3]
@@ -1069,7 +1071,7 @@ class SplatRenderer:
         if effects is not None and mode == 0:
             cam = -view[:3, :3].T @ view[:3, 3]
             self._fx.encode(enc, colour_view, self._depth.create_view(), view, proj,
-                            cam, effects, time_seconds)
+                            cam, effects, time_seconds, self._planes)
         self.device.queue.submit([enc.finish()])
 
     def render(self, view: np.ndarray, proj: np.ndarray, size,

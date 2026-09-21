@@ -74,8 +74,23 @@ class ParticleEmitter:
     opacity: float = 1.0
     speed: float = 0.65
     spread: float = 0.65
+    #: Acceleration ALONG `direction`: positive speeds particles up (buoyant
+    #: fire), negative slows them (smoke losing heat).
     gravity: float = -0.05
     turbulence: float = 0.55
+    #: Which way the particles travel, a unit vector in scene space. Not
+    #: assumed to be world up: depth from a photo has no reliable "up", and a
+    #: user may want sparks blowing sideways or snow falling at an angle.
+    direction: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    #: Air resistance: how quickly the launch speed dies away. High for
+    #: smoke (billows out, then drifts), low for sparks.
+    drag: float = 0.6
+    #: How much each particle grows over its life (smoke puffs expand).
+    growth: float = 0.0
+    #: Stop at the floor, walls and ceiling the scene analysis found.
+    collide: bool = True
+    #: 0 slides along a surface (smoke pooling), up to 1 bounces back.
+    bounce: float = 0.0
     colour: tuple[float, float, float] = (0.72, 0.76, 0.80)
     emission: float = 0.0
     light_response: float = 0.8
@@ -83,17 +98,51 @@ class ParticleEmitter:
 
 
 @dataclass(slots=True)
+class CollisionPlane:
+    """A floor, ceiling or wall the user places for particles to collide with.
+
+    Depth from one photo is often tilted, so the detected ground is not always
+    where the eye says the floor is. A user plane is positioned and angled with
+    the same gizmo as any effect. Its normal is the local +Y axis rotated by
+    `rotation`: the free side, where particles live. A floor also defines
+    "up" for particle directions, so tilting it tilts gravity with it.
+    """
+
+    name: str = "Floor"
+    kind: str = "floor"  # floor, ceiling, wall
+    id: str = field(default_factory=_id)
+    enabled: bool = True
+    position: tuple[float, float, float] = (0.0, -0.5, -3.5)
+    #: Only for drawing in the editor (and the scale gizmo); collision uses
+    #: the infinite plane.
+    size: tuple[float, float, float] = (3.0, 0.02, 3.0)
+    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    def normal(self) -> tuple[float, float, float]:
+        rx, ry, rz = (float(v) for v in self.rotation)
+        cx, sx, cy, sy, cz, sz = (math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry),
+                                  math.cos(rz), math.sin(rz))
+        # (Rz Ry Rx) applied to (0, 1, 0), the same Euler order as volumes.
+        x, y, z = 0.0, cx, sx
+        x, z = cy * x + sy * z, -sy * x + cy * z
+        x, y = cz * x - sz * y, sz * x + cz * y
+        return (x, y, z)
+
+
+@dataclass(slots=True)
 class EffectsState:
     lighting: LightingSettings = field(default_factory=LightingSettings)
     volumes: list[VolumeEffect] = field(default_factory=list)
     emitters: list[ParticleEmitter] = field(default_factory=list)
+    planes: list[CollisionPlane] = field(default_factory=list)
 
     def clone(self) -> "EffectsState":
         return copy.deepcopy(self)
 
     def item(self, item_id: str):
         return next(
-            (item for item in [*self.volumes, *self.emitters] if item.id == item_id),
+            (item for item in [*self.volumes, *self.emitters, *self.planes]
+             if item.id == item_id),
             None,
         )
 
@@ -199,6 +248,7 @@ def interpolate_effects(a: EffectsState, b: EffectsState, f: float) -> EffectsSt
 
     result.volumes = blend_lists(a.volumes, b.volumes)
     result.emitters = blend_lists(a.emitters, b.emitters)
+    result.planes = blend_lists(a.planes, b.planes)
     return result
 
 
@@ -219,7 +269,7 @@ def animatable_paths(state: EffectsState) -> list[str]:
     """
     paths: list[str] = []
     owners = [(ENVIRONMENT, state.lighting)]
-    owners += [(item.id, item) for item in [*state.volumes, *state.emitters]]
+    owners += [(item.id, item) for item in [*state.volumes, *state.emitters, *state.planes]]
     for owner_id, target in owners:
         for info in fields(target):
             name = info.name
@@ -440,20 +490,58 @@ def volume_preset(kind: str, pivot_z: float = -4.0) -> VolumeEffect:
 def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
     kind = kind.lower()
     presets = {
-        "smoke": dict(name="Smoke emitter", count=420, speed=0.5, gravity=-0.03),
+        # drag/growth/bounce give each kind its own physics: smoke billows,
+        # slows and swells; sparks fly and bounce; dust hangs; snow settles.
+        "smoke": dict(name="Smoke emitter", count=420, speed=0.8, gravity=0.05,
+                      drag=1.4, growth=2.5, turbulence=0.9, opacity=0.55),
         "fire": dict(name="Fire emitter", count=520, speed=0.9, gravity=0.08,
-                     colour=(1.0, 0.24, 0.03), emission=4.0, particle_size=0.075),
+                     colour=(1.0, 0.24, 0.03), emission=4.0, particle_size=0.075,
+                     drag=0.8, growth=0.4, turbulence=0.7),
         "embers": dict(name="Ember emitter", count=300, speed=1.2, gravity=0.12,
-                       colour=(1.0, 0.32, 0.04), emission=5.0, particle_size=0.035),
+                       colour=(1.0, 0.32, 0.04), emission=5.0, particle_size=0.035,
+                       drag=0.3, turbulence=0.6, bounce=0.4),
         "dust": dict(name="Dust emitter", count=500, speed=0.12, gravity=-0.01,
-                     colour=(0.76, 0.66, 0.48), particle_size=0.025),
-        "snow": dict(name="Snow emitter", count=650, speed=-0.38, gravity=-0.22,
-                     colour=(0.92, 0.96, 1.0), particle_size=0.035),
+                     colour=(0.76, 0.66, 0.48), particle_size=0.025, drag=2.0,
+                     growth=0.3, turbulence=0.8),
+        "snow": dict(name="Snow emitter", count=650, speed=0.38, gravity=0.22,
+                     colour=(0.92, 0.96, 1.0), particle_size=0.035,
+                     direction=(0.0, -1.0, 0.0), drag=1.5, turbulence=0.5),
         "clouds": dict(name="Cloud particles", count=260, speed=0.08, gravity=0.0,
-                       colour=(0.9, 0.93, 1.0), particle_size=0.22),
+                       colour=(0.9, 0.93, 1.0), particle_size=0.22, drag=3.0,
+                       growth=1.0, turbulence=0.4, collide=False),
     }
     values = presets.get(kind, presets["smoke"])
+    if kind == "snow":
+        # Snow falls from above the whole scene, not from a spot on the ground
+        # (where it would land on the floor at once and never be seen).
+        return ParticleEmitter(kind="snow", position=(0.0, 1.4, pivot_z), size=(4.5, 0.3, 3.0),
+                               **{**values, "count": 1600, "lifetime": 5.0})
     return ParticleEmitter(kind=kind if kind in presets else "smoke", position=(0.0, -0.8, pivot_z), **values)
+
+
+def plane_preset(kind: str, pivot_z: float = -4.0, ground=None) -> CollisionPlane:
+    """A new plane. A floor starts on the detected ground (same height and
+    tilt) when there is one, so usually it only needs a nudge."""
+    kind = kind.lower()
+    if kind == "ceiling":
+        return CollisionPlane(name="Ceiling", kind="ceiling", position=(0.0, 1.4, pivot_z),
+                              rotation=(math.pi, 0.0, 0.0))
+    if kind == "wall":
+        return CollisionPlane(name="Wall", kind="wall", position=(0.0, 0.0, pivot_z - 1.5),
+                              size=(3.0, 0.02, 2.0), rotation=(math.pi / 2, 0.0, 0.0))
+    plane = CollisionPlane(name="Floor", kind="floor", position=(0.0, -0.8, pivot_z))
+    if ground is not None:
+        n, c = ground
+        nx, ny, nz = (float(v) for v in n)
+        if ny < 0:
+            nx, ny, nz, c = -nx, -ny, -nz, -c
+        if ny > 0.3:
+            y = -(float(c) + nz * pivot_z) / ny
+            a = math.asin(max(-1.0, min(1.0, nz)))
+            b = math.atan2(-nx, ny)
+            plane.position = (0.0, y, pivot_z)
+            plane.rotation = (a, 0.0, b)
+    return plane
 
 
 def normalise_direction(value) -> tuple[float, float, float]:

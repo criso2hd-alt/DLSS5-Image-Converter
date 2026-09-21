@@ -37,3 +37,19 @@ def test_export_reports_when_install_does_not_load(monkeypatch):
     monkeypatch.setattr(bootstrap, "activate_av", lambda: None)
     with pytest.raises(RuntimeError, match="could not be loaded"):
         creative_page._Worker()._ensure_video_support()
+
+
+def test_particle_directions_round_trip():
+    from dlss5_converter.creative_page import (
+        DIRECTIONS, angles_to_direction, direction_name, direction_to_angles)
+
+    assert direction_name((0.0, 1.0, 0.0)) == "Up"
+    assert direction_name((0.0, -1.0, 0.0)) == "Down"
+    assert direction_name((1.0, 0.0, 0.0)) == "Right"
+    assert direction_name((0.0, 0.0, 1.0)) == "Toward camera"
+    for name, (tilt, heading) in DIRECTIONS.items():
+        d = angles_to_direction(tilt, heading)
+        assert direction_name(d) == name
+        t2, h2 = direction_to_angles(d)
+        assert abs(t2 - tilt) < 1e-6
+    assert direction_name(angles_to_direction(30.0, 45.0)) == "Custom"

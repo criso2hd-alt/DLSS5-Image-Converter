@@ -74,3 +74,23 @@ def test_scale_axis_and_uniform(qt_app):
     assert all(a > b for a, b in zip(item.size, before))
     ratio_before = before[0] / before[1]
     assert abs(item.size[0] / item.size[1] - ratio_before) < 1e-6
+
+
+def test_floor_plane_redefines_up_and_collides(qt_app):
+    """A user floor tilts particle 'up' with it; the gizmo can move it."""
+    import math
+    from dlss5_converter.effects3d import plane_preset
+    from dlss5_converter.fx3d import euler_matrix
+
+    floor = plane_preset("floor", -3.5)
+    floor.rotation = (0.0, 0.0, math.radians(20))
+    up = euler_matrix(floor.rotation) @ np.array([0.0, 1.0, 0.0], np.float32)
+    assert np.allclose(up, floor.normal(), atol=1e-5)
+    assert up[0] < -0.3            # tilted: "up" leans with the floor
+
+    vp, _item = _viewport_with_volume(qt_app, 0.55)
+    vp.effects.planes.append(floor)
+    vp.selected_effect_id = floor.id
+    before = floor.position[1]
+    _drag_toward_tip(vp, floor, "y")
+    assert floor.position[1] > before

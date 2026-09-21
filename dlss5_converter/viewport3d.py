@@ -215,7 +215,45 @@ class EditorViewport(QWidget):
     def _effect_items(self):
         if self.effects is None:
             return []
-        return [*self.effects.volumes, *self.effects.emitters]
+        return [*self.effects.volumes, *self.effects.emitters,
+                *getattr(self.effects, "planes", [])]
+
+    def _paint_plane(self, painter: QPainter, vp, item, selected: bool) -> None:
+        """A plane as a grid, plus a permanent gravity arrow on floors."""
+        from .fx3d import euler_matrix
+        rot = euler_matrix(item.rotation)
+        centre = np.asarray(item.position, np.float32)
+        hx, hz = item.size[0] * 0.5, item.size[2] * 0.5
+        u, w = rot @ np.array([1.0, 0.0, 0.0], np.float32), rot @ np.array([0.0, 0.0, 1.0], np.float32)
+        colour = QColor("#9be07a" if item.kind == "floor" else "#e0c07a")
+        colour.setAlpha(230 if selected else 140)
+        painter.setPen(QPen(colour, 2 if selected else 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        steps = 6
+        for i in range(steps + 1):
+            f = -1.0 + 2.0 * i / steps
+            for a, b in ((centre + u * hx * f - w * hz, centre + u * hx * f + w * hz),
+                         (centre - u * hx + w * hz * f, centre + u * hx + w * hz * f)):
+                pa, pb = _project(a, vp, self.size()), _project(b, vp, self.size())
+                if pa is not None and pb is not None:
+                    painter.drawLine(pa, pb)
+        if item.kind == "floor":
+            n = np.asarray(item.normal(), np.float32)
+            top = centre + n * max(hx, hz) * 0.45
+            tip = centre
+            pt, pc = _project(top, vp, self.size()), _project(tip, vp, self.size())
+            if pt is not None and pc is not None:
+                arrow = QColor("#ffd24a")
+                painter.setPen(QPen(arrow, 3))
+                painter.drawLine(pt, pc)
+                dx, dy = pc.x() - pt.x(), pc.y() - pt.y()
+                length = max(math.hypot(dx, dy), 1e-6)
+                ux, uy = dx / length, dy / length
+                for s in (1, -1):
+                    hx2 = pc.x() - ux * 12 + s * uy * 7
+                    hy2 = pc.y() - uy * 12 - s * ux * 7
+                    painter.drawLine(pc, QPoint(int(hx2), int(hy2)))
+                painter.drawText(QPoint(pt.x() + 6, pt.y()), "gravity")
 
     def _paint_effect_widgets(self, painter: QPainter, camera: Camera) -> None:
         vp = camera.view_projection(self.width() / max(self.height(), 1))
@@ -226,6 +264,17 @@ class EditorViewport(QWidget):
             if centre is None:
                 continue
             selected = item.id == self.selected_effect_id
+            if getattr(item, "kind", "") in ("floor", "ceiling", "wall"):
+                self._paint_plane(painter, vp, item, selected)
+                if selected:
+                    previous = self.active_handle
+                    self.active_handle = self._fx_handle
+                    self._painting_effect = True
+                    self._paint_transform_gizmo(
+                        painter, vp, self.size(), np.asarray(item.position, np.float32))
+                    self._painting_effect = False
+                    self.active_handle = previous
+                continue
             colour = QColor("#ff7a42" if item.kind in {"fire", "embers"} else "#75dbff")
             colour.setAlpha(245 if selected else 150)
             painter.setPen(QPen(colour, 3 if selected else 1))

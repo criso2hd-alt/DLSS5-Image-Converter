@@ -143,28 +143,73 @@ struct PU {
     vp: mat4x4<f32>,
     right: vec4<f32>, up: vec4<f32>, position: vec4<f32>, extent: vec4<f32>,
     motion: vec4<f32>,       // x time, y lifetime, z particle size, w speed
-    physics: vec4<f32>,      // x spread, y gravity, z turbulence, w seed
+    physics: vec4<f32>,      // x spread, y gravity (along dir), z turbulence, w seed
     colour: vec4<f32>,       // rgb, w emission
     ambient_kind: vec4<f32>, // rgb ambient, w kind
     view_z: vec4<f32>,       // row 2 of the view matrix
-    style: vec4<f32>,        // x opacity
+    style: vec4<f32>,        // x opacity, y plane count, z bounce, w growth
+    dir: vec4<f32>,          // xyz travel direction, w drag
+    planes: array<vec4<f32>, 4>,   // collision planes n.p + c >= 0 is free space
 };
 @group(0) @binding(0) var<uniform> u: PU;
 @group(0) @binding(1) var scene_depth: texture_2d<f32>;
 fn hash(n:f32)->f32{return fract(sin(n)*43758.5453);}
 struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@location(1) fade:f32,
            @location(2) depth:f32};
+
+// Stateless physics: every particle's position is a closed-form function of
+// its age, so nothing is simulated per frame on the CPU and a frame at any
+// time (scrubbing, export) is exact.
 @vertex fn vs_main(@builtin(vertex_index) vi:u32)->Out{
     let id=f32(vi/6u); let corner=vi%6u;
     var quad=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     let q=quad[corner]; let phase=hash(id*19.19+u.physics.w);
-    let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let seconds=age*u.motion.y;
+    let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let s=age*u.motion.y;
+
+    // Travel axis chosen by the user, and two axes across it for the cone.
+    let dir=normalize(u.dir.xyz + vec3(1e-6, 0.0, 0.0));
+    var helper=vec3(1.0,0.0,0.0);
+    if (abs(dir.x) > 0.9) { helper=vec3(0.0,0.0,1.0); }
+    let side=normalize(cross(dir,helper));
+    let side2=cross(dir,side);
+
     let random=vec3(hash(id*7.1)-.5,hash(id*13.7)-.5,hash(id*31.3)-.5);
-    var p=u.position.xyz+random*u.extent.xyz*u.physics.x;
-    p.y+=u.motion.w*seconds+0.5*u.physics.y*seconds*seconds;
-    let swirl=vec2(sin(seconds*2.1+id),cos(seconds*1.7+id))*u.physics.z*.16;
-    p.x+=swirl.x; p.z+=swirl.y;
-    let size=u.motion.z*(0.35+sin(age*3.14159)*0.9);
+    // Spawn anywhere in the emitter's box, exactly the box drawn in the
+    // editor; spread only fans particles out as they travel.
+    var p=u.position.xyz+random*u.extent.xyz;
+
+    // Launch speed dies away under drag: distance = v (1 - e^-kt) / k. Then
+    // a constant push along the axis (buoyancy, or gravity when negative).
+    let k=max(u.dir.w,1e-3);
+    let launch=u.motion.w*(1.0-exp(-k*s))/k;
+    p+=dir*(launch+0.5*u.physics.y*s*s);
+    // Each particle leaves at its own angle; the plume widens with age,
+    // faster for kinds that grow (smoke spreads as it rises).
+    let cone=(hash(id*3.3)-.5)*side+(hash(id*5.9)-.5)*side2;
+    p+=cone*(abs(launch)*0.6+0.05*s)*u.physics.x*(1.0+u.style.w*age);
+
+    // Turbulence: a swirling field of layered sines through space and time,
+    // stronger as a particle ages, so smoke curls and breaks up instead of
+    // rising in straight lines.
+    let tq=u.physics.z;
+    let f=p*1.7+dir*(s*0.6);
+    let curl=vec3(sin(f.y*2.1+s*1.3+id)+0.5*sin(f.z*3.7+s*0.7),
+                  sin(f.z*1.9+s*1.1)+0.5*sin(f.x*2.9+id*0.3),
+                  sin(f.x*2.3+s*0.9)+0.5*sin(f.y*3.1+id));
+    p+=curl*tq*0.09*(0.25+age);
+
+    // Collisions with the scene's floor, walls and ceiling. A particle that
+    // ends up on the wrong side is put back on the surface (slides along it)
+    // or mirrored off it (bounces), by the bounce amount.
+    let n_planes=i32(u.style.y);
+    for (var i=0; i<4; i=i+1) {
+        if (i >= n_planes) { break; }
+        let pl=u.planes[i];
+        let d=dot(pl.xyz,p)+pl.w;
+        if (d<0.0) { p-=pl.xyz*d*(1.0+u.style.z); }
+    }
+
+    let size=u.motion.z*(0.35+sin(age*3.14159)*0.9)*(1.0+u.style.w*age);
     let centre_depth = -(dot(u.view_z.xyz, p) + u.view_z.w);
     p+=u.right.xyz*q.x*size+u.up.xyz*q.y*size;
     var out:Out; out.position=u.vp*vec4(p,1); out.uv=q; out.fade=sin(age*3.14159);
@@ -256,7 +301,7 @@ class FxPass:
         pool = self._pool[kind]
         while len(pool) <= index:
             pool.append(self.device.create_buffer(
-                size=256, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST))
+                size=512, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST))
         buf = pool[index]
         self.device.queue.write_buffer(buf, 0, values.astype(np.float32).tobytes())
         return self.device.create_bind_group(layout=self._layout, entries=[
@@ -264,7 +309,7 @@ class FxPass:
             {"binding": 1, "resource": depth_view}])
 
     def encode(self, enc, colour_view, depth_view, view: np.ndarray, proj: np.ndarray,
-               camera_pos, effects, time_seconds: float) -> None:
+               camera_pos, effects, time_seconds: float, planes=None) -> None:
         if effects is None or (not effects.volumes and not effects.emitters):
             return
         wgpu = self._wgpu
@@ -301,10 +346,20 @@ class FxPass:
             rp.draw(36, 1, 0, 0)
         rp.set_pipeline(self._particle)
         slot = 0
+        # User planes replace the detected ones: their normal already points
+        # into free space. The first floor also defines "up" for directions.
+        user_planes, floor_rot = [], None
+        for pl in getattr(effects, "planes", []):
+            if not pl.enabled:
+                continue
+            n = np.asarray(pl.normal(), np.float32)
+            user_planes.append((n, -float(n @ np.asarray(pl.position, np.float32))))
+            if floor_rot is None and pl.kind == "floor":
+                floor_rot = euler_matrix(pl.rotation)
         for em in effects.emitters:
             if not em.enabled or em.count <= 0:
                 continue
-            v = np.zeros(56, np.float32)
+            v = np.zeros(80, np.float32)
             v[:16] = np.ascontiguousarray(vp.T).ravel()
             v[16:19] = view[0, :3]
             v[20:23] = view[1, :3]
@@ -318,6 +373,44 @@ class FxPass:
             v[47] = PARTICLE_KINDS.get(em.kind, 0.0)
             v[48:52] = view[2]
             v[52] = float(np.clip(getattr(em, "opacity", 1.0), 0.0, 1.0))
+            v[54] = float(np.clip(getattr(em, "bounce", 0.0), 0.0, 1.0))
+            v[55] = max(0.0, float(getattr(em, "growth", 0.0)))
+            direction = np.asarray(getattr(em, "direction", (0.0, 1.0, 0.0)), np.float32)
+            if floor_rot is not None:
+                direction = floor_rot @ direction     # "up" is the user's floor
+            v[56:59] = direction
+            v[59] = max(0.0, float(getattr(em, "drag", 0.6)))
+            if getattr(em, "collide", True) and user_planes:
+                count = 0
+                for n, c in user_planes[:4]:
+                    v[60 + 4 * count: 63 + 4 * count] = n
+                    v[63 + 4 * count] = c
+                    count += 1
+                v[53] = count
+            elif getattr(em, "collide", True) and planes:
+                # Which side of each plane is free space. A horizontal plane
+                # below the photo's camera is a floor (keep particles above
+                # it) and one above it a ceiling (keep them below), whatever
+                # side the emitter was dropped on; judging floors by the
+                # emitter trapped particles under the ground when a new
+                # emitter spawned slightly low. Walls keep the emitter's side.
+                origin = np.asarray(em.position, np.float32)
+                count = 0
+                for n, c in planes[:4]:
+                    n = np.asarray(n, np.float32)
+                    c = float(c)
+                    if abs(float(n[1])) > 0.85:
+                        if n[1] < 0.0:
+                            n, c = -n, -c                  # normal up
+                        floor = (-c / float(n[1])) < 0.0   # plane height below camera
+                        if not floor:
+                            n, c = -n, -c                  # ceiling: free side down
+                    elif float(n @ origin + c) < 0.0:
+                        n, c = -n, -c
+                    v[60 + 4 * count: 63 + 4 * count] = n
+                    v[63 + 4 * count] = c
+                    count += 1
+                v[53] = count
             rp.set_bind_group(0, self._group("p", slot, v, depth_view))
             slot += 1
             rp.draw(min(int(em.count), MAX_PARTICLES) * 6, 1, 0, 0)
