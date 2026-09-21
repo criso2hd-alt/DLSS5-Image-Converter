@@ -84,20 +84,20 @@ ENCODER_OPTIONS: dict[str, dict[str, str]] = {
 
 
 #: Offered in the UI in this order. H.264 first, because it is the one format
-#: every editor and player ingests; VP9 is last because WebM is a web-delivery
+#: every editor and player ingests; ProRes are the editing masters; VP9 is last because WebM is a web-delivery
 #: format that Premiere, Resolve and Final Cut do not import cleanly.
 CODECS: tuple[Codec, ...] = (
     Codec("h264", "H.264 / MP4", ".mp4", "h264_nvenc", "libx264", "yuv420p",
           "Universal - every editor and player. Hardware-encoded on your GPU."),
     Codec("h265", "H.265 / MP4", ".mp4", "hevc_nvenc", "libx265", "yuv420p",
           "Smaller files, modern editors. Also hardware-encoded."),
-    Codec("vp9", "VP9 / WebM", ".webm", "libvpx-vp9", "libvpx-vp9", "yuv420p",
-          "For web upload. Not for editors - WebM does not import cleanly."),
     Codec("prores", "ProRes 422 HQ / MOV", ".mov", "prores_ks", "prores_ks", "yuv422p10le",
           "Editing master, 10-bit. Large files, encoded on the CPU."),
     Codec("prores4444", "ProRes 4444 / MOV", ".mov", "prores_ks:4444", "prores_ks:4444",
           "yuv444p10le",
           "Highest-quality master, 10-bit full colour. Very large files."),
+    Codec("vp9", "VP9 / WebM", ".webm", "libvpx-vp9", "libvpx-vp9", "yuv420p",
+          "For web upload. Not for editors - WebM does not import cleanly."),
 )
 
 CODECS_BY_KEY = {c.key: c for c in CODECS}
