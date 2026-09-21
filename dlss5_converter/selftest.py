@@ -5,9 +5,14 @@ first conversion: ``bootstrap.is_ready`` uses ``find_spec``, which *locates*
 PyTorch without importing it, so a missing transitive dependency stays invisible
 until something tries to use it.
 
-Output goes to stderr, which a windowed build still writes to a redirect, so:
+The report is written to ``report.txt`` beside the exe, and also to the console
+when there is one:
 
-    DLSS5Converter.exe --selftest 2> report.txt
+    DLSS5Converter.exe --selftest
+
+It used to rely on ``2> report.txt``. That cannot work: the exe is a windowed
+(GUI-subsystem) program, so writing to a redirected stderr fails part-way with
+OSError 22 and the file comes back empty (issue #11).
 """
 
 from __future__ import annotations
@@ -15,8 +20,32 @@ from __future__ import annotations
 import sys
 
 
+_REPORT = None
+
+
+def _report_file():
+    """report.txt beside the exe, opened fresh for each self-test run."""
+    global _REPORT
+    if _REPORT is None:
+        from . import paths
+        try:
+            _REPORT = open(paths.app_dir() / "report.txt", "w", encoding="utf-8")
+        except OSError:
+            _REPORT = False          # read-only folder: console only
+    return _REPORT or None
+
+
 def _line(text: str = "") -> None:
-    print(text, file=sys.stderr, flush=True)
+    report = _report_file()
+    if report is not None:
+        report.write(text + "\n")
+        report.flush()
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except (OSError, ValueError, AttributeError):
+        # No usable console (windowed build, or stderr redirected in a way a
+        # GUI process cannot write to): the file above is the report.
+        pass
 
 
 def run_gpu_check() -> int:
@@ -183,7 +212,7 @@ def run_selftest() -> int:
 
         owned = QApplication.instance() is None
         application = QApplication.instance() or QApplication([])
-        window = MainWindow()
+        window = MainWindow(first_run_setup=False)
         window.prepared = pipeline.Prepared(
             source=np.full((64, 96, 3), 0.5, np.float32),
             inverse_depth=np.zeros((64, 96), np.float32),
@@ -382,6 +411,13 @@ def run_selftest() -> int:
                     )
                 )
             ]
+            from .runtime import LIMITED_ADDON_ADVICE, reshade_log_refused_addons
+            if reshade_log_refused_addons(log):
+                # A conversion "succeeds" with this build, as plain DLAA, so it
+                # has to count as a failure here or the report says PASS.
+                _line("")
+                _line("reshade build    : FAILED - " + LIMITED_ADDON_ADVICE)
+                failures += 1
             if interesting:
                 _line("")
                 _line("what the add-on reported:")
