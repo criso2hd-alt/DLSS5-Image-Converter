@@ -28,7 +28,7 @@ support" and use its `dxgi.dll`.
 the cause on an RTX 5070 — every indicator green, no error, image unchanged.
 Updating it fixed it. `--selftest` prints the version it loaded.
 
-**Second, it may have worked and you cannot see it.** The defaults sit at 1.0
+**It may have worked and you cannot see it.** The defaults sit at 1.0
 of a possible 2.00 — visible on most content, but on a render that is already
 photographic even a real change can be hard to spot side by side.
 
