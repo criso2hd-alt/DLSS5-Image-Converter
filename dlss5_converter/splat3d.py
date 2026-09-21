@@ -29,7 +29,7 @@ struct U {
     view: mat4x4<f32>,
     proj: mat4x4<f32>,
     viewport: vec4<f32>,   // x w, y h, z fx (px), w fy (px)
-    extra: vec4<f32>,      // x 1 = output view distance instead of colour
+    extra: vec4<f32>,      // x view mode (0 colour, 1 depth, 2 points), y near, z far
 };
 struct Splat {
     pos: vec4<f32>,        // xyz, w opacity
@@ -46,6 +46,26 @@ struct VOut {
     @location(0) offset: vec2<f32>,     // pixels from the splat centre, y up
     @location(1) conic: vec3<f32>,
     @location(2) color: vec4<f32>,
+    @location(3) depth: f32,
+};
+
+fn turbo(t: f32) -> vec3<f32> {
+    let x = clamp(t, 0.0, 1.0);
+    let r = 0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234
+            + x * (-152.94239396 + x * 59.28637943))));
+    let g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333
+            + x * (4.27729857 + x * 2.82956604))));
+    let b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771
+            + x * (-89.90310912 + x * 27.34824973))));
+    return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+struct FOut {
+    @location(0) colour: vec4<f32>,
+    // Coverage-weighted view depth, (depth * alpha, 0, 0, alpha), blended like
+    // colour. Dividing r by a gives the visible surface's depth, which is what
+    // the fog raymarch, particle occlusion and the hole finder all read.
+    @location(1) depth: vec4<f32>,
 };
 
 @vertex
@@ -85,7 +105,14 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     }
     let mid = 0.5 * (a + c);
     let lam = mid + sqrt(max(0.1, mid * mid - det));
-    let radius = min(ceil(3.0 * sqrt(lam)), 512.0);
+    var radius = min(ceil(3.0 * sqrt(lam)), 512.0);
+    var conic = vec3<f32>(c, -b, a) / det;
+    if (u.extra.x > 1.5) {
+        // Point cloud: every splat as a fixed dot, so the structure of the
+        // scene (what is real, what was filled) can be read at a glance.
+        radius = 1.5;
+        conic = vec3<f32>(1.2, 0.0, 1.2);
+    }
     var corner = vec2<f32>(-1.0, -1.0);
     if (vi == 1u) { corner = vec2<f32>(1.0, -1.0); }
     if (vi == 2u) { corner = vec2<f32>(-1.0, 1.0); }
@@ -94,23 +121,28 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let clip = u.proj * t;
     o.clip = vec4<f32>(clip.xy + off * 2.0 / u.viewport.xy * clip.w, clip.zw);
     o.offset = off;
-    o.conic = vec3<f32>(c, -b, a) / det;
+    o.conic = conic;
     o.color = vec4<f32>(s.color.rgb, s.pos.w);
-    if (u.extra.x > 0.5) {
-        // Depth pass: blended like colour, so dividing by alpha afterwards gives
-        // the coverage-weighted distance of whatever is visible.
-        o.color = vec4<f32>(tz, 0.0, 0.0, s.pos.w);
+    o.depth = tz;
+    if (u.extra.x > 0.5 && u.extra.x < 1.5) {
+        let near = u.extra.y;
+        let far = u.extra.z;
+        let t = (1.0 / tz - 1.0 / far) / max(1.0 / near - 1.0 / far, 1e-6);
+        o.color = vec4<f32>(turbo(t), s.pos.w);
     }
     return o;
 }
 
 @fragment
-fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+fn fs_main(i: VOut) -> FOut {
     let d = i.offset;
     let power = -0.5 * (i.conic.x * d.x * d.x + i.conic.z * d.y * d.y) - i.conic.y * d.x * d.y;
     let alpha = min(0.99, i.color.a * exp(power));
     if (alpha < 1.0 / 255.0) { discard; }
-    return vec4<f32>(i.color.rgb * alpha, alpha);
+    var o: FOut;
+    o.colour = vec4<f32>(i.color.rgb * alpha, alpha);
+    o.depth = vec4<f32>(i.depth * alpha, 0.0, 0.0, alpha);
+    return o;
 }
 """
 
@@ -425,7 +457,9 @@ def fill_view(scene: SplatScene, renderer: "SplatRenderer", view: np.ndarray,
     many splats were added (0 when this pose showed no holes)."""
     w, h = int(size[0]), int(size[1])
     rgb, alpha, dist = renderer.render_coverage(view, proj, (w, h))
-    hole = alpha < 0.6
+    # 0.85, not 0.5: a pixel only partly covered shows the dark background
+    # through it as a speck, so it counts as a hole to fill.
+    hole = alpha < 0.85
     # Past the photo's own frame edges is a hole too; the far-side depth
     # handles it the same way, which extends the picture as the camera swings.
     hole = cv2.morphologyEx(hole.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
@@ -550,6 +584,45 @@ def fill_along_path(scene: SplatScene, renderer: "SplatRenderer", poses, size,
     return added
 
 
+#: Final pass: un-premultiply, fill low-coverage pixels from a
+#: coverage-weighted 5x5 neighbourhood, composite over the background, write
+#: 8-bit. Doing this on the CPU cost ~80 ms a frame at 720p.
+FINISH_SHADER = """
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> bg: vec4<f32>;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    return vec4(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(src));
+    let c = vec2<i32>(pos.xy);
+    let here = textureLoad(src, c, 0);
+    var rgb = here.rgb / max(here.a, 1e-4);
+    var alpha = here.a;
+    if (here.a < 0.35) {
+        var pre = vec3<f32>(0.0);
+        var cov = 0.0;
+        var wsum = 0.0;
+        for (var dy = -2; dy <= 2; dy++) {
+            for (var dx = -2; dx <= 2; dx++) {
+                let q = clamp(c + vec2<i32>(dx, dy), vec2<i32>(0), dims - 1);
+                let s = textureLoad(src, q, 0);
+                let w = exp(-f32(dx * dx + dy * dy) / 4.5);
+                pre += s.rgb * w;
+                cov += s.a * w;
+                wsum += w;
+            }
+        }
+        if (cov > 1e-4) { rgb = pre / cov; }
+        alpha = max(alpha, clamp(cov / wsum * 1.6, 0.0, 1.0));
+    }
+    let a = clamp(alpha / 0.35, 0.0, 1.0);
+    return vec4<f32>(clamp(rgb * a + bg.rgb * (1.0 - a), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"""
+
+
 # -- renderer ----------------------------------------------------------------
 
 class SplatRenderer:
@@ -576,18 +649,35 @@ class SplatRenderer:
              "buffer": {"type": wgpu.BufferBindingType.read_only_storage}},
             {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX,
              "buffer": {"type": wgpu.BufferBindingType.read_only_storage}}])
+        blend = {"color": {"src_factor": "one", "dst_factor": "one-minus-src-alpha",
+                           "operation": "add"},
+                 "alpha": {"src_factor": "one", "dst_factor": "one-minus-src-alpha",
+                           "operation": "add"}}
         self._pipe = device.create_render_pipeline(
             layout=device.create_pipeline_layout(bind_group_layouts=[self._layout]),
             vertex={"module": self._shader, "entry_point": "vs_main", "buffers": []},
             primitive={"topology": wgpu.PrimitiveTopology.triangle_strip,
                        "cull_mode": wgpu.CullMode.none},
-            fragment={"module": self._shader, "entry_point": "fs_main", "targets": [{
-                "format": "rgba16float",
-                # Premultiplied, back to front.
-                "blend": {"color": {"src_factor": "one", "dst_factor": "one-minus-src-alpha",
-                                    "operation": "add"},
-                          "alpha": {"src_factor": "one", "dst_factor": "one-minus-src-alpha",
-                                    "operation": "add"}}}]})
+            # Premultiplied, back to front, into colour and depth together.
+            fragment={"module": self._shader, "entry_point": "fs_main", "targets": [
+                {"format": "rgba16float", "blend": blend},
+                {"format": "rgba16float", "blend": blend}]})
+        from .fx3d import FxPass
+        self._fx = FxPass(device)
+        fin = device.create_shader_module(code=FINISH_SHADER)
+        self._fin_layout = device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "texture": {"sample_type": wgpu.TextureSampleType.unfilterable_float}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}}])
+        self._fin_pipe = device.create_render_pipeline(
+            layout=device.create_pipeline_layout(bind_group_layouts=[self._fin_layout]),
+            vertex={"module": fin, "entry_point": "vs_main", "buffers": []},
+            primitive={"topology": wgpu.PrimitiveTopology.triangle_list},
+            fragment={"module": fin, "entry_point": "fs_main",
+                      "targets": [{"format": "rgba8unorm"}]})
+        self._fin_uniform = device.create_buffer(
+            size=16, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._targets = None
         self._n = 0
         sort_mod = device.create_shader_module(code=SORT_SHADER)
@@ -656,53 +746,92 @@ class SplatRenderer:
         if self._targets == (w, h):
             return
         wgpu = self._wgpu
-        self._color = self.device.create_texture(
-            size=(w, h, 1), format="rgba16float",
+        usage = (wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC
+                 | wgpu.TextureUsage.TEXTURE_BINDING)
+        self._color = self.device.create_texture(size=(w, h, 1), format="rgba16float", usage=usage)
+        self._depth = self.device.create_texture(size=(w, h, 1), format="rgba16float", usage=usage)
+        self._final = self.device.create_texture(
+            size=(w, h, 1), format="rgba8unorm",
             usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC)
+        self._fin_bind = self.device.create_bind_group(layout=self._fin_layout, entries=[
+            {"binding": 0, "resource": self._color.create_view()},
+            {"binding": 1, "resource": {"buffer": self._fin_uniform}}])
         self._targets = (w, h)
 
-    def render(self, view: np.ndarray, proj: np.ndarray, size,
-               background=(0.02, 0.021, 0.026)) -> np.ndarray:
-        return self.render_rgba(view, proj, size, background, 1.0)[:, :, :3]
+    def _read(self, tex, w: int, h: int) -> np.ndarray:
+        raw = self.device.queue.read_texture(
+            {"texture": tex}, {"bytes_per_row": w * 8, "rows_per_image": h}, (w, h, 1))
+        return np.frombuffer(raw, np.float16).reshape(h, w, 4).astype(np.float32)
 
-    def render_coverage(self, view, proj, size):
-        """(colour, alpha, distance) with a transparent background, for finding
-        the holes a camera pose reveals. Distance is 0 where nothing was drawn."""
-        rgba = self.render_rgba(view, proj, size, (0.0, 0.0, 0.0), 0.0)
-        alpha = rgba[:, :, 3]
-        rgb = rgba[:, :, :3] / np.maximum(alpha, 1e-4)[..., None]
-        dist = self.render_rgba(view, proj, size, (0.0, 0.0, 0.0), 0.0, depth=True)[:, :, 0]
-        dist = np.where(alpha > 1e-3, dist / np.maximum(alpha, 1e-4), 0.0)
-        return np.clip(rgb, 0, 1), alpha, dist.astype(np.float32)
-
-    def render_rgba(self, view, proj, size, background, bg_alpha: float,
-                    depth: bool = False) -> np.ndarray:
+    def _draw(self, view, proj, size, mode: int = 0, effects=None, time_seconds: float = 0.0,
+              depth_range=(NEAR, FAR)) -> None:
         wgpu = self._wgpu
         w, h = int(size[0]), int(size[1])
         self._ensure_targets(w, h)
         u = np.zeros(44, np.float32)
-        u[36] = 1.0 if depth else 0.0
         u[0:16] = np.ascontiguousarray(view.T, np.float32).ravel()
         u[16:32] = np.ascontiguousarray(proj.T, np.float32).ravel()
         u[32:36] = (w, h, proj[0, 0] * w * 0.5, proj[1, 1] * h * 0.5)
+        u[36:39] = (mode, depth_range[0], depth_range[1])
         self.device.queue.write_buffer(self._uniform, 0, u.tobytes())
         enc = self.device.create_command_encoder()
         self._encode_sort(enc, view)
-        rp = enc.begin_render_pass(color_attachments=[{
-            "view": self._color.create_view(), "clear_value": (*background, bg_alpha),
-            "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store}])
+        colour_view = self._color.create_view()
+        rp = enc.begin_render_pass(color_attachments=[
+            {"view": colour_view, "clear_value": (0.0, 0.0, 0.0, 0.0),
+             "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store},
+            {"view": self._depth.create_view(), "clear_value": (0.0, 0.0, 0.0, 0.0),
+             "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store}])
         rp.set_pipeline(self._pipe)
         rp.set_bind_group(0, self._bind)
         rp.draw(4, self._n, 0, 0)
         rp.end()
+        if effects is not None and mode == 0:
+            cam = -view[:3, :3].T @ view[:3, 3]
+            self._fx.encode(enc, colour_view, self._depth.create_view(), view, proj,
+                            cam, effects, time_seconds)
+        self.device.queue.submit([enc.finish()])
+
+    def render(self, view: np.ndarray, proj: np.ndarray, size,
+               background=(0.02, 0.021, 0.026), effects=None, time_seconds: float = 0.0,
+               mode: int = 0) -> np.ndarray:
+        """Final frame, RGB float 0..1."""
+        return self.render_u8(view, proj, size, background, effects, time_seconds,
+                              mode).astype(np.float32) / 255.0
+
+    def render_u8(self, view: np.ndarray, proj: np.ndarray, size,
+                  background=(0.02, 0.021, 0.026), effects=None, time_seconds: float = 0.0,
+                  mode: int = 0) -> np.ndarray:
+        """Final frame as uint8 RGB, finished on the GPU (see FINISH_SHADER)."""
+        wgpu = self._wgpu
+        w, h = int(size[0]), int(size[1])
+        self._draw(view, proj, (w, h), mode, effects, time_seconds)
+        self.device.queue.write_buffer(
+            self._fin_uniform, 0, np.array([*background, 0.0], np.float32).tobytes())
+        enc = self.device.create_command_encoder()
+        rp = enc.begin_render_pass(color_attachments=[{
+            "view": self._final.create_view(), "clear_value": (0, 0, 0, 1),
+            "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store}])
+        rp.set_pipeline(self._fin_pipe)
+        rp.set_bind_group(0, self._fin_bind)
+        rp.draw(3, 1, 0, 0)
+        rp.end()
         self.device.queue.submit([enc.finish()])
         raw = self.device.queue.read_texture(
-            {"texture": self._color}, {"bytes_per_row": w * 8, "rows_per_image": h},
-            (w, h, 1))
-        frame = np.frombuffer(raw, np.float16).reshape(h, w, 4).astype(np.float32)
-        if depth:
-            return frame
-        return np.clip(frame, 0.0, 1.0)
+            {"texture": self._final}, {"bytes_per_row": w * 4, "rows_per_image": h}, (w, h, 1))
+        return np.ascontiguousarray(np.frombuffer(raw, np.uint8).reshape(h, w, 4)[:, :, :3])
+
+    def render_coverage(self, view, proj, size):
+        """(colour, alpha, distance) with a transparent background, for finding
+        the holes a camera pose reveals. Distance is 0 where nothing was drawn."""
+        w, h = int(size[0]), int(size[1])
+        self._draw(view, proj, (w, h))
+        rgba = np.clip(self._read(self._color, w, h), 0.0, 1.0)
+        alpha = rgba[:, :, 3]
+        rgb = rgba[:, :, :3] / np.maximum(alpha, 1e-4)[..., None]
+        d = self._read(self._depth, w, h)
+        dist = np.where(d[:, :, 3] > 1e-3, d[:, :, 0] / np.maximum(d[:, :, 3], 1e-4), 0.0)
+        return np.clip(rgb, 0, 1), alpha, dist.astype(np.float32)
 
 
 def is_available() -> bool:
