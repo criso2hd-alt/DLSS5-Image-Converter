@@ -45,6 +45,10 @@ from .widgets import Spinner
 SCENE_LONG = 2560
 #: Long side of the renders used to find and fill holes along the camera move.
 BAKE_LONG = 1280
+#: Long side SHARP scenes are built for. SHARP always sees a 1536 square; this
+#: only sets the photo-camera depth map the fill works against.
+SHARP_LONG = 1600
+SOURCES = {"Standard": "standard", "High quality (SHARP)": "sharp"}
 PIVOT_Z = -(splat3d.NEAR + splat3d.FAR) * 0.5
 PRESETS = ["Orbit", "Drift", "Push in", "Pull out", "Vertigo", "Static"]
 RESOLUTIONS = {
@@ -111,6 +115,7 @@ class _Worker(QObject):
     bake_done = Signal(object, int)         # SplatScene, generation
     export_done = Signal(str)
     lama_ready = Signal(bool, str)
+    sharp_ready = Signal(bool, str)
     failed = Signal(str)
 
     def __init__(self) -> None:
@@ -123,8 +128,20 @@ class _Worker(QObject):
             self._renderer = splat3d.SplatRenderer()
         return self._renderer
 
-    def build(self, rgb8: np.ndarray, depth: np.ndarray, contrast: float, gen: int) -> None:
+    def build(self, rgb8: np.ndarray, depth: np.ndarray, contrast: float, gen: int,
+              mode: str = "standard") -> None:
         try:
+            if mode == "sharp":
+                from . import sharp3d
+                self.progress.emit("Building the scene with SHARP… (about 20 s)")
+                h, w = rgb8.shape[:2]
+                s = min(1.0, SHARP_LONG / max(h, w))
+                if s < 1.0:
+                    rgb8 = cv2.resize(rgb8, (int(w * s) // 2 * 2, int(h * s) // 2 * 2),
+                                      interpolation=cv2.INTER_AREA)
+                scene = sharp3d.build_scene(rgb8, self._get_renderer(), contrast)
+                self.scene_ready.emit(scene, gen)
+                return
             self.progress.emit("Building the splat scene…")
             h, w = rgb8.shape[:2]
             s = min(1.0, SCENE_LONG / max(h, w))
@@ -152,6 +169,14 @@ class _Worker(QObject):
             self.bake_done.emit(scene, gen)
         except Exception as error:  # noqa: BLE001
             self.failed.emit(f"Background fill failed: {error}")
+
+    def download_sharp(self) -> None:
+        try:
+            from . import sharp3d
+            sharp3d.download(progress=lambda m: self.progress.emit(m))
+            self.sharp_ready.emit(True, "")
+        except Exception as error:  # noqa: BLE001
+            self.sharp_ready.emit(False, str(error))
 
     def download_lama(self) -> None:
         try:
@@ -195,7 +220,8 @@ class _Worker(QObject):
 class CreativePage(QWidget):
     """3D tab widget. Inherits the processed image from the main window."""
 
-    _request_build = Signal(object, object, float, int)
+    _request_build = Signal(object, object, float, int, str)
+    _request_sharp = Signal()
     _request_bake = Signal(object, object, object, int)
     _request_export = Signal(object, object)
     _request_lama = Signal()
@@ -228,6 +254,8 @@ class CreativePage(QWidget):
         self._request_bake.connect(self._worker.bake)
         self._request_export.connect(self._worker.export)
         self._request_lama.connect(self._worker.download_lama)
+        self._request_sharp.connect(self._worker.download_sharp)
+        self._worker.sharp_ready.connect(self._on_sharp)
         self._worker.scene_ready.connect(self._on_scene)
         self._worker.bake_done.connect(self._on_baked)
         self._worker.export_done.connect(self._on_exported)
@@ -383,6 +411,21 @@ class CreativePage(QWidget):
         self._controls: list[QWidget] = []
 
         card, c = self._card("Scene")
+        c.addWidget(QLabel("Scene quality"))
+        self.source_box = QComboBox()
+        self.source_box.addItems(list(SOURCES))
+        self.source_box.setToolTip(
+            "Standard: built from this app's depth map, no download.\n"
+            "High quality: Apple's SHARP model predicts the 3D scene itself. Much "
+            "cleaner around people and objects and more solid from other angles; a "
+            "little softer in fine texture. One-time download, about 20 s per image.")
+        self.source_box.currentTextChanged.connect(self._source_changed)
+        c.addWidget(self.source_box)
+        from . import sharp3d
+        self.sharp_button = QPushButton(f"Download SHARP for High quality ({sharp3d.SIZE_LABEL})")
+        self.sharp_button.setToolTip("Apple's SHARP model (research licence). Downloaded once.")
+        self.sharp_button.clicked.connect(self._download_sharp)
+        c.addWidget(self.sharp_button)
         c.addWidget(QLabel("Depth strength"))
         self.contrast = QSlider(Qt.Orientation.Horizontal)
         self.contrast.setRange(40, 250)
@@ -405,7 +448,7 @@ class CreativePage(QWidget):
         self.bake_note.setWordWrap(True)
         self.bake_note.setStyleSheet("color: #8a93a6;")
         c.addWidget(self.bake_note)
-        self._controls += [self.contrast, self.bake_button]
+        self._controls += [self.contrast, self.bake_button, self.source_box]
         col.addWidget(card)
 
         card, c = self._card("Atmosphere")
@@ -535,7 +578,15 @@ class CreativePage(QWidget):
             return
         self._gen += 1
         self._set_enabled(False)
-        self._request_build.emit(self._rgb8, self._depth, self.contrast.value() / 100.0, self._gen)
+        mode = SOURCES.get(self.source_box.currentText(), "standard")
+        from . import sharp3d
+        if mode == "sharp" and not sharp3d.is_downloaded():
+            mode = "standard"
+            self.source_box.blockSignals(True)
+            self.source_box.setCurrentIndex(0)
+            self.source_box.blockSignals(False)
+        self._request_build.emit(self._rgb8, self._depth, self.contrast.value() / 100.0,
+                                 self._gen, mode)
 
     def _ensure_renderer(self) -> bool:
         if self._renderer is None and not self._renderer_error:
@@ -565,8 +616,10 @@ class CreativePage(QWidget):
 
     def _update_bake_note(self) -> None:
         from . import inpaint
+        from . import sharp3d
         has_lama = inpaint.is_downloaded()
         self.lama_button.setVisible(not has_lama)
+        self.sharp_button.setVisible(not sharp3d.is_downloaded())
         if self._baked:
             self.bake_note.setText("Background filled for the current move.")
         else:
@@ -615,6 +668,37 @@ class CreativePage(QWidget):
         self._update_bake_note()
         self.viewport.invalidate()
         self._request_redraw()
+
+    def _source_changed(self, text: str) -> None:
+        from . import sharp3d
+        if SOURCES.get(text) == "sharp" and not sharp3d.is_downloaded():
+            answer = QMessageBox.question(
+                self, "Download SHARP",
+                f"High quality uses Apple's SHARP model, a one-time {sharp3d.SIZE_LABEL} "
+                "download (research licence). Download it now?")
+            if answer == QMessageBox.StandardButton.Yes:
+                self._download_sharp()
+            else:
+                self.source_box.blockSignals(True)
+                self.source_box.setCurrentIndex(0)
+                self.source_box.blockSignals(False)
+            return
+        self._baked = False
+        self._start_build()
+
+    def _download_sharp(self) -> None:
+        self.sharp_button.setEnabled(False)
+        self._request_sharp.emit()
+
+    def _on_sharp(self, ok: bool, message: str) -> None:
+        self.sharp_button.setEnabled(True)
+        self._set_status("" if ok else f"SHARP download failed: {message}")
+        self._update_bake_note()
+        if ok:
+            self.source_box.blockSignals(True)
+            self.source_box.setCurrentText("High quality (SHARP)")
+            self.source_box.blockSignals(False)
+            self._start_build()
 
     def _download_lama(self) -> None:
         self.lama_button.setEnabled(False)
