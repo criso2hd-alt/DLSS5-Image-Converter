@@ -800,7 +800,7 @@ class RuntimeProbeWorker(QObject):
             if self._status is not None:
                 runtime.stage_runtime(self._status)
                 if self._neural is not None:
-                    runtime.write_addon_config(self._harness.parent, self._neural)
+                    runtime.write_config(self._harness.parent, self._neural)
             report = evaluator.probe(self._harness)
         except Exception as error:  # noqa: BLE001 - reported in the setup dialog
             self.finished.emit(False, str(error))
@@ -2787,6 +2787,7 @@ class MainWindow(QMainWindow):
 
         self.settings = AppSettings.load(paths.settings_path())
         gpus.set_preference(self.settings.gpu)
+        runtime.set_backend(self.settings.backend)
         gpus.note_harness_adapter(f"adapter: {self.settings.dlss_adapter}")
         # One engine for the window's lifetime. Reloading Depth Anything per
         # image would add several seconds and a gigabyte of churn to every run.
@@ -4320,6 +4321,43 @@ class MainWindow(QMainWindow):
 
         # -- DLSS runtime (the setup that used to be loose buttons) --
         runtime_grp = ModuleCard("DLSS runtime")
+        # Which injector runs the neural pass. Both drive the same
+        # nvngx_dlssnr.dll; OptiScaler is the alternative for setups where the
+        # RenoDX add-on does not attach, and it adds multi-pass.
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Neural backend"))
+        self.backend_box = QComboBox()
+        for key in runtime.BACKENDS:
+            self.backend_box.addItem(runtime.BACKEND_LABELS[key], key)
+        found = self.backend_box.findData(self.settings.backend)
+        self.backend_box.setCurrentIndex(found if found >= 0 else 0)
+        self.backend_box.setToolTip(
+            "RenoDX: the ReShade add-on (dxgi.dll + renodx-dlss5.addon64 in dlss_files).\n\n"
+            "OptiScaler: the OptiScaler Neural Rendering release, extracted into "
+            "dlss_files\\optiscaler. Try it if the RenoDX add-on does not attach. "
+            "Both use your nvngx_dlssnr.dll and nvngx_dlss.dll.")
+        self.backend_box.currentIndexChanged.connect(self._backend_changed)
+        backend_row.addStretch(1)
+        backend_row.addWidget(self.backend_box, 1)
+        runtime_grp.add_layout(backend_row)
+
+        passes_row = QHBoxLayout()
+        self.passes_label = QLabel("Neural passes")
+        passes_row.addWidget(self.passes_label)
+        self.passes_box = SegmentedControl(
+            [("1", 1), ("2", 2), ("3", 3)],
+            current=min(2, max(0, int(self.settings.neural.passes) - 1)))
+        self.passes_box.setToolTip(
+            "OptiScaler only. How many times the model runs over the frame. 1 is normal; "
+            "2 and 3 are deliberately stronger and take 2x and 3x as long.")
+        self.passes_box.changed.connect(self._passes_changed)
+        passes_row.addStretch(1)
+        passes_row.addWidget(self.passes_box, 1)
+        self.passes_row_widget = QWidget()
+        self.passes_row_widget.setLayout(passes_row)
+        runtime_grp.add(self.passes_row_widget)
+        self.passes_row_widget.setVisible(self.settings.backend == "optiscaler")
+
         self.settings_runtime_status = QLabel("")
         self.settings_runtime_status.setObjectName("hint")
         self.settings_runtime_status.setWordWrap(True)
@@ -4406,6 +4444,21 @@ class MainWindow(QMainWindow):
         outer.addWidget(scroller)
         self._refresh_settings_runtime()
         return page
+
+    def _backend_changed(self, _index: int) -> None:
+        name = self.backend_box.currentData() or "renodx"
+        self.settings.backend = name
+        self.settings.save(paths.settings_path())
+        runtime.set_backend(name)
+        self.passes_row_widget.setVisible(name == "optiscaler")
+        self._refresh_settings_runtime()
+        self.refresh_runtime_status()
+        self.statusBar().showMessage(
+            f"Neural backend: {runtime.BACKEND_LABELS[name]}. Use Check runtime to test it.")
+
+    def _passes_changed(self, value) -> None:
+        self.settings.neural.passes = int(value)
+        self.settings.save(paths.settings_path())
 
     def _refresh_settings_runtime(self) -> None:
         """Fill the Settings runtime line with a plain ready / not-ready verdict."""

@@ -50,6 +50,10 @@ LUTS_DIR = "luts"
 #: pull ReShade into the GUI as well as into the harness that actually wants it.
 ENGINE_DIR = "engine"
 
+#: Where the user extracts the OptiScaler Neural Rendering release, inside
+#: dlss_files. Optional: only needed for the OptiScaler backend.
+OPTISCALER_DIR = "optiscaler"
+
 
 def app_dir() -> Path:
     """Folder containing the executable (frozen) or the project root (source)."""
@@ -195,6 +199,21 @@ def native_exe() -> Path:
     if is_frozen():
         return app_dir() / ENGINE_DIR / "dlss5_eval.exe"
     return app_dir() / "native" / "bin" / "dlss5_eval.exe"
+
+
+def optiscaler_dir() -> Path:
+    """Where the user puts the OptiScaler release (see OPTISCALER_DIR)."""
+    return dlss_files_dir() / OPTISCALER_DIR
+
+
+def optiscaler_engine_dir() -> Path:
+    """The OptiScaler backend's own harness folder, beside the RenoDX one.
+
+    A separate folder rather than swapping DLLs in the RenoDX one: both load
+    as dxgi.dll, so each backend keeps a complete set and switching is only a
+    matter of which folder the harness runs from."""
+    return native_exe().parent.parent / (
+        "engine_optiscaler" if is_frozen() else "bin_optiscaler")
 
 
 # --- Locating the user's NVIDIA runtime -------------------------------------

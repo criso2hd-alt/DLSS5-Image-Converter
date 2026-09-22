@@ -108,6 +108,9 @@ class NeuralSettings:
     color_strength: float = 1.0
     #: Strength of the HDR transfer curve the pass works through.
     transfer_strength: float = 1.0
+    #: Sequential model passes, 1-3. OptiScaler backend only (RenoDX runs
+    #: one); 2 and 3 are deliberately stronger and cost 2x and 3x.
+    passes: int = 1
     #: Scene paper-white, the anchor the model treats as diffuse white. Games in
     #: the wild ship 16 here; the add-on's own default is 1. On an HDR/OLED
     #: display this is the control that decides how bright "white" is assumed to
@@ -328,6 +331,8 @@ class AppSettings:
     #: The GPU for the app's own GPU work (3D, depth, SHARP, fill, upscale) by
     #: adapter name. Empty follows the card DLSS runs on. See gpus.py.
     gpu: str = ""
+    #: Which neural backend runs the pass: "renodx" or "optiscaler".
+    backend: str = "renodx"
     #: The adapter the last runtime check said DLSS runs on, remembered so the
     #: automatic choice is right from launch, before this session's check ends.
     dlss_adapter: str = ""
@@ -380,6 +385,7 @@ class AppSettings:
             # install, so migrate it as already introduced.
             onboarding_version=onboarding_version,
             gpu=str(raw.get("gpu") or ""),
+            backend=str(raw.get("backend") or "renodx"),
             dlss_adapter=str(raw.get("dlss_adapter") or ""),
         )
 

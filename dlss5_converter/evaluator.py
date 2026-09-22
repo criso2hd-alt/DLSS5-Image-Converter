@@ -538,9 +538,21 @@ def interpret_probe(report: str) -> list[str]:
         return [startup_crash_advice()]
 
     problems: list[str] = []
+    from . import runtime
+    optiscaler = runtime.backend() == "optiscaler"
+    if optiscaler and is_on("dlssnr_module_loaded") is False:
+        problems.append(
+            "OptiScaler did not start the neural renderer (dlssnr_module_loaded: 0). "
+            "Check that the whole OptiScaler release is in dlss_files\\optiscaler "
+            f"(including {runtime.OPTISCALER_FORWARDER}) and that nvngx_dlssnr.dll suits "
+            "the card: RTX 50 uses NVIDIA's original 310.8, RTX 20/30/40 the "
+            "cross-generation build. OptiScaler.log in the engine_optiscaler folder "
+            "says why.")
     # Dependency order: report only the first broken link, since a break at the
     # base makes everything above it 0 as a matter of course.
-    if is_on("reshade_proxy_loaded") is False:
+    if optiscaler:
+        pass                            # ReShade and the add-on are not used
+    elif is_on("reshade_proxy_loaded") is False:
         problems.append(
             "ReShade did not load (reshade_proxy_loaded: 0) - and everything "
             "else needs it. Make sure dlss_files\\dxgi.dll is a real 64-bit "
