@@ -606,6 +606,9 @@ class FxPanel(QWidget):
         item = self.base_item()
         self.props_card.setVisible(item is not None)
         if item is None:
+            # The scene-wide card still shows current values with nothing
+            # selected (it used to wait for a selection, and started stale).
+            self._sync_env()
             return
         kind = kind_of(item)
         self.props_card.title_label.setText(item.name.upper())
