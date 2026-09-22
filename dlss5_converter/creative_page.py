@@ -118,7 +118,7 @@ def shot_matrices(key, size, source_aspect: float) -> tuple[np.ndarray, np.ndarr
         cam.fov_degrees = math.degrees(2.0 * math.atan(half))
     return camera_matrices(cam, size)
 VOLUME_TYPES = ["Fog", "Smoke", "Fire", "Cloud", "Godrays"]
-PARTICLE_TYPES = ["Embers", "Dust", "Snow", "Smoke", "Fire", "Clouds"]
+PARTICLE_TYPES = ["Embers", "Dust", "Snow", "Rain", "Smoke", "Fire", "Clouds"]
 BACKGROUND = (0.02, 0.021, 0.026)
 
 

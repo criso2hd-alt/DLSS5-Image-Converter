@@ -58,7 +58,7 @@ class VolumeEffect:
 @dataclass(slots=True)
 class ParticleEmitter:
     name: str = "Smoke emitter"
-    kind: str = "smoke"  # smoke, fire, embers, dust, snow, clouds
+    kind: str = "smoke"  # smoke, fire, embers, dust, snow, clouds, rain
     id: str = field(default_factory=_id)
     enabled: bool = True
     position: tuple[float, float, float] = (0.0, -1.0, -4.0)
@@ -506,6 +506,12 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
         "snow": dict(name="Snow emitter", count=650, speed=0.38, gravity=0.22,
                      colour=(0.92, 0.96, 1.0), particle_size=0.035,
                      direction=(0.0, -1.0, 0.0), drag=1.5, turbulence=0.5),
+        # Rain: fast, thin, barely any drag or swirl; the shader draws the
+        # drops as streaks and the ones that reach the floor as splashes.
+        "rain": dict(name="Rain emitter", count=2600, speed=5.5, gravity=4.0,
+                     colour=(0.72, 0.78, 0.86), particle_size=0.006, spread=0.04,
+                     direction=(0.0, -1.0, 0.0), drag=0.05, turbulence=0.04,
+                     opacity=0.7, lifetime=1.4),
         "clouds": dict(name="Cloud particles", count=260, speed=0.08, gravity=0.0,
                        colour=(0.9, 0.93, 1.0), particle_size=0.22, drag=3.0,
                        growth=1.0, turbulence=0.4, collide=False),
@@ -516,6 +522,9 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
         # (where it would land on the floor at once and never be seen).
         return ParticleEmitter(kind="snow", position=(0.0, 1.4, pivot_z), size=(4.5, 0.3, 3.0),
                                **{**values, "count": 1600, "lifetime": 5.0})
+    if kind == "rain":
+        return ParticleEmitter(kind="rain", position=(0.0, 1.8, pivot_z), size=(5.0, 0.3, 4.0),
+                               **values)
     return ParticleEmitter(kind=kind if kind in presets else "smoke", position=(0.0, -0.8, pivot_z), **values)
 
 

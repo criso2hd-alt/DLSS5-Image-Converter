@@ -25,7 +25,8 @@ import math
 import numpy as np
 
 VOLUME_KINDS = {"fog": 0.0, "smoke": 1.0, "fire": 2.0, "cloud": 3.0, "godrays": 4.0}
-PARTICLE_KINDS = {"smoke": 0.0, "fire": 1.0, "embers": 2.0, "dust": 3.0, "snow": 4.0, "clouds": 5.0}
+PARTICLE_KINDS = {"smoke": 0.0, "fire": 1.0, "embers": 2.0, "dust": 3.0, "snow": 4.0, "clouds": 5.0,
+                  "rain": 6.0}
 MAX_PARTICLES = 20000
 
 VOLUME_SHADER = """
@@ -163,6 +164,7 @@ const EMBERS: i32 = 2;
 const DUST: i32 = 3;
 const SNOW: i32 = 4;
 const CLOUDS: i32 = 5;
+const RAIN: i32 = 6;
 // Embers glow until COOL_START of their life and are fully ash by ASH_AT.
 const COOL_START: f32 = 0.18;
 const ASH_AT: f32 = 0.62;
@@ -194,7 +196,8 @@ fn axes()->Axes{
 // its age, so nothing is simulated per frame on the CPU and a frame at any
 // time (scrubbing, export) is exact. A function rather than inline code so
 // the vertex stage can evaluate it twice and get a velocity for streaks.
-fn position_at(id:f32, s:f32)->vec3<f32>{
+// w is 1 when a collision plane stopped the particle (rain splashes).
+fn position_at(id:f32, s:f32)->vec4<f32>{
     let ax=axes();
     let age=clamp(s/max(u.motion.y,0.01),0.0,1.0);
     let random=vec3(hash(id*7.1)-.5,hash(id*13.7)-.5,hash(id*31.3)-.5);
@@ -236,25 +239,30 @@ fn position_at(id:f32, s:f32)->vec3<f32>{
     // ends up on the wrong side is put back on the surface (slides along it)
     // or mirrored off it (bounces), by the bounce amount.
     let n_planes=i32(u.style.y);
+    var hit=0.0;
     for (var i=0; i<4; i=i+1) {
         if (i >= n_planes) { break; }
         let pl=u.planes[i];
         let d=dot(pl.xyz,p)+pl.w;
-        if (d<0.0) { p-=pl.xyz*d*(1.0+u.style.z); }
+        if (d<0.0) { p-=pl.xyz*d*(1.0+u.style.z); hit=1.0; }
     }
-    return p;
+    return vec4(p,hit);
 }
 
 struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
-           @location(1) age:f32, @location(2) depth:f32, @location(3) rnd:f32};
+           @location(1) age:f32, @location(2) depth:f32, @location(3) rnd:f32,
+           @location(4) hit:f32};
 
 @vertex fn vs_main(@builtin(vertex_index) vi:u32)->Out{
     let id=f32(vi/6u); let corner=vi%6u;
     var quad=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     let q=quad[corner]; let phase=hash(id*19.19+u.physics.w);
     let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let s=age*u.motion.y;
-    let p=position_at(id,s);
+    let at=position_at(id,s);
+    let p=at.xyz;
     let kd=kind();
+    // A raindrop that has reached the floor becomes a splash lying on it.
+    let splash=kd==RAIN && at.w>0.5;
 
     var size=u.motion.z*(0.35+sin(age*3.14159)*0.9)*(1.0+u.style.w*age);
     if (kd==EMBERS) {
@@ -264,15 +272,18 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
         size=u.motion.z*mix(1.0-0.35*age,1.35,ash);
     } else if (kd==SNOW || kd==DUST) {
         size=u.motion.z*(0.8+0.4*hash(id*2.7));
+    } else if (kd==RAIN) {
+        size=u.motion.z*(0.8+0.4*hash(id*2.7));
+        if (splash) { size=u.motion.z*14.0; }
     }
 
     // Motion streak: stretch the sprite along its on-screen velocity, the
     // way a camera shutter smears anything fast and bright. Only glowing
     // embers and fire; ash and smoke are too slow to smear.
     var along=vec2(1.0,0.0); var stretch=1.0;
-    if (kd==EMBERS || kd==FIRE) {
+    if ((kd==EMBERS || kd==FIRE || kd==RAIN) && !splash) {
         let dt=1.0/30.0;
-        let v=(p-position_at(id,max(s-dt,0.0)))/dt;
+        let v=(p-position_at(id,max(s-dt,0.0)).xyz)/dt;
         let sv=vec2(dot(v,u.right.xyz),dot(v,u.up.xyz));
         let speed=length(sv);
         let hot=1.0-smoothstep(COOL_START,ASH_AT*0.8,age);
@@ -281,17 +292,28 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
             // Flames are tall whatever their speed: a tongue licking along
             // the direction the fire rises. q.x runs along it, tip at +x.
             stretch=1.9;
+        } else if (kd==RAIN) {
+            // Rain is only ever seen as streaks: a drop falls several of its
+            // own lengths during one exposure.
+            stretch=1.0+min(speed*(1.0/40.0)/max(size,1e-4),40.0);
         } else {
             stretch=1.0+min(speed*(1.0/48.0)/max(size,1e-4),6.0)*hot;
         }
     }
     let across=vec2(-along.y,along.x);
-    let o=along*q.x*size*stretch+across*q.y*size;
+    var o=along*q.x*size*stretch+across*q.y*size;
+    // A splash lies on the floor, so seen from a normal eye height its
+    // ring is a flat ellipse rather than a circle facing the camera.
+    if (splash) { o.y*=0.3; }
 
     let centre_depth = -(dot(u.view_z.xyz, p) + u.view_z.w);
     var out:Out;
     out.position=u.vp*vec4(p+u.right.xyz*o.x+u.up.xyz*o.y,1.0);
     out.uv=q; out.age=age; out.depth=centre_depth; out.rnd=hash(id*1.37+u.physics.w);
+    out.hit=select(0.0,1.0,splash);
+    // A splash sits exactly on the surface, so half its ring would fail the
+    // depth test against that same surface. Judge it as slightly nearer.
+    if (splash) { out.depth=centre_depth-0.12; }
     return out;
 }
 
@@ -364,6 +386,25 @@ fn puff_light(uv:vec2<f32>, r:f32)->f32{
         let smoke_c=vec3(0.12,0.11,0.1)*lit;
         let cover=mix(flame*0.75,flame*0.3,smoke)*life*occl;
         return shade(mix(c,smoke_c,smoke),cover,1.0-smoke);
+    }
+    if (kd==RAIN) {
+        if (in.hit>0.5) {
+            // Splash: a thin ring spreading out and fading, restarting now
+            // and then so a wet floor keeps rippling while rain lands on it.
+            // Only some landed drops ripple at a time, or the floor turns
+            // into a pattern of rings.
+            if (in.rnd>0.45) { discard; }
+            let ring_t=fract(t*1.3+in.rnd*7.0);
+            let ring=1.0-smoothstep(0.0,0.1,abs(r-ring_t));
+            let flat_ring=ring*(1.0-ring_t)*(1.0-ring_t)*0.8;
+            return shade(u.colour.rgb*(lit+vec3(0.3)),flat_ring*occl,0.2);
+        }
+        // A streak: thin across, fading at both ends, with a faint sheen
+        // where it catches light.
+        let across=1.0-smoothstep(0.15,1.0,abs(in.uv.y));
+        let ends=1.0-smoothstep(0.4,1.0,abs(in.uv.x));
+        let c=u.colour.rgb*(lit+vec3(0.35+u.colour.w));
+        return shade(c,across*ends*0.45*life*occl,0.25);
     }
     if (kd==SNOW) {
         let flake=1.0-smoothstep(0.45,0.7,r);
