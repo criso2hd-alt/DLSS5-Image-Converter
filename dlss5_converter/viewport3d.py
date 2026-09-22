@@ -215,8 +215,7 @@ class EditorViewport(QWidget):
     def _effect_items(self):
         if self.effects is None:
             return []
-        return [*self.effects.volumes, *self.effects.emitters,
-                *getattr(self.effects, "planes", [])]
+        return self.effects.items()
 
     def _paint_plane(self, painter: QPainter, vp, item, selected: bool) -> None:
         """A plane as a grid, plus a permanent gravity arrow on floors."""
@@ -275,7 +274,16 @@ class EditorViewport(QWidget):
                     self._painting_effect = False
                     self.active_handle = previous
                 continue
-            colour = QColor("#ff7a42" if item.kind in {"fire", "embers"} else "#75dbff")
+            if item.kind == "lightning":
+                # Where the bolt comes from: a line up to its start height.
+                top = _project(np.asarray(item.position, np.float32)
+                               + np.array([0.0, item.height, 0.0], np.float32), vp, self.size())
+                if top is not None:
+                    pen = QPen(QColor(255, 236, 120, 200 if selected else 110), 1, Qt.PenStyle.DashLine)
+                    painter.setPen(pen)
+                    painter.drawLine(centre, top)
+            colour = QColor("#ff7a42" if item.kind in {"fire", "embers"}
+                            else "#ffe066" if item.kind == "lightning" else "#75dbff")
             colour.setAlpha(245 if selected else 150)
             painter.setPen(QPen(colour, 3 if selected else 1))
             painter.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 34))

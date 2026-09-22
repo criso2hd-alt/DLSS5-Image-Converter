@@ -898,7 +898,12 @@ FINISH_SHADER = """
         alpha = max(alpha, clamp(cov / wsum * 1.6, 0.0, 1.0));
     }
     let a = clamp(alpha / 0.35, 0.0, 1.0);
-    return vec4<f32>(clamp(rgb * a + bg.rgb * (1.0 - a), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    // bg.w is the lightning flash: everything brightens and cools for an
+    // instant, the empty sky most of all.
+    let flash = bg.w;
+    let sky = bg.rgb * (1.0 + flash * 3.0) + vec3<f32>(0.5, 0.55, 0.7) * flash * 0.15;
+    let lit = rgb * (1.0 + flash * 1.6) + vec3<f32>(0.55, 0.6, 0.75) * flash * 0.1;
+    return vec4<f32>(clamp(lit * a + sky * (1.0 - a), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 """
 
@@ -1089,8 +1094,12 @@ class SplatRenderer:
         wgpu = self._wgpu
         w, h = int(size[0]), int(size[1])
         self._draw(view, proj, (w, h), mode, effects, time_seconds)
+        flash = 0.0
+        if effects is not None and mode == 0:
+            from .fx3d import scene_flash
+            flash = scene_flash(effects, time_seconds)
         self.device.queue.write_buffer(
-            self._fin_uniform, 0, np.array([*background, 0.0], np.float32).tobytes())
+            self._fin_uniform, 0, np.array([*background, flash], np.float32).tobytes())
         enc = self.device.create_command_encoder()
         rp = enc.begin_render_pass(color_attachments=[{
             "view": self._final.create_view(), "clear_value": (0, 0, 0, 1),

@@ -28,6 +28,136 @@ VOLUME_KINDS = {"fog": 0.0, "smoke": 1.0, "fire": 2.0, "cloud": 3.0, "godrays": 
 PARTICLE_KINDS = {"smoke": 0.0, "fire": 1.0, "embers": 2.0, "dust": 3.0, "snow": 4.0, "clouds": 5.0,
                   "rain": 6.0}
 MAX_PARTICLES = 20000
+#: One strike lasts this long, flicker included.
+STRIKE_SECONDS = 0.45
+
+BOLT_SHADER = """
+struct BU { vp: mat4x4<f32>, colour: vec4<f32>, view_z: vec4<f32> };
+@group(0) @binding(0) var<uniform> u: BU;
+@group(0) @binding(1) var scene_depth: texture_2d<f32>;
+struct VIn{@location(0) pos:vec3<f32>, @location(1) across:f32, @location(2) strength:f32};
+struct Out{@builtin(position) position:vec4<f32>, @location(0) across:f32,
+           @location(1) strength:f32, @location(2) depth:f32};
+@vertex fn vs_main(v:VIn)->Out{
+    var o:Out;
+    o.position=u.vp*vec4(v.pos,1.0);
+    o.across=v.across; o.strength=v.strength;
+    o.depth=-(dot(u.view_z.xyz,v.pos)+u.view_z.w);
+    return o;
+}
+// A white-hot core inside a wide coloured glow, added to the frame. Hidden
+// behind nearer surfaces like particles are, so a strike behind a building
+// lights the sky around it instead of drawing over it.
+@fragment fn fs_main(i:Out)->@location(0) vec4<f32>{
+    let d=textureLoad(scene_depth, vec2<i32>(i.position.xy), 0);
+    var occl=1.0;
+    if (d.a>0.05) { occl=clamp((d.r/d.a-i.depth)/0.3,0.0,1.0); }
+    let a=i.across;
+    // The ribbon is mostly glow: the core is a thin line down its middle.
+    let core=exp(-a*a*120.0);
+    let glow=exp(-a*a*4.0);
+    let rgb=(vec3(1.0)*core*0.45+u.colour.rgb*glow*0.05)*u.colour.w*i.strength*occl;
+    return vec4(rgb,0.0);
+}
+"""
+
+
+def _rng(*keys):
+    return np.random.default_rng([int(abs(k) * 1000) & 0xFFFFFFFF for k in keys])
+
+
+def strike_at(item, t: float) -> tuple[float, int]:
+    """(brightness 0..1, strike index) of a lightning item at time t.
+
+    Time is cut into slots of 60/rate seconds; each slot may hold one strike
+    at a random moment inside it, with two or three flickers. Everything
+    comes from (seed, slot), so the storm is the same on every playback."""
+    rate = max(float(item.rate), 0.1)
+    slot = 60.0 / rate
+    k0 = int(math.floor(t / slot))
+    best = (0.0, -1)
+    for k in (k0 - 1, k0):
+        if k < 0:
+            continue
+        rng = _rng(item.seed, k + 1)
+        if rng.random() > 0.8:
+            continue                       # the odd gap keeps it irregular
+        start = k * slot + rng.random() * max(slot - STRIKE_SECONDS, 0.0)
+        dt = t - start
+        if not 0.0 <= dt < STRIKE_SECONDS:
+            continue
+        pulses = [0.0, 0.06 + 0.05 * rng.random(), 0.18 + 0.1 * rng.random()]
+        pulses = pulses[:1 + int(rng.integers(1, 3))]
+        env = max((math.exp(-(dt - p) / 0.05) for p in pulses if dt >= p), default=0.0)
+        if env > best[0]:
+            best = (env, k)
+    return best
+
+
+def _jagged(a: np.ndarray, b: np.ndarray, rng, levels: int, rough: float) -> np.ndarray:
+    """Midpoint displacement: split every segment and push the midpoint
+    sideways by a share of its length, level after level."""
+    pts = [a, b]
+    for _ in range(levels):
+        out = [pts[0]]
+        for p, q in zip(pts, pts[1:]):
+            seg = q - p
+            length = float(np.linalg.norm(seg))
+            off = rng.normal(size=3)
+            off -= seg * float(off @ seg) / (length * length + 1e-9)
+            out += [(p + q) * 0.5 + off * length * rough, q]
+        pts = out
+    return np.asarray(pts, np.float32)
+
+
+def bolt_paths(item, index: int) -> list[tuple[np.ndarray, float, float]]:
+    """The bolt of strike `index`: (points, width, strength) per branch.
+    The main channel runs from the sky down to the target; a few thinner
+    forks leave it partway and die out."""
+    rng = _rng(item.seed, index + 1, 7)
+    target = np.asarray(item.position, np.float32)
+    h = max(float(item.height), 0.1)
+    top = target + np.array([rng.normal() * 0.25 * h, h, rng.normal() * 0.25 * h], np.float32)
+    main = _jagged(top, target, rng, 7, 0.2)
+    paths = [(main, 1.0, 1.0)]
+    for _ in range(int(rng.integers(2, 5))):
+        i = int(rng.integers(len(main) // 6, len(main) * 2 // 3))
+        start = main[i]
+        rest = target - start
+        side = rng.normal(size=3).astype(np.float32)
+        side -= rest * float(side @ rest) / (float(rest @ rest) + 1e-9)
+        side /= float(np.linalg.norm(side)) + 1e-9
+        end = start + rest * rng.uniform(0.25, 0.5) + side * float(np.linalg.norm(rest)) * 0.35
+        paths.append((_jagged(start, end, rng, 5, 0.25), 0.45, 0.55))
+    return paths
+
+
+def bolt_vertices(item, index: int, camera_pos, brightness: float) -> np.ndarray:
+    """Camera-facing ribbons along every branch: (x, y, z, across, strength)."""
+    cam = np.asarray(camera_pos, np.float32)
+    half = 0.06 + 0.01 * max(float(item.height), 0.1)
+    rows = []
+    for pts, width, strength in bolt_paths(item, index):
+        n = len(pts) - 1
+        for j in range(n):
+            a, b = pts[j], pts[j + 1]
+            side = np.cross(b - a, cam - a)
+            side = side / (float(np.linalg.norm(side)) + 1e-9) * half * width
+            # Branches fade towards their tips.
+            s = brightness * strength * (1.0 - 0.7 * j / max(n, 1) if width < 1.0 else 1.0)
+            for p, x in ((a - side, -1.0), (a + side, 1.0), (b + side, 1.0),
+                         (a - side, -1.0), (b + side, 1.0), (b - side, -1.0)):
+                rows.append((p[0], p[1], p[2], x, s))
+    return np.asarray(rows, np.float32)
+
+
+def scene_flash(effects, t: float) -> float:
+    """How much the whole frame lights up at time t, from every strike."""
+    total = 0.0
+    for item in getattr(effects, "strikes", []) if effects is not None else []:
+        if item.enabled and item.flash > 0.0:
+            total += strike_at(item, t)[0] * float(item.flash)
+    return min(total, 3.0)
 
 VOLUME_SHADER = """
 struct VU {
@@ -475,11 +605,11 @@ class FxPass:
         self._layout = layout
         pl = device.create_pipeline_layout(bind_group_layouts=[layout])
 
-        def pipe(code: str, cull, colour_src: str):
+        def pipe(code: str, cull, colour_src: str, buffers=()):
             mod = device.create_shader_module(code=code)
             return device.create_render_pipeline(
                 layout=pl,
-                vertex={"module": mod, "entry_point": "vs_main", "buffers": []},
+                vertex={"module": mod, "entry_point": "vs_main", "buffers": list(buffers)},
                 primitive={"topology": wgpu.PrimitiveTopology.triangle_list, "cull_mode": cull},
                 fragment={"module": mod, "entry_point": "fs_main", "targets": [{
                     "format": colour_format,
@@ -493,7 +623,13 @@ class FxPass:
         # embers while smoke and ash still cover what is behind them.
         self._volume = pipe(VOLUME_SHADER, wgpu.CullMode.front, "one")
         self._particle = pipe(PARTICLE_SHADER, wgpu.CullMode.none, "one")
-        self._pool: dict[str, list] = {"v": [], "p": []}
+        self._bolt = pipe(BOLT_SHADER, wgpu.CullMode.none, "one", [{
+            "array_stride": 20, "step_mode": wgpu.VertexStepMode.vertex,
+            "attributes": [
+                {"format": wgpu.VertexFormat.float32x3, "offset": 0, "shader_location": 0},
+                {"format": wgpu.VertexFormat.float32, "offset": 12, "shader_location": 1},
+                {"format": wgpu.VertexFormat.float32, "offset": 16, "shader_location": 2}]}])
+        self._pool: dict[str, list] = {"v": [], "p": [], "b": []}
 
     def _group(self, kind: str, index: int, values: np.ndarray, depth_view):
         wgpu = self._wgpu
@@ -509,7 +645,8 @@ class FxPass:
 
     def encode(self, enc, colour_view, depth_view, view: np.ndarray, proj: np.ndarray,
                camera_pos, effects, time_seconds: float, planes=None) -> None:
-        if effects is None or (not effects.volumes and not effects.emitters):
+        if effects is None or not (effects.volumes or effects.emitters
+                                   or getattr(effects, "strikes", [])):
             return
         wgpu = self._wgpu
         vp = proj @ view
@@ -614,4 +751,26 @@ class FxPass:
             rp.set_bind_group(0, self._group("p", slot, v, depth_view))
             slot += 1
             rp.draw(min(int(em.count), MAX_PARTICLES) * 6, 1, 0, 0)
+        rp.set_pipeline(self._bolt)
+        slot = 0
+        for item in getattr(effects, "strikes", []):
+            if not item.enabled or not item.show_bolt:
+                continue
+            brightness, index = strike_at(item, time_seconds)
+            if brightness < 0.02:
+                continue
+            verts = bolt_vertices(item, index, camera_pos, brightness)
+            if not len(verts):
+                continue
+            v = np.zeros(24, np.float32)
+            v[:16] = np.ascontiguousarray(vp.T).ravel()
+            v[16:19] = item.colour
+            v[19] = item.emission
+            v[20:24] = view[2]
+            buf = self.device.create_buffer_with_data(
+                data=verts.tobytes(), usage=wgpu.BufferUsage.VERTEX)
+            rp.set_bind_group(0, self._group("b", slot, v, depth_view))
+            rp.set_vertex_buffer(0, buf)
+            slot += 1
+            rp.draw(len(verts), 1, 0, 0)
         rp.end()

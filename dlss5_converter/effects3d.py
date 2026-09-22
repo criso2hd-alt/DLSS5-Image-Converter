@@ -130,19 +130,54 @@ class CollisionPlane:
 
 
 @dataclass(slots=True)
+class LightningStrike:
+    """An empty the user places; lightning strikes it at random moments.
+
+    The position is where the bolt lands. When a strike happens is decided
+    from the time and the seed alone (see fx3d.strike_at), so scrubbing and
+    export always show the same storm. With the bolt hidden it is only the
+    flash: distant lightning lighting up the scene.
+    """
+
+    name: str = "Lightning"
+    kind: str = "lightning"
+    id: str = field(default_factory=_id)
+    enabled: bool = True
+    position: tuple[float, float, float] = (0.0, -0.5, -4.0)
+    #: Only the marker drawn in the editor.
+    size: tuple[float, float, float] = (0.25, 0.25, 0.25)
+    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: Strikes per minute on average; the exact moments are irregular.
+    rate: float = 10.0
+    #: How far above the target the bolt starts.
+    height: float = 4.0
+    #: How much the whole frame lights up during a strike.
+    flash: float = 0.8
+    #: Brightness of the bolt itself.
+    emission: float = 6.0
+    show_bolt: bool = True
+    colour: tuple[float, float, float] = (0.78, 0.84, 1.0)
+    seed: float = 3.0
+
+
+@dataclass(slots=True)
 class EffectsState:
     lighting: LightingSettings = field(default_factory=LightingSettings)
     volumes: list[VolumeEffect] = field(default_factory=list)
     emitters: list[ParticleEmitter] = field(default_factory=list)
     planes: list[CollisionPlane] = field(default_factory=list)
+    strikes: list[LightningStrike] = field(default_factory=list)
 
     def clone(self) -> "EffectsState":
         return copy.deepcopy(self)
 
+    def items(self) -> list:
+        """Every placed effect, whatever its type."""
+        return [*self.volumes, *self.emitters, *self.planes, *self.strikes]
+
     def item(self, item_id: str):
         return next(
-            (item for item in [*self.volumes, *self.emitters, *self.planes]
-             if item.id == item_id),
+            (item for item in self.items() if item.id == item_id),
             None,
         )
 
@@ -249,6 +284,7 @@ def interpolate_effects(a: EffectsState, b: EffectsState, f: float) -> EffectsSt
     result.volumes = blend_lists(a.volumes, b.volumes)
     result.emitters = blend_lists(a.emitters, b.emitters)
     result.planes = blend_lists(a.planes, b.planes)
+    result.strikes = blend_lists(a.strikes, b.strikes)
     return result
 
 
@@ -269,7 +305,7 @@ def animatable_paths(state: EffectsState) -> list[str]:
     """
     paths: list[str] = []
     owners = [(ENVIRONMENT, state.lighting)]
-    owners += [(item.id, item) for item in [*state.volumes, *state.emitters, *state.planes]]
+    owners += [(item.id, item) for item in state.items()]
     for owner_id, target in owners:
         for info in fields(target):
             name = info.name

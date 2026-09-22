@@ -35,11 +35,12 @@ from PySide6.QtWidgets import (
 from . import splat3d, video
 from .animation3d import (KEY_EASES, CameraKey, CameraTrack, Easing, key_ease_label,
                           key_to_camera, set_key_ease, track_from_preset)
-from .effects3d import (EffectsState, EffectsTrack, emitter_preset, plane_preset,
-                        volume_preset)
+from .effects3d import EffectsState, EffectsTrack
 from .timeline3d import TimelineWidget
 from .viewport3d import VIEW_MODES, EditorViewport
-from .widgets import Spinner
+from .widgets import ModuleCard, Spinner
+from .fx_panel import (DIRECTIONS, PARTICLE_TYPES, VOLUME_TYPES, FxPanel,  # noqa: F401
+                       angles_to_direction, direction_name, direction_to_angles)
 
 #: Long side the splat scene is built at. Every source pixel becomes a splat,
 #: so this sets both detail and GPU memory: 2560 is ~3.7M splats (~240 MB),
@@ -117,44 +118,7 @@ def shot_matrices(key, size, source_aspect: float) -> tuple[np.ndarray, np.ndarr
         half = math.tan(math.radians(cam.fov_degrees) * 0.5) * source_aspect / out_aspect
         cam.fov_degrees = math.degrees(2.0 * math.atan(half))
     return camera_matrices(cam, size)
-VOLUME_TYPES = ["Fog", "Smoke", "Fire", "Cloud", "Godrays"]
-PARTICLE_TYPES = ["Embers", "Dust", "Snow", "Rain", "Smoke", "Fire", "Clouds"]
 BACKGROUND = (0.02, 0.021, 0.026)
-
-
-#: Named particle directions as (tilt, heading) in degrees. Tilt 0 is scene up;
-#: heading 0 is away from the camera, 90 to its right.
-DIRECTIONS = {
-    "Up": (0.0, 0.0),
-    "Down": (180.0, 0.0),
-    "Left": (90.0, 270.0),
-    "Right": (90.0, 90.0),
-    "Toward camera": (90.0, 180.0),
-    "Away from camera": (90.0, 0.0),
-}
-
-
-def angles_to_direction(tilt: float, heading: float) -> tuple[float, float, float]:
-    t, hd = math.radians(tilt), math.radians(heading)
-    return (math.sin(t) * math.sin(hd), math.cos(t), -math.sin(t) * math.cos(hd))
-
-
-def direction_to_angles(direction) -> tuple[float, float]:
-    x, y, z = (float(v) for v in direction)
-    length = math.sqrt(x * x + y * y + z * z) or 1.0
-    x, y, z = x / length, y / length, z / length
-    tilt = math.degrees(math.acos(max(-1.0, min(1.0, y))))
-    heading = math.degrees(math.atan2(x, -z)) % 360.0 if abs(y) < 0.9999 else 0.0
-    return tilt, heading
-
-
-def direction_name(direction) -> str:
-    tilt, heading = direction_to_angles(direction)
-    for name, (t, hd) in DIRECTIONS.items():
-        dh = abs((heading - hd + 180.0) % 360.0 - 180.0)
-        if abs(tilt - t) < 0.5 and (dh < 0.5 or t in (0.0, 180.0)):
-            return name
-    return "Custom"
 
 
 def _to_rgb8(image: np.ndarray) -> np.ndarray:
@@ -539,14 +503,10 @@ class CreativePage(QWidget):
         return lab
 
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
-        frame = QFrame()
-        frame.setStyleSheet("QFrame#card { background: #121824; border-radius: 8px; }")
-        frame.setObjectName("card")
-        col = QVBoxLayout(frame)
-        col.setContentsMargins(12, 10, 12, 12)
-        col.setSpacing(6)
-        col.addWidget(self._heading(title))
-        return frame, col
+        # The app's titled card, so this rail reads like the rest of the app.
+        card = ModuleCard(title)
+        card.body.setSpacing(8)
+        return card, card.body
 
     def _build_rail(self) -> QWidget:
         inner = QWidget()
@@ -608,107 +568,8 @@ class CreativePage(QWidget):
         self._controls += [self.contrast, self.bake_button, self.source_box]
         col.addWidget(card)
 
-        card, c = self._card("Atmosphere")
-        row = QHBoxLayout()
-        self.volume_type = QComboBox()
-        self.volume_type.addItems(VOLUME_TYPES)
-        add_vol = QPushButton("Add volume")
-        add_vol.clicked.connect(self._add_volume)
-        row.addWidget(self.volume_type, 1)
-        row.addWidget(add_vol)
-        c.addLayout(row)
-        row = QHBoxLayout()
-        self.particle_type = QComboBox()
-        self.particle_type.addItems(PARTICLE_TYPES)
-        add_em = QPushButton("Add particles")
-        add_em.clicked.connect(self._add_emitter)
-        row.addWidget(self.particle_type, 1)
-        row.addWidget(add_em)
-        c.addLayout(row)
-        row = QHBoxLayout()
-        self.plane_type = QComboBox()
-        self.plane_type.addItems(["Floor", "Ceiling", "Wall"])
-        add_plane = QPushButton("Add plane")
-        add_plane.setToolTip(
-            "A surface particles collide with, placed with the gizmo. A floor starts "
-            "on the detected ground and shows which way gravity pulls; tilt it to "
-            "tilt 'up' for every particle effect. Adding any plane replaces the "
-            "automatically detected ones.")
-        add_plane.clicked.connect(self._add_plane)
-        row.addWidget(self.plane_type, 1)
-        row.addWidget(add_plane)
-        c.addLayout(row)
-        self._controls.append(add_plane)
-        self.fx_list = QListWidget()
-        self.fx_list.setMaximumHeight(110)
-        self.fx_list.currentItemChanged.connect(self._fx_selected)
-        c.addWidget(self.fx_list)
-        self.fx_panel = QWidget()
-        fp = QVBoxLayout(self.fx_panel)
-        fp.setContentsMargins(0, 0, 0, 0)
-        self.fx_enabled = QCheckBox("Enabled")
-        self.fx_enabled.toggled.connect(lambda v: self._fx_set("enabled", v))
-        fp.addWidget(self.fx_enabled)
-        self.fx_amount = self._spin(fp, "Amount", 0.0, 5000.0, 0.05, "amount")
-        self.fx_speed = self._spin(fp, "Speed", -3.0, 3.0, 0.02, "speed")
-        self.fx_scale = self._spin(fp, "Size", 0.05, 20.0, 0.05, "scale")
-        # Particles only: the size of each individual dot (Size above is the
-        # emitter's box) and how solid they are.
-        # Particles only, in one box that is hidden for volumes.
-        self.particle_box = QWidget()
-        pb = QVBoxLayout(self.particle_box)
-        pb.setContentsMargins(0, 0, 0, 0)
-        self.fx_psize = self._spin(pb, "Particle size", 0.002, 1.0, 0.005, "particle_size")
-        self.fx_psize.setDecimals(3)
-        self.fx_opacity = self._spin(pb, "Opacity", 0.0, 1.0, 0.05, "opacity")
-        self.fx_turb = self._spin(pb, "Turbulence", 0.0, 4.0, 0.05, "turbulence")
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Direction"))
-        self.fx_dir = QComboBox()
-        self.fx_dir.addItems(list(DIRECTIONS) + ["Custom"])
-        self.fx_dir.setToolTip("Which way the particles travel. The photo decides what "
-                               "'up' is, so pick it here, or use Custom with Tilt/Heading.")
-        self.fx_dir.currentTextChanged.connect(self._fx_dir_preset)
-        row.addStretch()
-        row.addWidget(self.fx_dir)
-        pb.addLayout(row)
-        self.fx_tilt = self._spin(pb, "Tilt", 0.0, 180.0, 5.0, "tilt")
-        self.fx_tilt.setSuffix("°")
-        self.fx_tilt.setToolTip("0° travels up, 90° sideways, 180° down.")
-        self.fx_heading = self._spin(pb, "Heading", 0.0, 360.0, 5.0, "heading")
-        self.fx_heading.setSuffix("°")
-        self.fx_heading.setToolTip("Sideways direction: 0° away from the camera, 90° right, "
-                                   "180° toward the camera, 270° left.")
-        self.fx_collide = QCheckBox("Collide with floor, walls and ceiling")
-        self.fx_collide.setToolTip("Stop at the surfaces the scene analysis found.")
-        self.fx_collide.toggled.connect(lambda v: self._fx_set("collide", v))
-        pb.addWidget(self.fx_collide)
-        self.fx_bounce = self._spin(pb, "Bounce", 0.0, 1.0, 0.05, "bounce")
-        self.fx_bounce.setToolTip("0 slides along a surface (smoke pooling on the floor), "
-                                  "1 bounces straight back.")
-        fp.addWidget(self.particle_box)
-        self.fx_glow = self._spin(fp, "Glow", 0.0, 10.0, 0.1, "emission")
-        row = QHBoxLayout()
-        colour = QPushButton("Colour…")
-        colour.clicked.connect(self._fx_colour)
-        self.fx_colour_button = colour
-        remove = QPushButton("Remove")
-        remove.clicked.connect(self._fx_remove)
-        key_fx = QPushButton("◆ Key FX")
-        key_fx.setToolTip("Keyframe every effect's current settings at the playhead.")
-        key_fx.clicked.connect(self._key_fx)
-        row.addWidget(colour)
-        row.addWidget(key_fx)
-        row.addWidget(remove)
-        fp.addLayout(row)
-        hint = QLabel("Drag an effect's box in the 3D view to place it.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #8a93a6;")
-        fp.addWidget(hint)
-        self.fx_panel.setEnabled(False)
-        c.addWidget(self.fx_panel)
-        self._controls += [add_vol, add_em]
-        col.addWidget(card)
+        self.fx_panel = FxPanel(self)
+        col.addWidget(self.fx_panel)
 
         card, c = self._card("Export")
         self.res_box = QComboBox()
@@ -738,21 +599,6 @@ class CreativePage(QWidget):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFixedWidth(340)
         return scroll
-
-    def _spin(self, layout, label: str, lo: float, hi: float, step: float, field: str):
-        row = QHBoxLayout()
-        text = QLabel(label)
-        row.addWidget(text)
-        sp = QDoubleSpinBox()
-        sp.setRange(lo, hi)
-        sp.setSingleStep(step)
-        sp.setDecimals(2)
-        sp._label = text
-        sp.valueChanged.connect(lambda v, f=field: self._fx_set(f, v))
-        row.addStretch()
-        row.addWidget(sp)
-        layout.addLayout(row)
-        return sp
 
     def _empty_text(self) -> str:
         return ("Convert an image on the Single image tab, then come back here to "
@@ -1003,6 +849,9 @@ class CreativePage(QWidget):
         self.time = float(t)
         self.viewport.set_time(self.time)
         self._sync_lens()
+        if self.effects_track.keys:
+            self.viewport.set_effects(self._effects_at(self.time))
+        self.fx_panel.sync()
         self._request_redraw()
 
     def _sync_lens(self) -> None:
@@ -1044,154 +893,33 @@ class CreativePage(QWidget):
         t = (self._start_time + self._clock.elapsed()) % max(self.duration, 1e-3)
         self.timeline.set_time(t)      # emits time_changed -> _seek
 
-    # -- effects -------------------------------------------------------------
+    # -- effects (the panel calls these) ----------------------------------------
 
-    def _add_volume(self) -> None:
-        item = volume_preset(self.volume_type.currentText(), PIVOT_Z)
-        self.effects.volumes.append(item)
-        self._fx_added(item)
+    def pivot_z(self) -> float:
+        return PIVOT_Z
 
-    def _add_emitter(self) -> None:
-        item = emitter_preset(self.particle_type.currentText(), PIVOT_Z)
-        self.effects.emitters.append(item)
-        self._fx_added(item)
-
-    def _add_plane(self) -> None:
-        kind = self.plane_type.currentText()
-        ground = None
+    def ground_plane(self):
+        """The detected floor as (normal, c), or None."""
         for n, c in (self._scene.planes if self._scene is not None and self._scene.planes else []):
             if abs(float(n[1])) > 0.85:
-                ground = (n, c)
-                break
-        item = plane_preset(kind, PIVOT_Z, ground)
-        self.effects.planes.append(item)
-        self._fx_added(item)
+                return n, c
+        return None
 
-    def _fx_added(self, item) -> None:
-        li = QListWidgetItem(item.name)
-        li.setData(Qt.ItemDataRole.UserRole, item.id)
-        self.fx_list.addItem(li)
-        self.fx_list.setCurrentItem(li)
-        self._fx_changed()
+    def effects_at(self, t: float) -> EffectsState:
+        return self._effects_at(t)
 
-    def _selected_fx(self):
-        li = self.fx_list.currentItem()
-        return None if li is None else self.effects.item(li.data(Qt.ItemDataRole.UserRole))
-
-    def _fx_selected(self, *_args) -> None:
-        item = self._selected_fx()
-        self.fx_panel.setEnabled(item is not None)
-        self.viewport.set_effect_selection(item.id if item is not None else None)
-        if item is None:
-            return
-        is_plane = getattr(item, "kind", "") in ("floor", "ceiling", "wall")
-        # A plane has only a place, a tilt and an on/off switch.
-        for sp in (self.fx_amount, self.fx_speed, self.fx_glow):
-            sp.setVisible(not is_plane)
-            sp._label.setVisible(not is_plane)
-        self.fx_colour_button.setVisible(not is_plane)
-        if is_plane:
-            self.particle_box.setVisible(False)
-            self.fx_enabled.blockSignals(True)
-            self.fx_enabled.setChecked(item.enabled)
-            self.fx_enabled.blockSignals(False)
-            self.fx_scale.blockSignals(True)
-            self.fx_scale.setValue(float(np.mean([item.size[0], item.size[2]])))
-            self.fx_scale.blockSignals(False)
-            return
-        is_volume = hasattr(item, "density")
-        widgets = (self.fx_enabled, self.fx_amount, self.fx_speed, self.fx_scale, self.fx_glow,
-                   self.fx_psize, self.fx_opacity, self.fx_turb, self.fx_dir, self.fx_tilt,
-                   self.fx_heading, self.fx_collide, self.fx_bounce)
-        for wdg in widgets:
-            wdg.blockSignals(True)
-        self.fx_enabled.setChecked(item.enabled)
-        self.fx_amount.setValue(item.density if is_volume else float(item.count))
-        self.fx_amount.setSingleStep(0.05 if is_volume else 25)
-        self.fx_speed.setValue(item.speed)
-        self.fx_scale.setValue(float(np.mean(item.size)))
-        self.fx_glow.setValue(item.emission)
-        if not is_volume:
-            self.fx_psize.setValue(item.particle_size)
-            self.fx_opacity.setValue(getattr(item, "opacity", 1.0))
-            self.fx_turb.setValue(item.turbulence)
-            tilt, heading = direction_to_angles(item.direction)
-            self.fx_tilt.setValue(tilt)
-            self.fx_heading.setValue(heading)
-            self.fx_dir.setCurrentText(direction_name(item.direction))
-            self.fx_collide.setChecked(bool(getattr(item, "collide", True)))
-            self.fx_bounce.setValue(float(getattr(item, "bounce", 0.0)))
-        self.particle_box.setVisible(not is_volume)
-        for wdg in widgets:
-            wdg.blockSignals(False)
-
-    def _fx_set(self, field: str, value) -> None:
-        item = self._selected_fx()
-        if item is None:
-            return
-        if field == "amount":
-            if hasattr(item, "density"):
-                item.density = float(value)
-            else:
-                item.count = int(value)
-        elif field in ("tilt", "heading"):
-            item.direction = angles_to_direction(self.fx_tilt.value(), self.fx_heading.value())
-            self.fx_dir.blockSignals(True)
-            self.fx_dir.setCurrentText(direction_name(item.direction))
-            self.fx_dir.blockSignals(False)
-        elif field == "scale" and getattr(item, "kind", "") in ("floor", "ceiling", "wall"):
-            cur = float(np.mean([item.size[0], item.size[2]])) or 1.0
-            k = float(value) / cur
-            item.size = (item.size[0] * k, item.size[1], item.size[2] * k)
-        elif field == "scale":
-            cur = float(np.mean(item.size)) or 1.0
-            item.size = tuple(float(s) * float(value) / cur for s in item.size)
-        else:
-            setattr(item, field, value)
-        self._fx_changed()
-
-    def _fx_dir_preset(self, name: str) -> None:
-        if name not in DIRECTIONS:
-            return
-        tilt, heading = DIRECTIONS[name]
-        for sp, v in ((self.fx_tilt, tilt), (self.fx_heading, heading)):
-            sp.blockSignals(True)
-            sp.setValue(v)
-            sp.blockSignals(False)
-        self._fx_set("tilt", tilt)
-
-    def _fx_colour(self) -> None:
-        item = self._selected_fx()
-        if item is None:
-            return
-        r, g, b = (int(c * 255) for c in item.colour)
-        chosen = QColorDialog.getColor(QColor(r, g, b), self, "Effect colour")
-        if chosen.isValid():
-            item.colour = (chosen.redF(), chosen.greenF(), chosen.blueF())
-            self._fx_changed()
-
-    def _fx_remove(self) -> None:
-        item = self._selected_fx()
-        if item is None:
-            return
-        self.effects.volumes = [v for v in self.effects.volumes if v.id != item.id]
-        self.effects.emitters = [e for e in self.effects.emitters if e.id != item.id]
-        self.effects.planes = [p for p in self.effects.planes if p.id != item.id]
-        self.fx_list.takeItem(self.fx_list.currentRow())
-        self._fx_changed()
-
-    def _key_fx(self) -> None:
-        self.effects_track.add(self.time, self.effects.clone())
-        self.timeline.set_effects_track(self.effects_track)
-
-    def _effect_moved(self, item_id: str) -> None:
-        for i in range(self.fx_list.count()):
-            if self.fx_list.item(i).data(Qt.ItemDataRole.UserRole) == item_id:
-                self.fx_list.setCurrentRow(i)
+    def fx_changed(self) -> None:
+        # The 3D view shows the effects as they are at the playhead, so an
+        # animated effect's gizmo sits where the effect actually is.
+        self.viewport.set_effects(self._effects_at(self.time))
         self._request_redraw()
 
-    def _fx_changed(self) -> None:
-        self.viewport.set_effects(self.effects)
+    def keys_changed(self) -> None:
+        self.timeline.set_effects_track(self.effects_track)
+        self.fx_changed()
+
+    def _effect_moved(self, item_id: str) -> None:
+        self.fx_panel.moved(item_id, self.viewport.effects)
         self._request_redraw()
 
     def _effects_at(self, t: float) -> EffectsState:
