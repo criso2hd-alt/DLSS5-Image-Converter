@@ -62,3 +62,16 @@ def test_an_old_driver_is_called_out():
     )
     problems = interpret_probe(report)
     assert any("driver" in p.lower() for p in problems)
+
+
+def test_a_hung_or_dying_probe_is_a_startup_crash(monkeypatch):
+    from dlss5_converter import evaluator, hardware
+    monkeypatch.setattr(hardware, "query_driver_version", lambda: None)
+    hung = evaluator.interpret_probe("The harness did not respond within 45 seconds.")
+    assert len(hung) == 1 and "while starting" in hung[0]
+    # Named the adapter, then died before the live test line.
+    died = evaluator.interpret_probe("adapter: NVIDIA GeForce RTX 4070\ndlss_available: 1\n")
+    assert len(died) == 1 and "driver" in died[0]
+    # Crashed before printing anything at all.
+    silent = evaluator.interpret_probe("No output.")
+    assert len(silent) == 1 and "while starting" in silent[0]

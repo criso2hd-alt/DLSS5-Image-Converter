@@ -41,6 +41,30 @@ import numpy as np
 
 from .settings import NeuralSettings
 
+def startup_crash_advice() -> str:
+    """What to say when DLSS dies while starting, before the first frame.
+
+    The harness prints READY only after the DLSS feature is created, and NGX
+    reports its own errors as an ERROR line. So a harness that dies silently
+    (or hangs) before READY crashed inside DLSS startup itself, with every
+    file already loaded. In practice that is the NVIDIA driver refusing this
+    pre-release DLSS 5 build, typically right after a driver update: the
+    user report that prompted this ended at NVSDK_NGX_CreateFeature_Validate
+    in nvngx.log, on a setup that had worked a week earlier.
+    """
+    try:
+        from . import hardware
+        driver = hardware.query_driver_version()
+    except Exception:  # noqa: BLE001 - advice must never raise
+        driver = None
+    now = f" Your driver is {driver}." if driver else ""
+    return ("DLSS crashed while starting on the GPU, before the first frame, while "
+            "it was creating the DLSS feature with the neural add-on. Your files "
+            "loaded, so the usual cause is the NVIDIA driver: newer drivers can stop "
+            "this DLSS 5 build from starting. If it worked before, roll back to the "
+            f"driver you had then.{now}")
+
+
 #: Exit codes a crashing harness comes back with. Only the ones we have seen or
 #: can give advice about - anything else is reported as a raw hex code, which is
 #: still enough to identify in a bug report.
@@ -224,7 +248,11 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Could not start {self._exe.name}: {error}") from error
 
         _register(self._process)
-        line = self._read()
+        self._starting = True
+        try:
+            line = self._read()
+        finally:
+            self._starting = False
         if not line.startswith("READY"):
             raise HarnessError(f"Harness did not start cleanly: {line}")
         self.notes = line[len("READY") :].strip()
@@ -321,6 +349,8 @@ class Harness(AbstractContextManager["Harness"]):
             message += f" - {detail})" if detail else ")"
         if stderr.strip():
             message += "\n" + stderr.strip()
+        if getattr(self, "_starting", False):
+            message = startup_crash_advice() + "\n\n" + message
         return message
 
     def _send(self, line: str) -> None:
@@ -457,7 +487,8 @@ def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
             process.communicate(timeout=5)
         except Exception:  # noqa: BLE001 - already giving up on this process
             pass
-        return f"The harness did not respond within {int(timeout)} seconds."
+        return (f"The harness did not respond within {int(timeout)} seconds.\n\n"
+                + startup_crash_advice())
     finally:
         _unregister(process)
         with _PROBE_LOCK:
@@ -499,6 +530,12 @@ def interpret_probe(report: str) -> list[str]:
     healthy = test.lower() == "ok" and is_on("dlssnr_module_loaded")
     if healthy:
         return []
+    if "did not respond within" in report or report.strip() == "No output." or (
+            "adapter" in fields and "test_evaluation" not in fields
+            and is_on("dlss_available") is not False):
+        # Hung, or died after naming the adapter but before the live test:
+        # the failure is inside DLSS startup, not a missing file.
+        return [startup_crash_advice()]
 
     problems: list[str] = []
     # Dependency order: report only the first broken link, since a break at the

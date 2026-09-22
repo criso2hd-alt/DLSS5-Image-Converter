@@ -83,3 +83,24 @@ def test_read_surfaces_the_diagnosis():
     with pytest.raises(HarnessError) as caught:
         live._read()
     assert "0xC0000005" in str(caught.value)
+
+
+def test_a_crash_before_ready_points_at_the_driver(monkeypatch):
+    """Dying before READY means DLSS crashed while creating its feature (the
+    Discord report: nvngx.log ended at CreateFeature_Validate). The files are
+    fine; the usual cause is the driver, so say that and name the version."""
+    from dlss5_converter import hardware
+    monkeypatch.setattr(hardware, "query_driver_version", lambda: "999.99")
+    live = harness()
+    live._process = dead(-1073741819)
+    live._starting = True
+    message = live._died()
+    assert "while starting" in message and "driver" in message
+    assert "999.99" in message
+    assert "0xC0000005" in message          # the raw evidence is still there
+
+
+def test_a_crash_mid_conversion_does_not_blame_the_driver():
+    live = harness()
+    live._process = dead(-1073741819)
+    assert "while starting" not in live._died()
