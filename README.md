@@ -14,6 +14,12 @@ video up to 4K, including ProRes.
 > this project will not help you obtain them. You point it at the copies you
 > already have.
 
+## Community
+
+Questions, bug reports, results and release news: join the Discord.
+
+[![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/mEfSW3XfNn)
+
 ## Buy me a coffee
 
 If this app helped you in any way and you feel like it, you can buy me a coffee.
