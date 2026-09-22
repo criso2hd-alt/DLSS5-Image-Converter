@@ -136,7 +136,7 @@ def test_a_harness_that_only_logs_still_fails():
 
 def test_the_probe_report_drops_a_backends_logging():
     from dlss5_converter.evaluator import _harness_fields
-    raw = ("[15:21:36] [info] Util::DllPath E:\...\dxgi.dll\n"
+    raw = (r"[15:21:36] [info] Util::DllPath E:\engine\dxgi.dll" "\n"
            "[2026-09-22 15:21:36] [NGXLoadConfig:1151] app_E658700=310.9.0.0\n"
            "adapter: NVIDIA GeForce RTX 4080\n"
            "dlss_available: 1\n"
