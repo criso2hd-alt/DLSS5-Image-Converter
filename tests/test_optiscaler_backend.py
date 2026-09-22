@@ -71,11 +71,20 @@ def test_config_carries_the_settings_and_keeps_comments(setup):
     assert "OverlayMenu=false" in ini
 
 
-def test_missing_forwarder_is_named(setup):
+def test_a_half_extracted_release_is_named(setup):
+    """Only OptiScaler.dll, without the backend folder beside it."""
+    _, release = setup
+    (release / "OptiScaler" / "backend.dll").unlink()
+    status = runtime.detect()
+    assert any("extract the whole release" in p for p in status.problems)
+
+
+def test_the_obsolete_forwarder_is_not_required(setup):
+    """Current releases drop nvngx.dll_dlssnr.dll and their install guide says
+    to delete it. Requiring it made a correct install look broken."""
     _, release = setup
     (release / "nvngx.dll_dlssnr.dll").unlink()
-    status = runtime.detect()
-    assert any("nvngx.dll_dlssnr.dll" in p for p in status.problems)
+    assert runtime.detect().ready
 
 
 def test_probe_success_does_not_need_reshade_flags(setup):

@@ -42,11 +42,12 @@ def backend() -> str:
     return _backend
 
 
-#: The OptiScaler proxy and the forwarder its neural module needs. The DLSSNR
-#: snippet refuses a caller whose module path lacks "nvngx.dll", which is the
-#: only reason the forwarder exists; without it the pass fails every time.
+#: The OptiScaler proxy. Older releases also shipped nvngx.dll_dlssnr.dll,
+#: because the neural model refuses a caller whose module path lacks
+#: "nvngx.dll"; current builds do that aliasing inside OptiScaler and their
+#: install guide says to delete the helper. So it is staged when present and
+#: never required.
 OPTISCALER_DLL = "OptiScaler.dll"
-OPTISCALER_FORWARDER = "nvngx.dll_dlssnr.dll"
 
 
 @dataclass
@@ -306,11 +307,10 @@ def _detect_optiscaler(status: RuntimeStatus, extra: Path | None) -> RuntimeStat
             f"OptiScaler was not found. Extract the OptiScaler Neural Rendering release "
             f"(all of it) into the {folder} folder next to the application, or drop the "
             f"release zip in {paths.DLSS_FILES_DIR}. You do not need to run its setup script.")
-    elif not (status.optiscaler / OPTISCALER_FORWARDER).is_file():
+    elif not any(status.optiscaler.glob("OptiScaler/*.dll")):
         status.problems.append(
-            f"{OPTISCALER_FORWARDER} is missing from {status.optiscaler}. It comes in the "
-            "OptiScaler release and the neural pass cannot start without it; extract the "
-            "whole release, not only OptiScaler.dll.")
+            f"The OptiScaler folder is missing from {status.optiscaler}: extract the whole "
+            "release, not only OptiScaler.dll. Its backend DLLs live in that subfolder.")
     if status.neural_dll is None:
         status.problems.append(
             f"nvngx_dlssnr.dll was not found. Put it in the {paths.DLSS_FILES_DIR} folder. "
