@@ -2370,3 +2370,46 @@ def _fmt_tc(frame: int, fps: float) -> str:
     seconds = int(total_seconds % 60)
     frames = int(round(frame % (fps or 24.0)))
     return f"{minutes:02d}:{seconds:02d}.{frames:02d}"
+
+
+from PySide6.QtCore import QObject  # noqa: E402 - kept beside its only user
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+
+class WheelGuard(QObject):
+    """App-wide: the mouse wheel never changes a slider, spin box or dropdown.
+
+    Scrolling a long side panel with the pointer passing over a control used
+    to change that control on the way past. At best that silently edits a
+    setting; on the 3D tab's Depth strength it rebuilt the whole scene and the
+    app hung for a moment mid-scroll. Users expect the wheel to scroll the
+    panel, so it now always does: the wheel event goes to the nearest scroll
+    area instead. Values change only by dragging, clicking or typing.
+
+    Custom widgets that use the wheel on purpose (image zoom, the video
+    timeline, the 3D viewport) are plain QWidgets and are not affected.
+    """
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt name
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import (
+            QAbstractScrollArea, QAbstractSlider, QAbstractSpinBox, QComboBox)
+
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not isinstance(obj, (QAbstractSpinBox, QComboBox, QAbstractSlider)):
+            return False
+        # A scroll bar is itself a slider; it must keep scrolling normally.
+        from PySide6.QtWidgets import QScrollBar
+        if isinstance(obj, QScrollBar):
+            return False
+        # An open dropdown list is a scroll area of its own and keeps working;
+        # only the closed combo box is guarded.
+        parent = obj.parentWidget()
+        while parent is not None and not isinstance(parent, QAbstractScrollArea):
+            parent = parent.parentWidget()
+        if parent is not None:
+            bar = parent.verticalScrollBar()
+            if bar is not None and bar.isVisible():
+                QApplication.sendEvent(bar, event)
+        return True     # eaten: the control's value never changes

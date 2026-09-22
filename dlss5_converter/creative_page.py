@@ -579,6 +579,10 @@ class CreativePage(QWidget):
         self.contrast.setValue(100)
         self.contrast.setToolTip("How far apart near and far things sit. Raise it for "
                                  "flat-looking images, lower it if edges tear.")
+        # Rebuilding the scene takes a moment, so it waits until the slider is
+        # let go: with tracking off, valueChanged fires on release (and on a
+        # click or key press), not continuously while dragging.
+        self.contrast.setTracking(False)
         self.contrast.valueChanged.connect(lambda _v: self._rebuild.start())
         c.addWidget(self.contrast)
         self.bake_button = QPushButton("Fill background for this move")

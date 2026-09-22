@@ -6468,6 +6468,10 @@ def _load_bundled_fonts(app: QApplication) -> None:
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("DLSS 5 Image & Video Converter")
+    # The mouse wheel scrolls panels, never changes a control's value.
+    from .widgets import WheelGuard
+    app._wheel_guard = WheelGuard(app)   # kept alive by the app
+    app.installEventFilter(app._wheel_guard)
     _load_bundled_fonts(app)
     try:
         theme = AppSettings.load(paths.settings_path()).theme
