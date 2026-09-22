@@ -6,7 +6,7 @@ import os
 
 # Single source of truth for the version shown in the UI footer. Keep in step
 # with pyproject.toml's version on each release.
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 # OpenCV ships the OpenEXR codec but disables it at runtime unless this is set
 # (opencv/opencv#21326). EXR matters more here than in a normal photo app: the
