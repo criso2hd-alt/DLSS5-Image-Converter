@@ -614,6 +614,32 @@ class SaveWorker(QObject):
         self.finished.emit(saved)
 
 
+class _UiRelay(QObject):
+    """Delivers a worker's finished/failed to plain Python callbacks ON THE UI
+    THREAD.
+
+    A signal from an object that was moved to a worker thread, connected to a
+    plain function or closure, runs that function on the WORKER thread in
+    PySide6 (there is no receiving QObject to queue it to). The save's
+    completion handler then hid and deleted the progress dialog and touched the
+    window from the wrong thread, which could hang the app right after the
+    file was written. Bound methods of a QObject that lives on the UI thread
+    are queued to it, so routing through this object puts the callbacks back
+    where Qt requires them.
+    """
+
+    def __init__(self, parent: QObject, on_finished, on_failed) -> None:
+        super().__init__(parent)
+        self._on_finished = on_finished
+        self._on_failed = on_failed
+
+    def finished(self, value) -> None:
+        self._on_finished(value)
+
+    def failed(self, message: str) -> None:
+        self._on_failed(message)
+
+
 class StyleWorker(QObject):
     """Converts the same image once per neural style, back to back.
 
@@ -6189,8 +6215,11 @@ class MainWindow(QMainWindow):
             self.save_button.setEnabled(True)
             QMessageBox.warning(self, "Could not save", message)
 
-        worker.finished.connect(_done)
-        worker.failed.connect(_fail)
+        # Through a UI-thread relay, never straight to the closures: see _UiRelay.
+        relay = _UiRelay(self, _done, _fail)
+        worker.finished.connect(relay.finished)
+        worker.failed.connect(relay.failed)
+        self._save_relay = relay
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
