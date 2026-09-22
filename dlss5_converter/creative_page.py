@@ -912,10 +912,16 @@ class CreativePage(QWidget):
         # The 3D view shows the effects as they are at the playhead, so an
         # animated effect's gizmo sits where the effect actually is.
         self.viewport.set_effects(self._effects_at(self.time))
+        # Placed lightning strikes show as ticks on the FX row.
+        self.timeline.set_markers([t for s in self.effects.strikes if s.enabled
+                                   for t in s.strike_times])
         self._request_redraw()
 
     def keys_changed(self) -> None:
         self.timeline.set_effects_track(self.effects_track)
+        self.fx_changed()
+
+    def strikes_changed(self) -> None:
         self.fx_changed()
 
     def _effect_moved(self, item_id: str) -> None:

@@ -133,8 +133,9 @@ SPECS: dict[str, list[tuple[str, list[Prop]]]] = {
     ],
     "lightning": [
         ("Strikes", [
-            Prop("rate", "Strikes per minute", 0.5, 120.0, 1, curve=2.0,
-                 tip="On average. The exact moments are irregular, like a real storm."),
+            Prop("rate", "Random strikes per minute", 0.0, 120.0, 1, curve=2.0,
+                 tip="On average, at irregular moments like a real storm. 0 turns random "
+                     "strikes off, leaving only the ones you place."),
             Prop("height", "Height", 0.5, 30.0, 1, tip="How far above the target the bolt starts."),
             Prop("seed", "Variation", 0.0, 100.0, 0,
                  tip="A different storm: other strike times and bolt shapes."),
@@ -637,6 +638,7 @@ class FxPanel(QWidget):
             collide.toggled.connect(lambda v: self.set_value("collide", v))
             self.props_layout.addWidget(collide)
         if kind == "lightning":
+            self._strike_rows(item)
             bolt = QCheckBox("Show the bolt")
             bolt.setToolTip("Off: only the flash, like lightning striking out of shot.")
             bolt.setChecked(bool(item.show_bolt))
@@ -676,6 +678,81 @@ class FxPanel(QWidget):
             s.changed.connect(lambda _v: self._direction_angles())
             self._sliders[field] = s
             self.props_layout.addWidget(s)
+
+    def _strike_rows(self, item) -> None:
+        """Placed strikes: exact moments, shown as ticks on the timeline."""
+        self._section("Placed strikes")
+        buttons = QHBoxLayout()
+        add = QPushButton("⚡  Strike at playhead")
+        add.setToolTip("Adds a strike at exactly this moment, on top of any random ones. "
+                       "Set random strikes to 0 to time every strike yourself.")
+        add.clicked.connect(self._add_strike)
+        remove = QPushButton("Remove")
+        remove.setObjectName("secondary")
+        remove.setToolTip("Removes the placed strike at (or just before) the playhead.")
+        remove.clicked.connect(self._remove_strike)
+        clear = QPushButton("Clear")
+        clear.setObjectName("secondary")
+        clear.setToolTip("Removes every placed strike.")
+        clear.clicked.connect(self._clear_strikes)
+        buttons.addWidget(add, 1)
+        buttons.addWidget(remove)
+        buttons.addWidget(clear)
+        holder = QWidget()
+        holder.setLayout(buttons)
+        self.props_layout.addWidget(holder)
+        self.strike_label = QLabel("")
+        self.strike_label.setObjectName("hint")
+        self.strike_label.setWordWrap(True)
+        self.props_layout.addWidget(self.strike_label)
+        self._show_strikes()
+
+    def _show_strikes(self) -> None:
+        item = self.base_item()
+        if item is None or kind_of(item) != "lightning" or not hasattr(self, "strike_label"):
+            return
+        times = sorted(item.strike_times)
+        if not times:
+            text = "None yet. Move the playhead and press Strike."
+        else:
+            listed = ", ".join(f"{t:.2f} s" for t in times[:8])
+            more = f" and {len(times) - 8} more" if len(times) > 8 else ""
+            text = f"{len(times)} placed: {listed}{more}"
+        try:
+            self.strike_label.setText(text)
+        except RuntimeError:
+            pass                            # the row was rebuilt meanwhile
+
+    def _add_strike(self) -> None:
+        item = self.base_item()
+        if item is None:
+            return
+        t = round(float(self.owner.time), 3)
+        if not any(abs(t - s) < 1e-3 for s in item.strike_times):
+            item.strike_times = sorted([*item.strike_times, t])
+        self._strikes_changed()
+
+    def _remove_strike(self) -> None:
+        from .fx3d import STRIKE_SECONDS
+        item = self.base_item()
+        if item is None or not item.strike_times:
+            return
+        t = float(self.owner.time)
+        # The strike under the playhead: one starting here or still flashing.
+        near = [s for s in item.strike_times if -0.05 <= t - s <= STRIKE_SECONDS]
+        target = max(near) if near else min(item.strike_times, key=lambda s: abs(s - t))
+        item.strike_times = [s for s in item.strike_times if s != target]
+        self._strikes_changed()
+
+    def _clear_strikes(self) -> None:
+        item = self.base_item()
+        if item is not None:
+            item.strike_times = []
+            self._strikes_changed()
+
+    def _strikes_changed(self) -> None:
+        self._show_strikes()
+        self.owner.strikes_changed()
 
     def _colour_row(self) -> None:
         swatch = QPushButton()

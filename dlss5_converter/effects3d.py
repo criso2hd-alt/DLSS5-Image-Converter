@@ -155,8 +155,11 @@ class LightningStrike:
     #: Only the marker drawn in the editor.
     size: tuple[float, float, float] = (0.25, 0.25, 0.25)
     rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    #: Strikes per minute on average; the exact moments are irregular.
+    #: Random strikes per minute on average; 0 switches random strikes off.
     rate: float = 10.0
+    #: Exact moments (seconds) the user placed a strike, on top of the random
+    #: ones. A list of events, not an animated value, so never interpolated.
+    strike_times: list[float] = field(default_factory=list)
     #: How far above the target the bolt starts.
     height: float = 4.0
     #: How much the whole frame lights up during a strike.
@@ -221,7 +224,7 @@ def _mix_angles(a, b, f: float):
 
 
 #: Identity, not animatable state. Everything else on an effect is keyframable.
-_STATIC_FIELDS = frozenset({"id", "kind", "name", "hdri_path"})
+_STATIC_FIELDS = frozenset({"id", "kind", "name", "hdri_path", "strike_times"})
 #: Interpolated as angles so a turn takes the short way round.
 _ANGLE_FIELDS = frozenset({"rotation"})
 
@@ -470,8 +473,17 @@ class EffectsTrack:
         if not keys:
             return fallback.clone()
         if all(not key.paths for key in keys):
-            return self._evaluate_snapshots(keys, time)
-        return self._evaluate_paths(keys, time, fallback)
+            state = self._evaluate_snapshots(keys, time)
+        else:
+            state = self._evaluate_paths(keys, time, fallback)
+        # Placed lightning strikes are events, not keyed values. A snapshot
+        # key holds a copy of the list from when it was made, so the live
+        # list always comes from the fallback (the effects being edited).
+        for item in state.strikes:
+            live = fallback.item(item.id)
+            if live is not None:
+                item.strike_times = list(live.strike_times)
+        return state
 
     @staticmethod
     def _evaluate_snapshots(keys: list[EffectsKey], time: float) -> EffectsState:

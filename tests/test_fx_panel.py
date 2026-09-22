@@ -111,3 +111,20 @@ def test_the_eye_hides_a_gizmo_but_not_the_effect(page):
     assert page.viewport._effect_items() == []
     panel.eye_all.click()                            # and bring it all back
     assert {i.id for i in page.viewport._effect_items()} == {rain.id, bolt.id}
+
+
+def test_strike_at_playhead_adds_marks_and_removes(page):
+    panel = page.fx_panel
+    panel._add_lightning()
+    item = panel.base_item()
+    page.time = 1.25
+    panel._add_strike()
+    page.time = 3.0
+    panel._add_strike()
+    assert item.strike_times == [1.25, 3.0]
+    assert page.timeline.markers == [1.25, 3.0]
+    page.time = 3.1                          # still inside the 3.0 s flash
+    panel._remove_strike()
+    assert item.strike_times == [1.25]
+    panel._clear_strikes()
+    assert item.strike_times == [] and page.timeline.markers == []

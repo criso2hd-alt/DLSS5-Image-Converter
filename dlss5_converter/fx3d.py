@@ -66,31 +66,50 @@ def _rng(*keys):
     return np.random.default_rng([int(abs(k) * 1000) & 0xFFFFFFFF for k in keys])
 
 
+#: Strike indices at or above this are the user's placed strikes, so their
+#: bolt shapes never repeat a random strike's.
+MANUAL_INDEX = 1_000_000
+
+
+def _flicker(rng, dt: float) -> float:
+    """Brightness `dt` seconds into a strike: two or three quick flashes."""
+    pulses = [0.0, 0.06 + 0.05 * rng.random(), 0.18 + 0.1 * rng.random()]
+    pulses = pulses[:1 + int(rng.integers(1, 3))]
+    return max((math.exp(-(dt - p) / 0.05) for p in pulses if dt >= p), default=0.0)
+
+
 def strike_at(item, t: float) -> tuple[float, int]:
     """(brightness 0..1, strike index) of a lightning item at time t.
 
-    Time is cut into slots of 60/rate seconds; each slot may hold one strike
-    at a random moment inside it, with two or three flickers. Everything
-    comes from (seed, slot), so the storm is the same on every playback."""
-    rate = max(float(item.rate), 0.1)
-    slot = 60.0 / rate
-    k0 = int(math.floor(t / slot))
+    Random strikes: time is cut into slots of 60/rate seconds and each slot
+    may hold one strike at a random moment inside it. Placed strikes happen
+    exactly at the user's times. Everything comes from the seed and the slot
+    or time, so the storm is the same on every playback."""
     best = (0.0, -1)
-    for k in (k0 - 1, k0):
-        if k < 0:
-            continue
-        rng = _rng(item.seed, k + 1)
-        if rng.random() > 0.8:
-            continue                       # the odd gap keeps it irregular
-        start = k * slot + rng.random() * max(slot - STRIKE_SECONDS, 0.0)
-        dt = t - start
-        if not 0.0 <= dt < STRIKE_SECONDS:
-            continue
-        pulses = [0.0, 0.06 + 0.05 * rng.random(), 0.18 + 0.1 * rng.random()]
-        pulses = pulses[:1 + int(rng.integers(1, 3))]
-        env = max((math.exp(-(dt - p) / 0.05) for p in pulses if dt >= p), default=0.0)
-        if env > best[0]:
-            best = (env, k)
+    rate = float(item.rate)
+    if rate > 0.0:
+        slot = 60.0 / rate
+        k0 = int(math.floor(t / slot))
+        for k in (k0 - 1, k0):
+            if k < 0:
+                continue
+            rng = _rng(item.seed, k + 1)
+            if rng.random() > 0.8:
+                continue                   # the odd gap keeps it irregular
+            start = k * slot + rng.random() * max(slot - STRIKE_SECONDS, 0.0)
+            dt = t - start
+            if 0.0 <= dt < STRIKE_SECONDS:
+                env = _flicker(rng, dt)
+                if env > best[0]:
+                    best = (env, k)
+    for i, start in enumerate(sorted(getattr(item, "strike_times", []) or [])):
+        dt = t - float(start)
+        if 0.0 <= dt < STRIKE_SECONDS:
+            rng = _rng(item.seed, start * 1000.0 + 1.0, 3)
+            rng.random()                   # keep the same draw order as random strikes
+            env = _flicker(rng, dt)
+            if env > best[0]:
+                best = (env, MANUAL_INDEX + i)
     return best
 
 

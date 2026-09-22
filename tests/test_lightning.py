@@ -32,3 +32,25 @@ def test_flash_follows_the_strike_and_respects_hidden_bolts():
     assert peak > 0.8                       # a flash with no bolt drawn
     item.enabled = False
     assert max(fx3d.scene_flash(fx, t) for t in np.arange(0.0, 20.0, 0.05)) == 0.0
+
+
+def test_placed_strikes_happen_exactly_when_placed():
+    item = LightningStrike(rate=0.0, strike_times=[1.5, 4.0])
+    assert fx3d.strike_at(item, 1.49)[0] == 0.0
+    brightness, index = fx3d.strike_at(item, 1.5)
+    assert brightness > 0.9 and index >= fx3d.MANUAL_INDEX
+    assert fx3d.strike_at(item, 4.02)[0] > 0.5
+    # Random strikes are off at rate 0: nothing else anywhere.
+    lit = [t for t in np.arange(0.0, 10.0, 0.01) if fx3d.strike_at(item, t)[0] > 0.02]
+    assert all(1.5 <= t < 1.5 + fx3d.STRIKE_SECONDS or 4.0 <= t < 4.0 + fx3d.STRIKE_SECONDS
+               for t in lit)
+
+
+def test_placed_strikes_survive_a_key_all_snapshot():
+    from dlss5_converter.effects3d import EffectsTrack
+    item = LightningStrike(rate=0.0)
+    fx = EffectsState(strikes=[item])
+    track = EffectsTrack()
+    track.add(0.0, fx)                       # snapshot before any strike
+    item.strike_times = [2.0]                # placed afterwards
+    assert track.evaluate(2.0, fx).strikes[0].strike_times == [2.0]
