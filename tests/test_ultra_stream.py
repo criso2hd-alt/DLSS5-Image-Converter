@@ -48,7 +48,12 @@ def test_ultra_stream_writes_bigtiff_and_returns_native(tmp_path):
     assert np.allclose(native, 0.4, atol=2e-3)
 
 
-def test_ultra_stream_cleans_scratch_and_tiles_when_large(tmp_path):
+def test_ultra_stream_cleans_scratch_and_tiles_when_large(tmp_path, monkeypatch):
+    # Pin free memory: the planner clamps the factor to what RAM allows, so on
+    # a machine that happens to be busy this asserted a size it never asked for.
+    from dlss5_converter import hardware
+    monkeypatch.setattr(hardware, "query_system_ram", lambda: 64 * 1024**3)
+    monkeypatch.setattr(hardware, "query_nvidia_vram", lambda: None)
     settings = AppSettings()
     settings.detail.mode = "ultra"
     settings.detail.sr_enabled = False
