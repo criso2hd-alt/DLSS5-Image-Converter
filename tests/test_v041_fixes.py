@@ -79,3 +79,38 @@ def test_standard_reshade_build_is_named_from_the_log(tmp_path):
                   "UI: This build of ReShade has only limited add-on functionality.\n")
     assert not runtime.reshade_log_refused_addons(ok)
     assert not runtime.reshade_log_refused_addons(tmp_path / "missing.log")
+
+
+def test_save_completion_runs_on_the_ui_thread(qt_app, tmp_path):
+    """The save's finished handler must run on the UI thread: it closes the
+    progress dialog and updates the window. On the worker thread it could hang
+    the app right after the file was written (large PNG save report)."""
+    import threading
+    import time
+    from dlss5_converter import app as app_mod
+
+    w = app_mod.MainWindow(first_run_setup=False)
+    ui = threading.get_ident()
+    seen = {}
+    out = tmp_path / "x.png"
+
+    def job():
+        out.write_bytes(b"png")
+        return out
+
+    def message(saved):
+        seen["ui"] = threading.get_ident() == ui
+        seen["saved"] = saved
+        return "done"
+
+    w._start_save([("Saving…", job)], message)
+    deadline = time.time() + 10
+    while "ui" not in seen and time.time() < deadline:
+        qt_app.processEvents()
+        time.sleep(0.01)
+    assert seen.get("ui") is True
+    assert seen["saved"] == [out]
+    assert w._save_dialog is None           # progress dialog was taken down
+    assert w.save_button.isEnabled()
+    w.deleteLater()
+    qt_app.processEvents()
