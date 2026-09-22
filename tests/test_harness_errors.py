@@ -146,3 +146,15 @@ def test_the_probe_report_drops_a_backends_logging():
                                  "dlss_available: 1", "test_evaluation: ok"]
     # Nothing but logging: keep it rather than reporting an empty check.
     assert "[info]" in _harness_fields("[info] only noise here\n")
+
+
+def test_a_reply_glued_to_a_log_line_is_still_found():
+    """The NGX driver writes to the harness's stream without a newline, so a
+    real capture had the reply stuck to the end of a log line. Matching only
+    at the start of the line left the app waiting for a reply it had read."""
+    from dlss5_converter.evaluator import _protocol_reply
+    glued = "[2026-09-22] [NGXSendTelemetryEvaluateDataV3:560READY DLSS feature created"
+    assert _protocol_reply(glued) == "READY DLSS feature created"
+    assert _protocol_reply("FRAME_OK 3") == "FRAME_OK 3"
+    assert _protocol_reply("[info] Config::Reload loading ini") is None
+    assert _protocol_reply("[ngx] blah ERROR NGX said no") == "ERROR NGX said no"

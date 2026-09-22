@@ -72,7 +72,20 @@ _STARTUP_LINES = 400
 
 #: The words the harness starts its protocol lines with. Anything else on the
 #: stream is a backend's logging (see Harness._read).
-_PROTOCOL_WORDS = frozenset({"READY", "FRAME_OK", "WRITE_OK", "BYE"})
+_PROTOCOL_WORDS = ("READY", "FRAME_OK", "WRITE_OK", "DEPTH_OK", "BYE", "ERROR")
+
+
+def _protocol_reply(line: str) -> str | None:
+    """The harness's reply inside `line`, or None when it is only logging.
+
+    The driver's log can run into the reply without a newline between them,
+    so the reply is whatever follows the first protocol word in the line.
+    """
+    hits = [(line.find(word), word) for word in _PROTOCOL_WORDS if word in line]
+    if not hits:
+        return None
+    start, _word = min(hits)
+    return line[start:].strip()
 
 #: Exit codes a crashing harness comes back with. Only the ones we have seen or
 #: can give advice about - anything else is reported as a raw hex code, which is
@@ -353,10 +366,12 @@ class Harness(AbstractContextManager["Harness"]):
         """The harness's next protocol line, skipping a backend's logging.
 
         OptiScaler and the NGX driver can write to this same stream at any
-        moment, not only during start-up. A log line arriving mid-conversion
-        used to be taken for the harness's reply, after which each side waited
-        for the other for ever, so anything that is not one of the protocol
-        words is logging and is passed over.
+        moment, not only during start-up, and the driver does it without a
+        newline: a real capture had the harness's reply glued to the end of a
+        half-written log line (``...EvaluateDataV3:560READY DLSS feature
+        created``). So a reply is found *inside* the line rather than at the
+        start of it, and everything before it is logging. Matching only at the
+        start left both sides waiting for each other for ever.
         """
         process = self._process
         if process is None or process.stdout is None:
@@ -366,11 +381,13 @@ class Harness(AbstractContextManager["Harness"]):
             if not raw:
                 raise HarnessError(self._died())
             line = raw.strip()
-            if line.startswith("ERROR"):
-                raise HarnessError(line[len("ERROR"):].strip() or "Unknown DLSS failure.")
-            if line.split(" ", 1)[0] in _PROTOCOL_WORDS:
-                return line
-            self.startup_noise.append(line)
+            reply = _protocol_reply(line)
+            if reply is None:
+                self.startup_noise.append(line)
+                continue
+            if reply.startswith("ERROR"):
+                raise HarnessError(reply[len("ERROR"):].strip() or "Unknown DLSS failure.")
+            return reply
         raise HarnessError("The harness sent only logging, never a reply.")
 
     def _died(self) -> str:
