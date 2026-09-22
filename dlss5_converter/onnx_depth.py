@@ -342,7 +342,9 @@ class OnnxDepthEngine:
         providers = _providers()
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        self.session = ort.InferenceSession(str(path), options, providers=providers)
+        from . import gpus
+        self.session = ort.InferenceSession(str(path), options,
+                                            providers=gpus.ort_providers(providers))
         active = self.session.get_providers()[0]
         # Report the real backend rather than a blanket "gpu": the shipped build
         # runs on DirectML (any DX12 GPU), a user who installs onnxruntime-gpu

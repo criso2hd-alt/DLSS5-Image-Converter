@@ -137,7 +137,8 @@ class MeshRenderer:
     def __init__(self) -> None:
         import wgpu
         self._wgpu = wgpu
-        self.adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+        from . import gpus
+        self.adapter = gpus.wgpu_adapter()
         self.device = self.adapter.request_device_sync()
         self._shader = self.device.create_shader_module(code=SHADER)
         self._sampler = self.device.create_sampler(

@@ -2123,7 +2123,9 @@ class GpuGauge(QFrame):
 
     def _parse(self) -> None:
         raw = bytes(self._proc.readAllStandardOutput()).decode("utf-8", "ignore").strip()
-        line = raw.splitlines()[0] if raw else ""
+        from . import gpus
+        # The row for the GPU the app runs on, not simply the first card.
+        line = gpus.pick_smi_line(raw.splitlines())
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 3:
             return

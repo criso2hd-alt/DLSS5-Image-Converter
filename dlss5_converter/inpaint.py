@@ -105,6 +105,7 @@ def dml_model(path: str) -> str | None:
     against ~2.4 s on the CPU."""
     import os
     import onnxruntime as ort
+    from . import gpus
 
     base = os.path.join(os.path.dirname(path), "lama_dml")
     out, ok_flag, bad_flag = base + ".onnx", base + ".verified", base + ".failed"
@@ -131,7 +132,7 @@ def dml_model(path: str) -> str | None:
         so.log_severity_level = 3
         so.enable_mem_pattern = False
         got = ort.InferenceSession(out, sess_options=so,
-                                   providers=["DmlExecutionProvider"]).run(None, feed)[0]
+                                   providers=gpus.ort_providers(["DmlExecutionProvider"])).run(None, feed)[0]
         scale = max(float(np.abs(ref).max()), 1e-6)
         if not np.isfinite(got).all() or float(np.abs(got - ref).max()) > 0.02 * scale:
             raise RuntimeError("DirectML LaMa output does not match the CPU")
@@ -206,6 +207,7 @@ class LamaInpainter:
     def _create_session(self) -> None:
         import onnxruntime as ort
         from .onnx_depth import _providers
+        from . import gpus
         path = self.model_path or download()
         self.model_path = path
         provs = _providers()
@@ -217,7 +219,7 @@ class LamaInpainter:
                     so.log_severity_level = 3
                     so.enable_mem_pattern = False     # DirectML requires it off
                     self._session = ort.InferenceSession(
-                        dml_path, sess_options=so, providers=["DmlExecutionProvider"])
+                        dml_path, sess_options=so, providers=gpus.ort_providers(["DmlExecutionProvider"]))
                     self.provider = "DirectML"
                     return
             except Exception:  # noqa: BLE001 - CPU below is the floor
