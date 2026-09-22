@@ -64,6 +64,9 @@ class EditorViewport(QWidget):
         self.scan_phase = 0.0
         self.effects = None
         self.show_effect_widgets = False
+        #: Effects whose gizmo the user switched off (the eye in the effects
+        #: list). Editor clutter only: they still render.
+        self.hidden_effect_ids: set[str] = set()
         self.show_reconstruction = False
         self.scene_model = None
         self.selected_effect_id: str | None = None
@@ -100,6 +103,10 @@ class EditorViewport(QWidget):
     def set_effects(self, effects) -> None:
         self.effects = effects
         self.invalidate()
+
+    def set_hidden_effects(self, ids) -> None:
+        self.hidden_effect_ids = set(ids)
+        self.update()
 
     def set_effect_selection(self, item_id: str | None) -> None:
         self.selected_effect_id = item_id
@@ -215,8 +222,9 @@ class EditorViewport(QWidget):
     def _effect_items(self):
         if self.effects is None:
             return []
-        return [*self.effects.volumes, *self.effects.emitters,
-                *getattr(self.effects, "planes", [])]
+        # A hidden gizmo is neither drawn nor clickable, so a crowded scene
+        # can be thinned down to the effect being worked on.
+        return [i for i in self.effects.items() if i.id not in self.hidden_effect_ids]
 
     def _paint_plane(self, painter: QPainter, vp, item, selected: bool) -> None:
         """A plane as a grid, plus a permanent gravity arrow on floors."""
@@ -275,7 +283,16 @@ class EditorViewport(QWidget):
                     self._painting_effect = False
                     self.active_handle = previous
                 continue
-            colour = QColor("#ff7a42" if item.kind in {"fire", "embers"} else "#75dbff")
+            if item.kind == "lightning":
+                # Where the bolt comes from: a line up to its start height.
+                top = _project(np.asarray(item.position, np.float32)
+                               + np.array([0.0, item.height, 0.0], np.float32), vp, self.size())
+                if top is not None:
+                    pen = QPen(QColor(255, 236, 120, 200 if selected else 110), 1, Qt.PenStyle.DashLine)
+                    painter.setPen(pen)
+                    painter.drawLine(centre, top)
+            colour = QColor("#ff7a42" if item.kind in {"fire", "embers"}
+                            else "#ffe066" if item.kind == "lightning" else "#75dbff")
             colour.setAlpha(245 if selected else 150)
             painter.setPen(QPen(colour, 3 if selected else 1))
             painter.setBrush(QColor(colour.red(), colour.green(), colour.blue(), 34))

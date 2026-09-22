@@ -80,6 +80,8 @@ class TimelineWidget(QWidget):
         super().__init__()
         self.track = CameraTrack()
         self.effects_track = EffectsTrack()
+        #: Event times drawn as ticks on the FX row (placed lightning strikes).
+        self.markers: list[float] = []
         self.duration = 4.0
         self.fps = 30
         self.time = 0.0
@@ -163,6 +165,10 @@ class TimelineWidget(QWidget):
         self.effects_track = track
         self.update()
 
+    def set_markers(self, times) -> None:
+        self.markers = sorted(float(t) for t in times)
+        self.update()
+
     def select_property(self, name: str) -> None:
         if name not in {row[1] for row in self._rows()}:
             return
@@ -228,6 +234,14 @@ class TimelineWidget(QWidget):
                 prefix + label,
             )
             y = self._track_y(row_index)
+            if property_name == "effects" and self.markers:
+                # Lightning strikes: a yellow bolt tick at each placed moment.
+                painter.setPen(QPen(QColor("#ffd24a"), 2))
+                for t in self.markers:
+                    x = self._x_for(t)
+                    painter.drawLine(x, top + 3, x - 3, y)
+                    painter.drawLine(x - 3, y, x + 2, y)
+                    painter.drawLine(x + 2, y, x - 1, top + ROW_HEIGHT - 4)
             for index, key in enumerate(keys):
                 x = self._x_for(key.time)
                 if index + 1 < len(keys):

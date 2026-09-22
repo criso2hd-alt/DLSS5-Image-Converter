@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -800,7 +801,7 @@ class RuntimeProbeWorker(QObject):
             if self._status is not None:
                 runtime.stage_runtime(self._status)
                 if self._neural is not None:
-                    runtime.write_addon_config(self._harness.parent, self._neural)
+                    runtime.write_config(self._harness.parent, self._neural)
             report = evaluator.probe(self._harness)
         except Exception as error:  # noqa: BLE001 - reported in the setup dialog
             self.finished.emit(False, str(error))
@@ -2787,6 +2788,7 @@ class MainWindow(QMainWindow):
 
         self.settings = AppSettings.load(paths.settings_path())
         gpus.set_preference(self.settings.gpu)
+        runtime.set_backend(self.settings.backend)
         gpus.note_harness_adapter(f"adapter: {self.settings.dlss_adapter}")
         # One engine for the window's lifetime. Reloading Depth Anything per
         # image would add several seconds and a gigabyte of churn to every run.
@@ -4320,6 +4322,52 @@ class MainWindow(QMainWindow):
 
         # -- DLSS runtime (the setup that used to be loose buttons) --
         runtime_grp = ModuleCard("DLSS runtime")
+        # Which injector runs the neural pass. Both drive the same
+        # nvngx_dlssnr.dll; OptiScaler is the alternative for setups where the
+        # RenoDX add-on does not attach, and it adds multi-pass.
+        backend_row = QHBoxLayout()
+        backend_row.addWidget(QLabel("Neural backend"))
+        self.backend_box = QComboBox()
+        for key in runtime.BACKENDS:
+            self.backend_box.addItem(runtime.BACKEND_LABELS[key], key)
+        found = self.backend_box.findData(self.settings.backend)
+        self.backend_box.setCurrentIndex(found if found >= 0 else 0)
+        self.backend_box.setToolTip(
+            "RenoDX: the ReShade add-on (dxgi.dll + renodx-dlss5.addon64 in dlss_files). "
+            "This is the one that works.\n\n"
+            "OptiScaler: experimental. It loads and runs the neural model, but the result "
+            "does not reach the converted image yet, so the output looks untouched. "
+            "Under investigation; use RenoDX for real conversions.")
+        self.backend_box.currentIndexChanged.connect(self._backend_changed)
+        backend_row.addStretch(1)
+        backend_row.addWidget(self.backend_box, 1)
+        runtime_grp.add_layout(backend_row)
+
+        passes_row = QHBoxLayout()
+        self.passes_label = QLabel("Neural passes")
+        passes_row.addWidget(self.passes_label)
+        self.passes_box = SegmentedControl(
+            [("1", 1), ("2", 2), ("3", 3)],
+            current=min(2, max(0, int(self.settings.neural.passes) - 1)))
+        self.passes_box.setToolTip(
+            "OptiScaler only. How many times the model runs over the frame. 1 is normal; "
+            "2 and 3 are deliberately stronger and take 2x and 3x as long.")
+        self.passes_box.changed.connect(self._passes_changed)
+        passes_row.addStretch(1)
+        passes_row.addWidget(self.passes_box, 1)
+        self.passes_row_widget = QWidget()
+        self.passes_row_widget.setLayout(passes_row)
+        runtime_grp.add(self.passes_row_widget)
+        self.passes_row_widget.setVisible(self.settings.backend == "optiscaler")
+        self.backend_note = QLabel(
+            "OptiScaler is experimental: it starts and runs the neural model, but its "
+            "result does not reach the image yet, so conversions come out unchanged. "
+            "We are investigating. Use RenoDX for real work.")
+        self.backend_note.setObjectName("hint")
+        self.backend_note.setWordWrap(True)
+        self.backend_note.setVisible(self.settings.backend == "optiscaler")
+        runtime_grp.add(self.backend_note)
+
         self.settings_runtime_status = QLabel("")
         self.settings_runtime_status.setObjectName("hint")
         self.settings_runtime_status.setWordWrap(True)
@@ -4407,6 +4455,28 @@ class MainWindow(QMainWindow):
         self._refresh_settings_runtime()
         return page
 
+    def _neural_tag(self) -> str:
+        return ("OptiScaler · DLAA" if runtime.backend() == "optiscaler"
+                else "RenoDX · DLAA")
+
+    def _backend_changed(self, _index: int) -> None:
+        name = self.backend_box.currentData() or "renodx"
+        self.settings.backend = name
+        self.settings.save(paths.settings_path())
+        runtime.set_backend(name)
+        if hasattr(self, "neural_card"):
+            self.neural_card.set_tag(self._neural_tag())
+        self.passes_row_widget.setVisible(name == "optiscaler")
+        self.backend_note.setVisible(name == "optiscaler")
+        self._refresh_settings_runtime()
+        self.refresh_runtime_status()
+        self.statusBar().showMessage(
+            f"Neural backend: {runtime.BACKEND_LABELS[name]}. Use Check runtime to test it.")
+
+    def _passes_changed(self, value) -> None:
+        self.settings.neural.passes = int(value)
+        self.settings.save(paths.settings_path())
+
     def _refresh_settings_runtime(self) -> None:
         """Fill the Settings runtime line with a plain ready / not-ready verdict."""
         if not hasattr(self, "settings_runtime_status"):
@@ -4427,7 +4497,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        neural = ModuleCard("Neural", tag="RenoDX · DLAA")
+        # The tag names the backend actually running the pass, so a user who
+        # switched to OptiScaler is not told RenoDX is doing the work.
+        self.neural_card = ModuleCard("Neural", tag=self._neural_tag())
+        neural = self.neural_card
         self.neural_card = neural
         neural_layout = neural.body
         settings = self.settings.neural
@@ -6415,20 +6488,57 @@ class MainWindow(QMainWindow):
         )
 
     def _show_runtime_report(self, lines: list[str], has_problems: bool) -> None:
-        box = QMessageBox(
-            QMessageBox.Icon.Information, "DLSS 5 runtime",
-            "\n".join(lines), parent=self,
-        )
-        box.addButton(QMessageBox.StandardButton.Ok)
-        # Only when something is wrong. A clean report needs no reading.
-        guide = (
-            box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
-            if has_problems
-            else None
-        )
-        box.exec()
-        if guide is not None and box.clickedButton() is guide:
-            open_help("Troubleshooting")
+        """The runtime report: the verdict, then the detail in a scroll box.
+
+        It used to be one QMessageBox of text, which a backend's own logging
+        turned into a wall taller than the screen. The verdict and any
+        problems stay at the top in plain sight; everything else goes into a
+        box that scrolls, with a button to copy the lot into a bug report.
+        """
+        report = "\n".join(lines)
+        blank = lines.index("") if "" in lines else len(lines)
+        headline = "\n".join(lines[:blank]).strip()
+        detail = "\n".join(lines[blank:]).strip()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DLSS 5 runtime")
+        dialog.setStyleSheet(STYLE)
+        dialog.setMinimumWidth(620)
+        column = QVBoxLayout(dialog)
+        column.setContentsMargins(18, 16, 18, 14)
+        column.setSpacing(10)
+        verdict = QLabel("✗  Not ready" if has_problems else "✓  Runtime ready")
+        apply_font(verdict, family=FONT_DISPLAY, size=11)
+        column.addWidget(verdict)
+        summary = QLabel(headline)
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        column.addWidget(summary)
+        if detail:
+            box = QPlainTextEdit(detail)
+            box.setReadOnly(True)
+            box.setMinimumHeight(240)
+            apply_font(box, family=FONT_MONO, size=8.5)
+            column.addWidget(box, 1)
+
+        buttons = QHBoxLayout()
+        copy = QPushButton("Copy report")
+        copy.setObjectName("secondary")
+        copy.setToolTip("Copy the whole report, for a bug report.")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(report))
+        buttons.addWidget(copy)
+        buttons.addStretch(1)
+        if has_problems:
+            guide = QPushButton("Troubleshooting")
+            guide.setObjectName("secondary")
+            guide.clicked.connect(lambda: open_help("Troubleshooting"))
+            buttons.addWidget(guide)
+        close = QPushButton("OK")
+        close.clicked.connect(dialog.accept)
+        close.setDefault(True)
+        buttons.addWidget(close)
+        column.addLayout(buttons)
+        dialog.exec()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
         self.settings.save(paths.settings_path())

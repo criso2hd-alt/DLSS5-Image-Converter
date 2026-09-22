@@ -59,6 +59,20 @@ def query_nvidia_vram() -> VramInfo | None:
     return VramInfo(parts[0], total, used, free)
 
 
+def query_driver_version() -> str | None:
+    """The NVIDIA driver version as people quote it (e.g. 576.02), or None."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    line = next((ln.strip() for ln in result.stdout.splitlines() if ln.strip()), "")
+    return line if result.returncode == 0 and line else None
+
+
 def query_system_ram() -> int | None:
     """Free system RAM in bytes, or None when it cannot be determined.
 

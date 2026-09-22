@@ -171,10 +171,10 @@ class ModuleCard(QFrame):
             head_row.addWidget(self.title_label)
         head_row.addStretch(1)
         if tag:
-            tag_label = QLabel(tag)
-            tag_label.setObjectName("modTag")
-            apply_font(tag_label, family=FONT_MONO, size=7.5, spacing=1.4, caps=True)
-            head_row.addWidget(tag_label)
+            self.tag_label = QLabel(tag)
+            self.tag_label.setObjectName("modTag")
+            apply_font(self.tag_label, family=FONT_MONO, size=7.5, spacing=1.4, caps=True)
+            head_row.addWidget(self.tag_label)
         outer.addWidget(head)
 
         self._body_widget = QWidget()
@@ -182,6 +182,12 @@ class ModuleCard(QFrame):
         self.body.setContentsMargins(16, 14, 16, 15)
         self.body.setSpacing(13)
         outer.addWidget(self._body_widget)
+
+    def set_tag(self, text: str) -> None:
+        """Change the header's right-hand caption (it names the backend)."""
+        label = getattr(self, "tag_label", None)
+        if label is not None:
+            label.setText(text)
 
     def add(self, widget: QWidget) -> QWidget:
         self.body.addWidget(widget)

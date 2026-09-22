@@ -525,7 +525,7 @@ def convert(
     staged = runtime.stage_runtime(status)
     assert status.harness is not None
     # Before launching, never after: the add-on reads this once at startup.
-    runtime.write_addon_config(staged, settings.neural)
+    runtime.write_config(staged, settings.neural)
 
     if prepared is None:
         prepared = prepare(image_path, settings, engine, progress)
@@ -819,7 +819,7 @@ def convert_sequence(
         raise RuntimeError("\n".join(status.problems))
     staged = runtime.stage_runtime(status)
     assert status.harness is not None
-    runtime.write_addon_config(staged, settings.neural)
+    runtime.write_config(staged, settings.neural)
 
     destination.mkdir(parents=True, exist_ok=True)
     scratch = paths.scratch_dir()
@@ -995,7 +995,7 @@ def convert_video(
         raise RuntimeError("\n".join(status.problems))
     staged = runtime.stage_runtime(status)
     assert status.harness is not None
-    runtime.write_addon_config(staged, settings.neural)
+    runtime.write_config(staged, settings.neural)
 
     if estimate_depth:
         engine.load(settings.depth.model_id, progress=progress)
@@ -1171,7 +1171,7 @@ def convert_batch(
         raise RuntimeError("\n".join(status.problems))
     staged = runtime.stage_runtime(status)
     assert status.harness is not None
-    runtime.write_addon_config(staged, settings.neural)
+    runtime.write_config(staged, settings.neural)
 
     destination.mkdir(parents=True, exist_ok=True)
     scratch = paths.scratch_dir()

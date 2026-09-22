@@ -898,7 +898,15 @@ FINISH_SHADER = """
         alpha = max(alpha, clamp(cov / wsum * 1.6, 0.0, 1.0));
     }
     let a = clamp(alpha / 0.35, 0.0, 1.0);
-    return vec4<f32>(clamp(rgb * a + bg.rgb * (1.0 - a), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+    // bg.w is the lightning flash: everything brightens and cools for an
+    // instant, the empty sky most of all.
+    let flash = bg.w;
+    let sky = bg.rgb * (1.0 + flash * 3.0) + vec3<f32>(0.5, 0.55, 0.7) * flash * 0.15;
+    // Surfaces lift less than the sky, and roll off instead of clipping, so a
+    // bright wall reads lit by the flash rather than burnt to white.
+    let boosted = rgb * (1.0 + flash * 0.9) + vec3<f32>(0.55, 0.6, 0.75) * flash * 0.08;
+    let lit = boosted / (1.0 + max(boosted - vec3<f32>(0.85), vec3<f32>(0.0)));
+    return vec4<f32>(clamp(lit * a + sky * (1.0 - a), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 """
 
@@ -1069,11 +1077,31 @@ class SplatRenderer:
         rp.set_bind_group(0, self._bind)
         rp.draw(4, self._n, 0, 0)
         rp.end()
+        from . import wet3d
+        if mode == 0 and wet3d.active(effects):
+            if getattr(self, "_wet", None) is None:
+                self._wet = wet3d.WetPass(self.device)
+            self._wet.encode(enc, self._color, self._depth.create_view(), view, proj,
+                             (w, h), effects, time_seconds, self._ground_up(effects))
         if effects is not None and mode == 0:
             cam = -view[:3, :3].T @ view[:3, 3]
             self._fx.encode(enc, colour_view, self._depth.create_view(), view, proj,
                             cam, effects, time_seconds, self._planes)
         self.device.queue.submit([enc.finish()])
+
+    def _ground_up(self, effects) -> tuple[float, float, float]:
+        """Which way is up for wet ground: the user's floor, else the detected
+        ground plane, else world up. A photo's depth is rarely level, so the
+        ground's own normal decides what counts as floor."""
+        for pl in getattr(effects, "planes", []) or []:
+            if pl.enabled and pl.kind == "floor":
+                return tuple(float(v) for v in pl.normal())
+        for n, _c in self._planes:
+            n = np.asarray(n, np.float32)
+            if abs(float(n[1])) > 0.85:
+                n = n if n[1] > 0 else -n
+                return tuple(float(v) for v in n / (np.linalg.norm(n) + 1e-9))
+        return (0.0, 1.0, 0.0)
 
     def render(self, view: np.ndarray, proj: np.ndarray, size,
                background=(0.02, 0.021, 0.026), effects=None, time_seconds: float = 0.0,
@@ -1089,8 +1117,12 @@ class SplatRenderer:
         wgpu = self._wgpu
         w, h = int(size[0]), int(size[1])
         self._draw(view, proj, (w, h), mode, effects, time_seconds)
+        flash = 0.0
+        if effects is not None and mode == 0:
+            from .fx3d import scene_flash
+            flash = scene_flash(effects, time_seconds)
         self.device.queue.write_buffer(
-            self._fin_uniform, 0, np.array([*background, 0.0], np.float32).tobytes())
+            self._fin_uniform, 0, np.array([*background, flash], np.float32).tobytes())
         enc = self.device.create_command_encoder()
         rp = enc.begin_render_pass(color_attachments=[{
             "view": self._final.create_view(), "clear_value": (0, 0, 0, 1),

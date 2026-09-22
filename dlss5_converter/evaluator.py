@@ -32,6 +32,7 @@ import mmap
 import os
 import subprocess
 import threading
+from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -40,6 +41,51 @@ from types import TracebackType
 import numpy as np
 
 from .settings import NeuralSettings
+
+def startup_crash_advice() -> str:
+    """What to say when DLSS dies while starting, before the first frame.
+
+    The harness prints READY only after the DLSS feature is created, and NGX
+    reports its own errors as an ERROR line. So a harness that dies silently
+    (or hangs) before READY crashed inside DLSS startup itself, with every
+    file already loaded. In practice that is the NVIDIA driver refusing this
+    pre-release DLSS 5 build, typically right after a driver update: the
+    user report that prompted this ended at NVSDK_NGX_CreateFeature_Validate
+    in nvngx.log, on a setup that had worked a week earlier.
+    """
+    try:
+        from . import hardware
+        driver = hardware.query_driver_version()
+    except Exception:  # noqa: BLE001 - advice must never raise
+        driver = None
+    now = f" Your driver is {driver}." if driver else ""
+    return ("DLSS crashed while starting on the GPU, before the first frame, while "
+            "it was creating the DLSS feature with the neural add-on. Your files "
+            "loaded, so the usual cause is the NVIDIA driver: newer drivers can stop "
+            "this DLSS 5 build from starting. If it worked before, roll back to the "
+            f"driver you had then.{now}")
+
+
+#: How many lines of a backend's own logging to skip while waiting for the
+#: harness to speak.
+_STARTUP_LINES = 400
+
+#: The words the harness starts its protocol lines with. Anything else on the
+#: stream is a backend's logging (see Harness._read).
+_PROTOCOL_WORDS = ("READY", "FRAME_OK", "WRITE_OK", "DEPTH_OK", "BYE", "ERROR")
+
+
+def _protocol_reply(line: str) -> str | None:
+    """The harness's reply inside `line`, or None when it is only logging.
+
+    The driver's log can run into the reply without a newline between them,
+    so the reply is whatever follows the first protocol word in the line.
+    """
+    hits = [(line.find(word), word) for word in _PROTOCOL_WORDS if word in line]
+    if not hits:
+        return None
+    start, _word = min(hits)
+    return line[start:].strip()
 
 #: Exit codes a crashing harness comes back with. Only the ones we have seen or
 #: can give advice about - anything else is reported as a raw hex code, which is
@@ -156,6 +202,14 @@ class Harness(AbstractContextManager["Harness"]):
         ]
         self._process: subprocess.Popen[str] | None = None
         self.notes = ""
+        #: Lines a backend logged instead of the harness talking, kept for
+        #: diagnosis rather than mistaken for a protocol reply.
+        self.startup_noise: list[str] = []
+        #: The tail of the harness's error stream, filled by a reader thread.
+        #: It must be read continuously: a pipe nobody empties fills at 64 KB
+        #: and then blocks the writer, which is a harness frozen mid-frame for
+        #: no reason of its own (OptiScaler writes enough to reach it).
+        self._stderr_tail: deque[str] = deque(maxlen=60)
 
         # Shared-memory colour transport. Only worth setting up for the
         # throughput paths (video, sequence, batch), where the same 66 MB plane
@@ -224,9 +278,25 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Could not start {self._exe.name}: {error}") from error
 
         _register(self._process)
-        line = self._read()
-        if not line.startswith("READY"):
-            raise HarnessError(f"Harness did not start cleanly: {line}")
+        self._drain_stderr(self._process)
+        self._starting = True
+        try:
+            # Anything a backend prints on the way up is skipped: OptiScaler
+            # can log to the console, and its first line arriving here read as
+            # a harness that failed to start. The harness's own protocol lines
+            # are the only ones that matter, and an ERROR still raises from
+            # _read, so a real failure is not swallowed.
+            for _ in range(_STARTUP_LINES):
+                line = self._read()
+                if line.startswith("READY"):
+                    break
+                self.startup_noise.append(line)
+            else:
+                raise HarnessError(
+                    "Harness did not start cleanly: no READY line.\n"
+                    + "\n".join(self.startup_noise[-5:]))
+        finally:
+            self._starting = False
         self.notes = line[len("READY") :].strip()
 
     def _teardown_shmem(self) -> None:
@@ -275,17 +345,50 @@ class Harness(AbstractContextManager["Harness"]):
 
     # -- protocol ------------------------------------------------------------
 
+    def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
+        """Keep the error stream empty, holding on to its last lines."""
+        if process.stderr is None:
+            return
+
+        def pump() -> None:
+            try:
+                for line in process.stderr:      # ends when the process does
+                    text = line.rstrip()
+                    if text:
+                        self._stderr_tail.append(text)
+            except Exception:  # noqa: BLE001 - a closed pipe ends the thread
+                pass
+
+        threading.Thread(target=pump, daemon=True,
+                         name="harness-stderr").start()
+
     def _read(self) -> str:
+        """The harness's next protocol line, skipping a backend's logging.
+
+        OptiScaler and the NGX driver can write to this same stream at any
+        moment, not only during start-up, and the driver does it without a
+        newline: a real capture had the harness's reply glued to the end of a
+        half-written log line (``...EvaluateDataV3:560READY DLSS feature
+        created``). So a reply is found *inside* the line rather than at the
+        start of it, and everything before it is logging. Matching only at the
+        start left both sides waiting for each other for ever.
+        """
         process = self._process
         if process is None or process.stdout is None:
             raise HarnessError("The harness is not running.")
-        line = process.stdout.readline()
-        if not line:
-            raise HarnessError(self._died())
-        line = line.strip()
-        if line.startswith("ERROR"):
-            raise HarnessError(line[len("ERROR") :].strip() or "Unknown DLSS failure.")
-        return line
+        for _ in range(_STARTUP_LINES):
+            raw = process.stdout.readline()
+            if not raw:
+                raise HarnessError(self._died())
+            line = raw.strip()
+            reply = _protocol_reply(line)
+            if reply is None:
+                self.startup_noise.append(line)
+                continue
+            if reply.startswith("ERROR"):
+                raise HarnessError(reply[len("ERROR"):].strip() or "Unknown DLSS failure.")
+            return reply
+        raise HarnessError("The harness sent only logging, never a reply.")
 
     def _died(self) -> str:
         """Explain a harness that stopped talking without saying why.
@@ -300,8 +403,10 @@ class Harness(AbstractContextManager["Harness"]):
         if process is None:
             return "The harness is not running."
 
-        stderr = ""
-        if process.stderr is not None:
+        stderr = "\n".join(self._stderr_tail)
+        if not stderr and process.stderr is not None:
+            # No reader thread (the process was never spawned through _spawn).
+            # It has stopped talking, so this cannot block.
             try:
                 stderr = process.stderr.read() or ""
             except Exception:  # noqa: BLE001 - a dead pipe must not mask this
@@ -321,6 +426,8 @@ class Harness(AbstractContextManager["Harness"]):
             message += f" - {detail})" if detail else ")"
         if stderr.strip():
             message += "\n" + stderr.strip()
+        if getattr(self, "_starting", False):
+            message = startup_crash_advice() + "\n\n" + message
         return message
 
     def _send(self, line: str) -> None:
@@ -418,6 +525,18 @@ _probe_process: subprocess.Popen | None = None
 _PROBE_TIMEOUT = 40.0
 
 
+def _harness_fields(text: str) -> str:
+    """The harness's own ``key: value`` lines, without a backend's logging.
+
+    OptiScaler and the NGX driver can write hundreds of timestamped lines to
+    the same stream, which buried the eight lines that answer the question
+    and made the runtime report a wall of text.
+    """
+    kept = [line.rstrip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("[")]
+    return "\n".join(kept).strip() or (text.strip() or "No output.")
+
+
 def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
     """Ask the harness what the installed DLSS runtime can actually do.
 
@@ -457,13 +576,14 @@ def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
             process.communicate(timeout=5)
         except Exception:  # noqa: BLE001 - already giving up on this process
             pass
-        return f"The harness did not respond within {int(timeout)} seconds."
+        return (f"The harness did not respond within {int(timeout)} seconds.\n\n"
+                + startup_crash_advice())
     finally:
         _unregister(process)
         with _PROBE_LOCK:
             if _probe_process is process:
                 _probe_process = None
-    report = (out or err or "").strip() or "No output."
+    report = _harness_fields(out or err or "")
     from . import gpus
     gpus.note_harness_adapter(report)
     return report
@@ -499,11 +619,29 @@ def interpret_probe(report: str) -> list[str]:
     healthy = test.lower() == "ok" and is_on("dlssnr_module_loaded")
     if healthy:
         return []
+    if "did not respond within" in report or report.strip() == "No output." or (
+            "adapter" in fields and "test_evaluation" not in fields
+            and is_on("dlss_available") is not False):
+        # Hung, or died after naming the adapter but before the live test:
+        # the failure is inside DLSS startup, not a missing file.
+        return [startup_crash_advice()]
 
     problems: list[str] = []
+    from . import runtime
+    optiscaler = runtime.backend() == "optiscaler"
+    if optiscaler and is_on("dlssnr_module_loaded") is False:
+        problems.append(
+            "OptiScaler did not start the neural renderer (dlssnr_module_loaded: 0). "
+            "Check that the whole OptiScaler release is in dlss_files\\optiscaler "
+            "and that nvngx_dlssnr.dll suits "
+            "the card: RTX 50 uses NVIDIA's original 310.8, RTX 20/30/40 the "
+            "cross-generation build. OptiScaler.log in the engine_optiscaler folder "
+            "says why.")
     # Dependency order: report only the first broken link, since a break at the
     # base makes everything above it 0 as a matter of course.
-    if is_on("reshade_proxy_loaded") is False:
+    if optiscaler:
+        pass                            # ReShade and the add-on are not used
+    elif is_on("reshade_proxy_loaded") is False:
         problems.append(
             "ReShade did not load (reshade_proxy_loaded: 0) - and everything "
             "else needs it. Make sure dlss_files\\dxgi.dll is a real 64-bit "

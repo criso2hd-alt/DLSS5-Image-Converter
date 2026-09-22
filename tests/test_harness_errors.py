@@ -83,3 +83,78 @@ def test_read_surfaces_the_diagnosis():
     with pytest.raises(HarnessError) as caught:
         live._read()
     assert "0xC0000005" in str(caught.value)
+
+
+def test_a_crash_before_ready_points_at_the_driver(monkeypatch):
+    """Dying before READY means DLSS crashed while creating its feature (the
+    Discord report: nvngx.log ended at CreateFeature_Validate). The files are
+    fine; the usual cause is the driver, so say that and name the version."""
+    from dlss5_converter import hardware
+    monkeypatch.setattr(hardware, "query_driver_version", lambda: "999.99")
+    live = harness()
+    live._process = dead(-1073741819)
+    live._starting = True
+    message = live._died()
+    assert "while starting" in message and "driver" in message
+    assert "999.99" in message
+    assert "0xC0000005" in message          # the raw evidence is still there
+
+
+def test_a_crash_mid_conversion_does_not_blame_the_driver():
+    live = harness()
+    live._process = dead(-1073741819)
+    assert "while starting" not in live._died()
+
+
+def test_a_backend_logging_before_ready_is_skipped():
+    """OptiScaler can log to the console, which is our protocol with the
+    harness. Its first line used to read as "did not start cleanly"."""
+    import sys
+    from dlss5_converter.evaluator import Harness
+    script = (
+        "print('[15:21:36.145] [info] Config::Reload loading ini');"
+        "print('[2026-09-22] [NGXLoadConfig:1145] [dlss]');"
+        "print('READY DLSS feature created in DLAA mode');"
+    )
+    live = harness()
+    live._command = [sys.executable, "-c", script]
+    live._spawn(live._command)
+    assert live.notes == "DLSS feature created in DLAA mode"
+    assert len(live.startup_noise) == 2
+    live.__exit__(None, None, None)
+
+
+def test_a_harness_that_only_logs_still_fails():
+    import sys
+    live = harness()
+    live._command = [sys.executable, "-c", "print('[info] nothing to say')"]
+    with pytest.raises(HarnessError) as error:
+        live._spawn(live._command)
+    assert "no READY line" in str(error.value) or "while starting" in str(error.value)
+    live.__exit__(None, None, None)
+
+
+def test_the_probe_report_drops_a_backends_logging():
+    from dlss5_converter.evaluator import _harness_fields
+    raw = (r"[15:21:36] [info] Util::DllPath E:\engine\dxgi.dll" "\n"
+           "[2026-09-22 15:21:36] [NGXLoadConfig:1151] app_E658700=310.9.0.0\n"
+           "adapter: NVIDIA GeForce RTX 4080\n"
+           "dlss_available: 1\n"
+           "test_evaluation: ok\n")
+    kept = _harness_fields(raw)
+    assert kept.splitlines() == ["adapter: NVIDIA GeForce RTX 4080",
+                                 "dlss_available: 1", "test_evaluation: ok"]
+    # Nothing but logging: keep it rather than reporting an empty check.
+    assert "[info]" in _harness_fields("[info] only noise here\n")
+
+
+def test_a_reply_glued_to_a_log_line_is_still_found():
+    """The NGX driver writes to the harness's stream without a newline, so a
+    real capture had the reply stuck to the end of a log line. Matching only
+    at the start of the line left the app waiting for a reply it had read."""
+    from dlss5_converter.evaluator import _protocol_reply
+    glued = "[2026-09-22] [NGXSendTelemetryEvaluateDataV3:560READY DLSS feature created"
+    assert _protocol_reply(glued) == "READY DLSS feature created"
+    assert _protocol_reply("FRAME_OK 3") == "FRAME_OK 3"
+    assert _protocol_reply("[info] Config::Reload loading ini") is None
+    assert _protocol_reply("[ngx] blah ERROR NGX said no") == "ERROR NGX said no"

@@ -24,10 +24,39 @@ from .settings import (
 )
 
 
+#: The two ways the neural pass can be injected into the harness's DLSS
+#: evaluation: the RenoDX ReShade add-on, or the OptiScaler Neural Rendering
+#: fork (which drives the same nvngx_dlssnr.dll itself).
+BACKENDS = ("renodx", "optiscaler")
+BACKEND_LABELS = {"renodx": "RenoDX add-on (ReShade)",
+                  "optiscaler": "OptiScaler (experimental, no effect yet)"}
+_backend = "renodx"
+
+
+def set_backend(name: str) -> None:
+    """Choose the backend every detect/stage/config call follows."""
+    global _backend
+    _backend = name if name in BACKENDS else "renodx"
+
+
+def backend() -> str:
+    return _backend
+
+
+#: The OptiScaler proxy. Older releases also shipped nvngx.dll_dlssnr.dll,
+#: because the neural model refuses a caller whose module path lacks
+#: "nvngx.dll"; current builds do that aliasing inside OptiScaler and their
+#: install guide says to delete the helper. So it is staged when present and
+#: never required.
+OPTISCALER_DLL = "OptiScaler.dll"
+
+
 @dataclass
 class RuntimeStatus:
     """What we found, and what is missing, in language a user can act on."""
 
+    backend: str = "renodx"
+    optiscaler: Path | None = None
     neural_dll: Path | None = None
     dlss_dll: Path | None = None
     addon: Path | None = None
@@ -130,10 +159,45 @@ def reshade_log_refused_addons(log: str | Path) -> bool:
                for line in text.splitlines())
 
 
+def find_optiscaler(extra: Path | None = None) -> Path | None:
+    """The folder holding an extracted OptiScaler release, if there is one.
+
+    Looks in dlss_files/optiscaler, then any folder up to two levels inside
+    dlss_files (people extract the zip with its own top folder), then the
+    user's runtime folder. A zip left in dlss_files is extracted first."""
+    roots = [paths.optiscaler_dir(), paths.dlss_files_dir()]
+    if extra is not None:
+        roots.append(extra)
+    for root in roots:
+        try:
+            if (root / OPTISCALER_DLL).is_file():
+                return root
+        except OSError:
+            continue
+    try:
+        base = paths.dlss_files_dir()
+        for depth in ("*", "*/*"):
+            for hit in sorted(base.glob(f"{depth}/{OPTISCALER_DLL}")):
+                return hit.parent
+        zips = sorted(base.glob("OptiScaler*.zip"))
+        if zips:
+            import zipfile
+            target = paths.optiscaler_dir()
+            with zipfile.ZipFile(zips[-1]) as archive:
+                archive.extractall(target)
+            for hit in sorted(target.rglob(OPTISCALER_DLL)):
+                return hit.parent
+    except Exception:  # noqa: BLE001 - a bad zip is reported as "not found"
+        return None
+    return None
+
+
 def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     """Find every piece the harness needs, without loading any of them."""
     extra = Path(runtime_dir) if runtime_dir else None
-    status = RuntimeStatus()
+    status = RuntimeStatus(backend=_backend)
+    if _backend == "optiscaler":
+        return _detect_optiscaler(status, extra)
 
     def locate() -> None:
         status.neural_dll = paths.find_runtime_file("nvngx_dlssnr.dll", extra)
@@ -226,6 +290,193 @@ def detect(runtime_dir: str | Path | None = None) -> RuntimeStatus:
     return status
 
 
+def _detect_optiscaler(status: RuntimeStatus, extra: Path | None) -> RuntimeStatus:
+    """The OptiScaler backend's pieces: its release, the neural model and DLSS.
+
+    No ReShade and no RenoDX add-on: OptiScaler loads as the dxgi proxy
+    itself and drives nvngx_dlssnr.dll directly. Its install guide warns
+    against running both, so the two are staged into separate folders."""
+    status.optiscaler = find_optiscaler(extra)
+    status.neural_dll = paths.find_runtime_file("nvngx_dlssnr.dll", extra)
+    status.dlss_dll = paths.find_runtime_file("nvngx_dlss.dll", extra)
+    base = paths.native_exe()
+    if base.is_file():
+        status.harness = paths.optiscaler_engine_dir() / base.name
+    folder = f"{paths.DLSS_FILES_DIR}\\{paths.OPTISCALER_DIR}"
+    if status.optiscaler is None:
+        status.problems.append(
+            f"OptiScaler was not found. Extract the OptiScaler Neural Rendering release "
+            f"(all of it) into the {folder} folder next to the application, or drop the "
+            f"release zip in {paths.DLSS_FILES_DIR}. You do not need to run its setup script.")
+    elif not any(status.optiscaler.glob("OptiScaler/*.dll")):
+        status.problems.append(
+            f"The OptiScaler folder is missing from {status.optiscaler}: extract the whole "
+            "release, not only OptiScaler.dll. Its backend DLLs live in that subfolder.")
+    if status.neural_dll is None:
+        status.problems.append(
+            f"nvngx_dlssnr.dll was not found. Put it in the {paths.DLSS_FILES_DIR} folder. "
+            "RTX 50 cards use NVIDIA's original 310.8; RTX 20/30/40 need the "
+            "cross-generation 310.8 build.")
+    if status.dlss_dll is None:
+        status.problems.append(
+            f"nvngx_dlss.dll was not found. Put it in the {paths.DLSS_FILES_DIR} folder; "
+            "the neural pass runs inside a DLSS evaluation, so it is required here too.")
+    if status.harness is None:
+        status.problems.append(
+            f"dlss5_eval.exe is missing from the {paths.ENGINE_DIR} folder. This release "
+            "is incomplete; re-extract it." if paths.is_frozen()
+            else "dlss5_eval.exe has not been built. Run scripts\\build_native.ps1 once.")
+    return status
+
+
+def _place(source: Path, destination: Path) -> None:
+    """Hard link `source` to `destination` (copy where links are refused),
+    skipping the work when it is already there. See stage_runtime."""
+    if _already_staged(source, destination):
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+    try:
+        os.link(source, destination)
+    except (OSError, NotImplementedError):
+        shutil.copy2(source, destination)
+
+
+#: Release files that are instructions or installers, not runtime pieces.
+_OPTISCALER_SKIP = {".bat", ".md", ".txt", ".url", ".reg", ".ps1"}
+
+
+def _stage_optiscaler(status: RuntimeStatus) -> Path:
+    """Mirror the OptiScaler release into its own harness folder.
+
+    What its setup script would do by hand: OptiScaler.dll takes the name of
+    a DLL the process loads (dxgi.dll here), and everything else sits beside
+    it with its folders intact. Its OptiScaler.ini is not copied; it is
+    written from the release's copy by write_optiscaler_config, so the app's
+    settings land in it."""
+    if status.harness is None or status.optiscaler is None:
+        raise RuntimeError("OptiScaler is not set up; see Settings - Check runtime.")
+    target = status.harness.parent
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        _place(paths.native_exe(), status.harness)
+        for source in [status.neural_dll, status.dlss_dll,
+                       *_streamline_siblings(status.dlss_dll)]:
+            if source is not None:
+                _place(source, target / source.name)
+        root = status.optiscaler
+        for source in root.rglob("*"):
+            if not source.is_file() or source.suffix.lower() in _OPTISCALER_SKIP:
+                continue
+            relative = source.relative_to(root)
+            if relative.name.lower() == "optiscaler.ini":
+                continue
+            if relative.parts == (OPTISCALER_DLL,):
+                relative = Path("dxgi.dll")
+            _place(source, target / relative)
+    except OSError as error:
+        raise RuntimeError(f"Could not set up OptiScaler beside the harness: {error}") from error
+    return target
+
+
+def _ini_set(text: str, section: str, key: str, value: str) -> str:
+    """Set `key=value` inside `[section]` of an ini, keeping its comments.
+
+    configparser would drop OptiScaler's long explanatory comments and trips
+    over its duplicate-looking keys, so this edits lines in place: replace
+    the key if the section has it, add it under the header if not, and add
+    the section at the end if it is missing."""
+    lines = text.splitlines()
+    header = f"[{section}]".lower()
+    start = next((i for i, line in enumerate(lines) if line.strip().lower() == header), None)
+    if start is None:
+        return text.rstrip("\n") + f"\n\n[{section}]\n{key}={value}\n"
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip().startswith("[")), len(lines))
+    for i in range(start + 1, end):
+        stripped = lines[i].strip()
+        if not stripped.startswith(";") and stripped.split("=", 1)[0].strip() == key:
+            lines[i] = f"{key}={value}"
+            return "\n".join(lines) + "\n"
+    lines.insert(start + 1, f"{key}={value}")
+    return "\n".join(lines) + "\n"
+
+
+def write_optiscaler_config(harness_dir: Path, neural: NeuralSettings) -> Path:
+    """OptiScaler.ini beside the OptiScaler harness, carrying the app's settings.
+
+    Starts from the release's own OptiScaler.ini (so any key a newer build
+    needs keeps its default) and sets what the harness needs: DLSS as the DX12
+    upscaler so the evaluation passes through, frame generation and the
+    overlay off (there is no window to draw into), the process filter on our
+    harness only, a log for diagnosis, and the neural pass itself. OptiScaler
+    reads its ini at startup, so like the RenoDX one this is written before
+    each launch."""
+    source = find_optiscaler()
+    text = ""
+    if source is not None and (source / "OptiScaler.ini").is_file():
+        try:
+            text = (source / "OptiScaler.ini").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+
+    def clamp(value: float, ceiling: float = NR_STRENGTH_MAX) -> str:
+        return f"{min(ceiling, max(0.0, float(value))):.4f}"
+
+    enabled = float(neural.intensity) > 0.0
+    values = [
+        ("Upscalers", "Dx12Upscaler", "dlss"),
+        ("FrameGen", "Enabled", "false"),
+        ("Menu", "OverlayMenu", "false"),
+        ("Menu", "ShortcutKey", "-1"),
+        ("ProcessFilter", "TargetProcessName", "dlss5_eval.exe"),
+        ("Log", "LogToFile", "true"),
+        ("Log", "LogLevel", "2"),
+        # Anything OptiScaler prints to the console lands in the harness's
+        # stdout, which is the app's protocol with it: its log arriving there
+        # reads as a harness that did not start. The file log stays on, and
+        # it is what the app points at when the pass fails.
+        ("Log", "LogToConsole", "false"),
+        ("Log", "LogToNGX", "false"),
+        ("Log", "LogToDebug", "false"),
+        ("Log", "OpenConsole", "false"),
+        ("Log", "SeparateConsole", "false"),
+        ("DlssNr", "Enabled", "true" if enabled else "false"),
+        # After SR: our evaluation is DLAA, so "after" is the finished frame.
+        ("DlssNr", "RunBeforeSR", "false"),
+        ("DlssNr", "Passes", str(min(3, max(1, int(getattr(neural, "passes", 1)))))),
+        ("DlssNr", "WorkingScale", "1.0"),
+        ("DlssNr", "Preset", str(min(len(NR_PRESETS) - 1, max(0, int(neural.preset))))),
+        # Same order as ours: 0 standard/default, 1 natural, 2 cinematic.
+        ("DlssNr", "Style", str(min(len(NR_STYLES) - 1, max(0, int(neural.style))))),
+        ("DlssNr", "Intensity", clamp(neural.intensity)),
+        ("DlssNr", "LocalStructure", clamp(neural.structure)),
+        ("DlssNr", "LocalTone", clamp(neural.local_tone)),
+        ("DlssNr", "SkinStructure", clamp(neural.skin)),
+        ("DlssNr", "AutoMask", "true"),
+        ("DlssNr", "TransferStrength", clamp(neural.transfer_strength, NR_TRANSFER_MAX)),
+        ("DlssNr", "ColourStrength", clamp(neural.color_strength, NR_COLOR_MAX)),
+        ("DlssNr", "WhitePointScale", clamp(neural.paper_white, NR_PAPER_WHITE_MAX)),
+        ("DlssNr", "AutoCapture", "false"),
+        ("DlssNr", "DebugView", "0"),
+    ]
+    for section, key, value in values:
+        text = _ini_set(text, section, key, value)
+    path = harness_dir / "OptiScaler.ini"
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as error:
+        raise RuntimeError(f"Could not write the OptiScaler settings: {error}") from error
+    return path
+
+
+def write_config(harness_dir: Path, neural: NeuralSettings) -> Path:
+    """The active backend's settings file, written before a launch."""
+    if _backend == "optiscaler":
+        return write_optiscaler_config(harness_dir, neural)
+    return write_addon_config(harness_dir, neural)
+
+
 def _already_staged(source: Path, destination: Path) -> bool:
     """Whether `destination` is genuinely this `source`, not merely like it.
 
@@ -296,6 +547,8 @@ def stage_runtime(status: RuntimeStatus) -> Path:
     """
     if status.harness is None:
         raise RuntimeError("The native harness is not built.")
+    if status.backend == "optiscaler":
+        return _stage_optiscaler(status)
     target = status.harness.parent
     target.mkdir(parents=True, exist_ok=True)
 

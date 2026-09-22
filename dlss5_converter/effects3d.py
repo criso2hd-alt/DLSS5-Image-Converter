@@ -32,6 +32,17 @@ class LightingSettings:
     ambient_colour: tuple[float, float, float] = (0.55, 0.60, 0.72)
     key_colour: tuple[float, float, float] = (1.0, 0.94, 0.84)
     key_direction: tuple[float, float, float] = (-0.4, 0.6, 0.7)
+    #: Wet surfaces (see wet3d): how soaked the scene looks, 0 = dry.
+    wetness: float = 0.0
+    #: How much of the ground is standing water, 0 = none.
+    puddles: float = 0.0
+    #: Rain rings disturbing the reflections.
+    ripples: float = 0.6
+    #: Size of the puddle patches.
+    puddle_size: float = 1.0
+    #: Where a puddle's reflection finds nothing in frame, mirror the image
+    #: across the horizon instead (see wet3d). Off keeps only true hits.
+    puddle_mirror: bool = True
 
 
 @dataclass(slots=True)
@@ -58,7 +69,7 @@ class VolumeEffect:
 @dataclass(slots=True)
 class ParticleEmitter:
     name: str = "Smoke emitter"
-    kind: str = "smoke"  # smoke, fire, embers, dust, snow, clouds
+    kind: str = "smoke"  # smoke, fire, embers, dust, snow, clouds, rain
     id: str = field(default_factory=_id)
     enabled: bool = True
     position: tuple[float, float, float] = (0.0, -1.0, -4.0)
@@ -130,19 +141,57 @@ class CollisionPlane:
 
 
 @dataclass(slots=True)
+class LightningStrike:
+    """An empty the user places; lightning strikes it at random moments.
+
+    The position is where the bolt lands. When a strike happens is decided
+    from the time and the seed alone (see fx3d.strike_at), so scrubbing and
+    export always show the same storm. With the bolt hidden it is only the
+    flash: distant lightning lighting up the scene.
+    """
+
+    name: str = "Lightning"
+    kind: str = "lightning"
+    id: str = field(default_factory=_id)
+    enabled: bool = True
+    position: tuple[float, float, float] = (0.0, -0.5, -4.0)
+    #: Only the marker drawn in the editor.
+    size: tuple[float, float, float] = (0.25, 0.25, 0.25)
+    rotation: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: Random strikes per minute on average; 0 switches random strikes off.
+    rate: float = 10.0
+    #: Exact moments (seconds) the user placed a strike, on top of the random
+    #: ones. A list of events, not an animated value, so never interpolated.
+    strike_times: list[float] = field(default_factory=list)
+    #: How far above the target the bolt starts.
+    height: float = 4.0
+    #: How much the whole frame lights up during a strike.
+    flash: float = 0.8
+    #: Brightness of the bolt itself.
+    emission: float = 6.0
+    show_bolt: bool = True
+    colour: tuple[float, float, float] = (0.78, 0.84, 1.0)
+    seed: float = 3.0
+
+
+@dataclass(slots=True)
 class EffectsState:
     lighting: LightingSettings = field(default_factory=LightingSettings)
     volumes: list[VolumeEffect] = field(default_factory=list)
     emitters: list[ParticleEmitter] = field(default_factory=list)
     planes: list[CollisionPlane] = field(default_factory=list)
+    strikes: list[LightningStrike] = field(default_factory=list)
 
     def clone(self) -> "EffectsState":
         return copy.deepcopy(self)
 
+    def items(self) -> list:
+        """Every placed effect, whatever its type."""
+        return [*self.volumes, *self.emitters, *self.planes, *self.strikes]
+
     def item(self, item_id: str):
         return next(
-            (item for item in [*self.volumes, *self.emitters, *self.planes]
-             if item.id == item_id),
+            (item for item in self.items() if item.id == item_id),
             None,
         )
 
@@ -178,7 +227,7 @@ def _mix_angles(a, b, f: float):
 
 
 #: Identity, not animatable state. Everything else on an effect is keyframable.
-_STATIC_FIELDS = frozenset({"id", "kind", "name", "hdri_path"})
+_STATIC_FIELDS = frozenset({"id", "kind", "name", "hdri_path", "strike_times"})
 #: Interpolated as angles so a turn takes the short way round.
 _ANGLE_FIELDS = frozenset({"rotation"})
 
@@ -249,6 +298,7 @@ def interpolate_effects(a: EffectsState, b: EffectsState, f: float) -> EffectsSt
     result.volumes = blend_lists(a.volumes, b.volumes)
     result.emitters = blend_lists(a.emitters, b.emitters)
     result.planes = blend_lists(a.planes, b.planes)
+    result.strikes = blend_lists(a.strikes, b.strikes)
     return result
 
 
@@ -269,7 +319,7 @@ def animatable_paths(state: EffectsState) -> list[str]:
     """
     paths: list[str] = []
     owners = [(ENVIRONMENT, state.lighting)]
-    owners += [(item.id, item) for item in [*state.volumes, *state.emitters, *state.planes]]
+    owners += [(item.id, item) for item in state.items()]
     for owner_id, target in owners:
         for info in fields(target):
             name = info.name
@@ -426,8 +476,17 @@ class EffectsTrack:
         if not keys:
             return fallback.clone()
         if all(not key.paths for key in keys):
-            return self._evaluate_snapshots(keys, time)
-        return self._evaluate_paths(keys, time, fallback)
+            state = self._evaluate_snapshots(keys, time)
+        else:
+            state = self._evaluate_paths(keys, time, fallback)
+        # Placed lightning strikes are events, not keyed values. A snapshot
+        # key holds a copy of the list from when it was made, so the live
+        # list always comes from the fallback (the effects being edited).
+        for item in state.strikes:
+            live = fallback.item(item.id)
+            if live is not None:
+                item.strike_times = list(live.strike_times)
+        return state
 
     @staticmethod
     def _evaluate_snapshots(keys: list[EffectsKey], time: float) -> EffectsState:
@@ -506,6 +565,12 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
         "snow": dict(name="Snow emitter", count=650, speed=0.38, gravity=0.22,
                      colour=(0.92, 0.96, 1.0), particle_size=0.035,
                      direction=(0.0, -1.0, 0.0), drag=1.5, turbulence=0.5),
+        # Rain: fast, thin, barely any drag or swirl; the shader draws the
+        # drops as streaks and the ones that reach the floor as splashes.
+        "rain": dict(name="Rain emitter", count=2600, speed=5.5, gravity=4.0,
+                     colour=(0.72, 0.78, 0.86), particle_size=0.006, spread=0.04,
+                     direction=(0.0, -1.0, 0.0), drag=0.05, turbulence=0.04,
+                     opacity=0.7, lifetime=1.4),
         "clouds": dict(name="Cloud particles", count=260, speed=0.08, gravity=0.0,
                        colour=(0.9, 0.93, 1.0), particle_size=0.22, drag=3.0,
                        growth=1.0, turbulence=0.4, collide=False),
@@ -516,6 +581,9 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
         # (where it would land on the floor at once and never be seen).
         return ParticleEmitter(kind="snow", position=(0.0, 1.4, pivot_z), size=(4.5, 0.3, 3.0),
                                **{**values, "count": 1600, "lifetime": 5.0})
+    if kind == "rain":
+        return ParticleEmitter(kind="rain", position=(0.0, 1.8, pivot_z), size=(5.0, 0.3, 4.0),
+                               **values)
     return ParticleEmitter(kind=kind if kind in presets else "smoke", position=(0.0, -0.8, pivot_z), **values)
 
 

@@ -148,6 +148,18 @@ That is also the answer when the runtime check shows `dlssnr_module_loaded: 0`
 while every other line reads `1`. The file is present and found; the add-on
 refused it.
 
+### Neural backend (experimental)
+
+**Settings > DLSS runtime > Neural backend** offers a second way to run the
+neural pass: the [OptiScaler Neural Rendering](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
+release, extracted into `dlss_files\optiscaler`, instead of ReShade and the
+RenoDX add-on. It uses the same `nvngx_dlssnr.dll` you already have.
+
+**It does not work yet.** OptiScaler loads, takes the app's settings and runs
+the model, but its result does not reach the converted image, so conversions
+come out unchanged. It is in this release so people can follow along while we
+work out why. **Use RenoDX for real conversions.**
+
 ### Two GPUs
 
 On a PC with more than one GPU (a laptop with an external card, for example),
@@ -405,14 +417,37 @@ carries on behind a head. With the optional LaMa model (207 MB) the fill
 continues real structure; it runs on the GPU. Run it again after changing the
 camera move.
 
-**Atmosphere.** Add fog, smoke, fire, cloud or god-ray volumes, raymarched on the
-GPU and stopping softly at surfaces. Add particles (embers, dust, snow, smoke,
-fire, clouds) with their own size, opacity, turbulence and direction; the photo
-decides what "up" is, so you choose it. Particles collide with the floor and
-walls: smoke pools along the ground, embers and snow bounce. Add your own
-**Floor**, **Ceiling** or **Wall** planes when the depth came out tilted; a floor
-shows a gravity arrow and tilts "up" for every particle with it. Key FX
-keyframes the effects over time.
+**Effects.** *Add effect* offers volumes (fog, smoke, fire, cloud, god rays,
+raymarched on the GPU and stopping softly at surfaces), particles, lightning, and
+collision planes. Each effect has its own settings, and **every setting has a
+keyframe diamond**: click it to key the value at the playhead, and once a
+setting is animated, changing it keys it again, the way After Effects does.
+Untick an effect to switch it off, or click its eye to hide just its gizmo when
+the 3D view gets crowded.
+
+**Particles.** Embers, dust, snow, rain, smoke, fire and clouds, each drawn its
+own way. Embers flash white hot, cool through orange and red, then drift down as
+grey ash. Fire is flickering flame tongues that burn out into smoke. Smoke
+billows and takes the scene's light. Rain falls as streaks and splashes into
+ripples where it lands. Glowing particles add light where they overlap, and fast
+ones streak like a camera shutter. Particles collide with the floor and walls:
+smoke pools along the ground, embers and snow bounce. The photo decides what "up"
+is, so you choose each emitter's direction. Add your own **Floor**, **Ceiling**
+or **Wall** planes when the depth came out tilted; a floor shows a gravity arrow
+and tilts "up" for every particle with it.
+
+**Lightning.** Place a lightning target and a forked bolt strikes it, flickers,
+and lights up the whole frame. Random strikes come at irregular moments (the
+same ones on every playback); set them to 0 and press *Strike at playhead* to
+place every strike yourself. Placed strikes show as bolts on the timeline. Hide
+the bolt to keep only the flash, like lightning out of shot.
+
+**Wet surfaces.** Wetness darkens the scene and makes the ground shine with
+reflections of what is above it, strongest at low angles like real wet asphalt.
+Puddles turn patches of the ground into mirrors, rain ripples ring across them,
+and all of it can be keyframed, so the ground can dry or flood during a shot.
+Reflections come from what is in frame; *Mirror puddles* fills the rest by
+mirroring the image across the horizon.
 
 **Export.** 720p up to 4K, in H.264, H.265, ProRes 422 HQ, ProRes 4444 or VP9, at
 visually lossless quality. Video support downloads by itself the first time you

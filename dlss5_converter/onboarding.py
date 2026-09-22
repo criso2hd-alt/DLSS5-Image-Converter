@@ -48,6 +48,13 @@ def _css_cubic_bezier(x1: float, y1: float, x2: float, y2: float) -> QEasingCurv
 
 def probe_succeeded(report: str) -> bool:
     """Whether the native probe proved the whole neural path is live."""
+    from . import runtime
+    if runtime.backend() == "optiscaler":
+        # OptiScaler is the dxgi proxy and there is no RenoDX add-on, so the
+        # harness's ReShade/add-on flags read 0 by design. The neural module
+        # loading and the live test passing are the proof.
+        required = ("dlss_available: 1", "dlssnr_module_loaded: 1", "test_evaluation: ok")
+        return all(line in report for line in required)
     required = (
         "dlss_available: 1",
         "neural_addon_loaded: 1",
