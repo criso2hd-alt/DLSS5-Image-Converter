@@ -32,6 +32,14 @@ class LightingSettings:
     ambient_colour: tuple[float, float, float] = (0.55, 0.60, 0.72)
     key_colour: tuple[float, float, float] = (1.0, 0.94, 0.84)
     key_direction: tuple[float, float, float] = (-0.4, 0.6, 0.7)
+    #: Wet surfaces (see wet3d): how soaked the scene looks, 0 = dry.
+    wetness: float = 0.0
+    #: How much of the ground is standing water, 0 = none.
+    puddles: float = 0.0
+    #: Rain rings disturbing the reflections.
+    ripples: float = 0.6
+    #: Size of the puddle patches.
+    puddle_size: float = 1.0
 
 
 @dataclass(slots=True)

@@ -149,6 +149,17 @@ SPECS: dict[str, list[tuple[str, list[Prop]]]] = {
 }
 
 
+#: The scene-wide wet-surface controls (fields of LightingSettings).
+WET_PROPS = [
+    Prop("wetness", "Wetness", 0.0, 1.0,
+         tip="Darkens surfaces and makes the ground shine, as after rain."),
+    Prop("puddles", "Puddles", 0.0, 1.0, tip="How much of the ground is standing water."),
+    Prop("puddle_size", "Puddle size", 0.2, 5.0, curve=2.0, tip="Size of the puddle patches."),
+    Prop("ripples", "Rain ripples", 0.0, 1.0,
+         tip="Rings from raindrops disturbing the reflections."),
+]
+
+
 class KeyDiamond(QToolButton):
     """Hollow dim diamond when unanimated, hollow lit when animated elsewhere,
     filled when keyed at the playhead. Painted rather than drawn from a font
@@ -422,6 +433,22 @@ class FxPanel(QWidget):
         self.props_card.add(self.props_host)
         self.props_card.setVisible(False)
         outer.addWidget(self.props_card)
+
+        # -- wet surfaces: scene-wide, so a card of its own ------------------
+        self.wet_card = ModuleCard("Wet surfaces")
+        self._env_sliders: dict[str, FxSlider] = {}
+        for prop in WET_PROPS:
+            s = FxSlider(prop)
+            s.changed.connect(lambda v, f=prop.field: self.set_env(f, v))
+            s.key_clicked.connect(lambda f=prop.field: self._toggle_env_key(f))
+            self._env_sliders[prop.field] = s
+            self.wet_card.add(s)
+        note = QLabel("Wet ground reflects the scene, most strongly at low angles. "
+                      "Reflections only show what is in frame.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        self.wet_card.add(note)
+        outer.addWidget(self.wet_card)
         self._refresh_list()
 
     # -- adding ------------------------------------------------------------
@@ -691,6 +718,7 @@ class FxPanel(QWidget):
 
     def sync(self) -> None:
         """Show the values and diamonds for the playhead's time."""
+        self._sync_env()
         item = self.shown_item()
         if item is None:
             return
@@ -844,6 +872,43 @@ class FxPanel(QWidget):
         self._item_id = rest[min(index, len(rest) - 1)] if rest else None
         self._refresh_list()
         self.owner.fx_changed()
+
+    # -- scene-wide (environment) properties -----------------------------------
+
+    def _env_path(self, field: str) -> str:
+        from .effects3d import ENVIRONMENT
+        return f"{ENVIRONMENT}.{field}"
+
+    def _sync_env(self) -> None:
+        lighting = self.owner.effects_at(self.owner.time).lighting
+        track, t = self.owner.effects_track, self.owner.time
+        for field, slider in self._env_sliders.items():
+            slider.set_value(float(getattr(lighting, field)))
+            path = self._env_path(field)
+            slider.diamond.set_state("keyed" if track.is_keyed(t, path) else
+                                     "animated" if track.is_animated(path) else "none")
+
+    def set_env(self, field: str, value: float) -> None:
+        track, t = self.owner.effects_track, self.owner.time
+        path = self._env_path(field)
+        if track.is_animated(path):
+            state = self.owner.effects_at(t).clone()
+            setattr(state.lighting, field, float(value))
+            track.key_property(t, path, state)
+        else:
+            setattr(self.owner.effects.lighting, field, float(value))
+        self.owner.fx_changed()
+        self._sync_env()
+
+    def _toggle_env_key(self, field: str) -> None:
+        track, t = self.owner.effects_track, self.owner.time
+        path = self._env_path(field)
+        if track.is_keyed(t, path):
+            track.unkey_property(t, path)
+        else:
+            track.key_property(t, path, self.owner.effects_at(t))
+        self.owner.keys_changed()
+        self._sync_env()
 
     def _key_all(self) -> None:
         self.owner.effects_track.add(self.owner.time, self.owner.effects_at(self.owner.time))
