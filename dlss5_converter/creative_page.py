@@ -572,6 +572,10 @@ class CreativePage(QWidget):
         self.sharp_button = QPushButton(f"Download SHARP for High quality ({sharp3d.SIZE_LABEL})")
         self.sharp_button.setToolTip("Apple's SHARP model (research licence). Downloaded once.")
         self.sharp_button.clicked.connect(self._download_sharp)
+        # Decided now, not only once a scene has been built: otherwise a fresh
+        # start showed "Download SHARP" (and LaMa below) while the first scene
+        # was still building, even with the model already installed.
+        self.sharp_button.setVisible(not sharp3d.is_downloaded())
         c.addWidget(self.sharp_button)
         c.addWidget(QLabel("Depth strength"))
         self.contrast = QSlider(Qt.Orientation.Horizontal)
@@ -594,6 +598,8 @@ class CreativePage(QWidget):
         c.addWidget(self.bake_button)
         self.lama_button = QPushButton("Download LaMa for better fills (207 MB)")
         self.lama_button.clicked.connect(self._download_lama)
+        from . import inpaint
+        self.lama_button.setVisible(not inpaint.is_downloaded())
         c.addWidget(self.lama_button)
         self.bake_note = QLabel("")
         self.bake_note.setWordWrap(True)

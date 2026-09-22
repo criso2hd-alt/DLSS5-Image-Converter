@@ -86,3 +86,22 @@ def test_depth_strength_applies_on_release_only(qt_app):
     page.contrast.setSliderDown(False)      # released
     assert changes == [180]
     page.shutdown()
+
+
+def test_download_buttons_hidden_from_the_start_when_installed(qt_app, monkeypatch):
+    """A fresh start must not offer to download SHARP/LaMa that are installed."""
+    from dlss5_converter import creative_page, inpaint, sharp3d
+
+    monkeypatch.setattr(sharp3d, "is_downloaded", lambda: True)
+    monkeypatch.setattr(inpaint, "is_downloaded", lambda: True)
+    page = creative_page.CreativePage()          # no scene built yet
+    assert page.sharp_button.isHidden()
+    assert page.lama_button.isHidden()
+    page.shutdown()
+
+    monkeypatch.setattr(sharp3d, "is_downloaded", lambda: False)
+    monkeypatch.setattr(inpaint, "is_downloaded", lambda: False)
+    page = creative_page.CreativePage()
+    assert not page.sharp_button.isHidden()
+    assert not page.lama_button.isHidden()
+    page.shutdown()
