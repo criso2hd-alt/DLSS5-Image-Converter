@@ -379,6 +379,8 @@ class AppSettings:
             # update. A settings file with no key is proof this is not a fresh
             # install, so migrate it as already introduced.
             onboarding_version=onboarding_version,
+            gpu=str(raw.get("gpu") or ""),
+            dlss_adapter=str(raw.get("dlss_adapter") or ""),
         )
 
     def save(self, path: Path) -> None:
