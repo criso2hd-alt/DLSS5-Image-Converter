@@ -104,3 +104,45 @@ def test_a_crash_mid_conversion_does_not_blame_the_driver():
     live = harness()
     live._process = dead(-1073741819)
     assert "while starting" not in live._died()
+
+
+def test_a_backend_logging_before_ready_is_skipped():
+    """OptiScaler can log to the console, which is our protocol with the
+    harness. Its first line used to read as "did not start cleanly"."""
+    import sys
+    from dlss5_converter.evaluator import Harness
+    script = (
+        "print('[15:21:36.145] [info] Config::Reload loading ini');"
+        "print('[2026-09-22] [NGXLoadConfig:1145] [dlss]');"
+        "print('READY DLSS feature created in DLAA mode');"
+    )
+    live = harness()
+    live._command = [sys.executable, "-c", script]
+    live._spawn(live._command)
+    assert live.notes == "DLSS feature created in DLAA mode"
+    assert len(live.startup_noise) == 2
+    live.__exit__(None, None, None)
+
+
+def test_a_harness_that_only_logs_still_fails():
+    import sys
+    live = harness()
+    live._command = [sys.executable, "-c", "print('[info] nothing to say')"]
+    with pytest.raises(HarnessError) as error:
+        live._spawn(live._command)
+    assert "no READY line" in str(error.value) or "while starting" in str(error.value)
+    live.__exit__(None, None, None)
+
+
+def test_the_probe_report_drops_a_backends_logging():
+    from dlss5_converter.evaluator import _harness_fields
+    raw = ("[15:21:36] [info] Util::DllPath E:\...\dxgi.dll\n"
+           "[2026-09-22 15:21:36] [NGXLoadConfig:1151] app_E658700=310.9.0.0\n"
+           "adapter: NVIDIA GeForce RTX 4080\n"
+           "dlss_available: 1\n"
+           "test_evaluation: ok\n")
+    kept = _harness_fields(raw)
+    assert kept.splitlines() == ["adapter: NVIDIA GeForce RTX 4080",
+                                 "dlss_available: 1", "test_evaluation: ok"]
+    # Nothing but logging: keep it rather than reporting an empty check.
+    assert "[info]" in _harness_fields("[info] only noise here\n")

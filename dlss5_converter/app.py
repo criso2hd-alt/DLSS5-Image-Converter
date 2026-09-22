@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -6468,20 +6469,57 @@ class MainWindow(QMainWindow):
         )
 
     def _show_runtime_report(self, lines: list[str], has_problems: bool) -> None:
-        box = QMessageBox(
-            QMessageBox.Icon.Information, "DLSS 5 runtime",
-            "\n".join(lines), parent=self,
-        )
-        box.addButton(QMessageBox.StandardButton.Ok)
-        # Only when something is wrong. A clean report needs no reading.
-        guide = (
-            box.addButton("Troubleshooting", QMessageBox.ButtonRole.HelpRole)
-            if has_problems
-            else None
-        )
-        box.exec()
-        if guide is not None and box.clickedButton() is guide:
-            open_help("Troubleshooting")
+        """The runtime report: the verdict, then the detail in a scroll box.
+
+        It used to be one QMessageBox of text, which a backend's own logging
+        turned into a wall taller than the screen. The verdict and any
+        problems stay at the top in plain sight; everything else goes into a
+        box that scrolls, with a button to copy the lot into a bug report.
+        """
+        report = "\n".join(lines)
+        blank = lines.index("") if "" in lines else len(lines)
+        headline = "\n".join(lines[:blank]).strip()
+        detail = "\n".join(lines[blank:]).strip()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("DLSS 5 runtime")
+        dialog.setStyleSheet(STYLE)
+        dialog.setMinimumWidth(620)
+        column = QVBoxLayout(dialog)
+        column.setContentsMargins(18, 16, 18, 14)
+        column.setSpacing(10)
+        verdict = QLabel("✗  Not ready" if has_problems else "✓  Runtime ready")
+        apply_font(verdict, family=FONT_DISPLAY, size=11)
+        column.addWidget(verdict)
+        summary = QLabel(headline)
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        column.addWidget(summary)
+        if detail:
+            box = QPlainTextEdit(detail)
+            box.setReadOnly(True)
+            box.setMinimumHeight(240)
+            apply_font(box, family=FONT_MONO, size=8.5)
+            column.addWidget(box, 1)
+
+        buttons = QHBoxLayout()
+        copy = QPushButton("Copy report")
+        copy.setObjectName("secondary")
+        copy.setToolTip("Copy the whole report, for a bug report.")
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(report))
+        buttons.addWidget(copy)
+        buttons.addStretch(1)
+        if has_problems:
+            guide = QPushButton("Troubleshooting")
+            guide.setObjectName("secondary")
+            guide.clicked.connect(lambda: open_help("Troubleshooting"))
+            buttons.addWidget(guide)
+        close = QPushButton("OK")
+        close.clicked.connect(dialog.accept)
+        close.setDefault(True)
+        buttons.addWidget(close)
+        column.addLayout(buttons)
+        dialog.exec()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt name
         self.settings.save(paths.settings_path())

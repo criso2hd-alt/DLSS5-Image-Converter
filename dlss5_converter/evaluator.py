@@ -65,6 +65,10 @@ def startup_crash_advice() -> str:
             f"driver you had then.{now}")
 
 
+#: How many lines of a backend's own logging to skip while waiting for the
+#: harness to say READY.
+_STARTUP_LINES = 400
+
 #: Exit codes a crashing harness comes back with. Only the ones we have seen or
 #: can give advice about - anything else is reported as a raw hex code, which is
 #: still enough to identify in a bug report.
@@ -180,6 +184,9 @@ class Harness(AbstractContextManager["Harness"]):
         ]
         self._process: subprocess.Popen[str] | None = None
         self.notes = ""
+        #: Lines a backend logged before the harness said READY, kept for
+        #: diagnosis rather than mistaken for the harness talking.
+        self.startup_noise: list[str] = []
 
         # Shared-memory colour transport. Only worth setting up for the
         # throughput paths (video, sequence, batch), where the same 66 MB plane
@@ -250,11 +257,22 @@ class Harness(AbstractContextManager["Harness"]):
         _register(self._process)
         self._starting = True
         try:
-            line = self._read()
+            # Anything a backend prints on the way up is skipped: OptiScaler
+            # can log to the console, and its first line arriving here read as
+            # a harness that failed to start. The harness's own protocol lines
+            # are the only ones that matter, and an ERROR still raises from
+            # _read, so a real failure is not swallowed.
+            for _ in range(_STARTUP_LINES):
+                line = self._read()
+                if line.startswith("READY"):
+                    break
+                self.startup_noise.append(line)
+            else:
+                raise HarnessError(
+                    "Harness did not start cleanly: no READY line.\n"
+                    + "\n".join(self.startup_noise[-5:]))
         finally:
             self._starting = False
-        if not line.startswith("READY"):
-            raise HarnessError(f"Harness did not start cleanly: {line}")
         self.notes = line[len("READY") :].strip()
 
     def _teardown_shmem(self) -> None:
@@ -448,6 +466,18 @@ _probe_process: subprocess.Popen | None = None
 _PROBE_TIMEOUT = 40.0
 
 
+def _harness_fields(text: str) -> str:
+    """The harness's own ``key: value`` lines, without a backend's logging.
+
+    OptiScaler and the NGX driver can write hundreds of timestamped lines to
+    the same stream, which buried the eight lines that answer the question
+    and made the runtime report a wall of text.
+    """
+    kept = [line.rstrip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("[")]
+    return "\n".join(kept).strip() or (text.strip() or "No output.")
+
+
 def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
     """Ask the harness what the installed DLSS runtime can actually do.
 
@@ -494,7 +524,7 @@ def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
         with _PROBE_LOCK:
             if _probe_process is process:
                 _probe_process = None
-    report = (out or err or "").strip() or "No output."
+    report = _harness_fields(out or err or "")
     from . import gpus
     gpus.note_harness_adapter(report)
     return report

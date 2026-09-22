@@ -431,6 +431,15 @@ def write_optiscaler_config(harness_dir: Path, neural: NeuralSettings) -> Path:
         ("ProcessFilter", "TargetProcessName", "dlss5_eval.exe"),
         ("Log", "LogToFile", "true"),
         ("Log", "LogLevel", "2"),
+        # Anything OptiScaler prints to the console lands in the harness's
+        # stdout, which is the app's protocol with it: its log arriving there
+        # reads as a harness that did not start. The file log stays on, and
+        # it is what the app points at when the pass fails.
+        ("Log", "LogToConsole", "false"),
+        ("Log", "LogToNGX", "false"),
+        ("Log", "LogToDebug", "false"),
+        ("Log", "OpenConsole", "false"),
+        ("Log", "SeparateConsole", "false"),
         ("DlssNr", "Enabled", "true" if enabled else "false"),
         # After SR: our evaluation is DLAA, so "after" is the finished frame.
         ("DlssNr", "RunBeforeSR", "false"),
