@@ -4446,11 +4446,17 @@ class MainWindow(QMainWindow):
         self._refresh_settings_runtime()
         return page
 
+    def _neural_tag(self) -> str:
+        return ("OptiScaler · DLAA" if runtime.backend() == "optiscaler"
+                else "RenoDX · DLAA")
+
     def _backend_changed(self, _index: int) -> None:
         name = self.backend_box.currentData() or "renodx"
         self.settings.backend = name
         self.settings.save(paths.settings_path())
         runtime.set_backend(name)
+        if hasattr(self, "neural_card"):
+            self.neural_card.set_tag(self._neural_tag())
         self.passes_row_widget.setVisible(name == "optiscaler")
         self._refresh_settings_runtime()
         self.refresh_runtime_status()
@@ -4481,7 +4487,10 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        neural = ModuleCard("Neural", tag="RenoDX · DLAA")
+        # The tag names the backend actually running the pass, so a user who
+        # switched to OptiScaler is not told RenoDX is doing the work.
+        self.neural_card = ModuleCard("Neural", tag=self._neural_tag())
+        neural = self.neural_card
         self.neural_card = neural
         neural_layout = neural.body
         settings = self.settings.neural

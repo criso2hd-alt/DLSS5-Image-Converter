@@ -32,6 +32,7 @@ import mmap
 import os
 import subprocess
 import threading
+from collections import deque
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -66,8 +67,12 @@ def startup_crash_advice() -> str:
 
 
 #: How many lines of a backend's own logging to skip while waiting for the
-#: harness to say READY.
+#: harness to speak.
 _STARTUP_LINES = 400
+
+#: The words the harness starts its protocol lines with. Anything else on the
+#: stream is a backend's logging (see Harness._read).
+_PROTOCOL_WORDS = frozenset({"READY", "FRAME_OK", "WRITE_OK", "BYE"})
 
 #: Exit codes a crashing harness comes back with. Only the ones we have seen or
 #: can give advice about - anything else is reported as a raw hex code, which is
@@ -184,9 +189,14 @@ class Harness(AbstractContextManager["Harness"]):
         ]
         self._process: subprocess.Popen[str] | None = None
         self.notes = ""
-        #: Lines a backend logged before the harness said READY, kept for
-        #: diagnosis rather than mistaken for the harness talking.
+        #: Lines a backend logged instead of the harness talking, kept for
+        #: diagnosis rather than mistaken for a protocol reply.
         self.startup_noise: list[str] = []
+        #: The tail of the harness's error stream, filled by a reader thread.
+        #: It must be read continuously: a pipe nobody empties fills at 64 KB
+        #: and then blocks the writer, which is a harness frozen mid-frame for
+        #: no reason of its own (OptiScaler writes enough to reach it).
+        self._stderr_tail: deque[str] = deque(maxlen=60)
 
         # Shared-memory colour transport. Only worth setting up for the
         # throughput paths (video, sequence, batch), where the same 66 MB plane
@@ -255,6 +265,7 @@ class Harness(AbstractContextManager["Harness"]):
             raise HarnessError(f"Could not start {self._exe.name}: {error}") from error
 
         _register(self._process)
+        self._drain_stderr(self._process)
         self._starting = True
         try:
             # Anything a backend prints on the way up is skipped: OptiScaler
@@ -321,17 +332,46 @@ class Harness(AbstractContextManager["Harness"]):
 
     # -- protocol ------------------------------------------------------------
 
+    def _drain_stderr(self, process: subprocess.Popen[str]) -> None:
+        """Keep the error stream empty, holding on to its last lines."""
+        if process.stderr is None:
+            return
+
+        def pump() -> None:
+            try:
+                for line in process.stderr:      # ends when the process does
+                    text = line.rstrip()
+                    if text:
+                        self._stderr_tail.append(text)
+            except Exception:  # noqa: BLE001 - a closed pipe ends the thread
+                pass
+
+        threading.Thread(target=pump, daemon=True,
+                         name="harness-stderr").start()
+
     def _read(self) -> str:
+        """The harness's next protocol line, skipping a backend's logging.
+
+        OptiScaler and the NGX driver can write to this same stream at any
+        moment, not only during start-up. A log line arriving mid-conversion
+        used to be taken for the harness's reply, after which each side waited
+        for the other for ever, so anything that is not one of the protocol
+        words is logging and is passed over.
+        """
         process = self._process
         if process is None or process.stdout is None:
             raise HarnessError("The harness is not running.")
-        line = process.stdout.readline()
-        if not line:
-            raise HarnessError(self._died())
-        line = line.strip()
-        if line.startswith("ERROR"):
-            raise HarnessError(line[len("ERROR") :].strip() or "Unknown DLSS failure.")
-        return line
+        for _ in range(_STARTUP_LINES):
+            raw = process.stdout.readline()
+            if not raw:
+                raise HarnessError(self._died())
+            line = raw.strip()
+            if line.startswith("ERROR"):
+                raise HarnessError(line[len("ERROR"):].strip() or "Unknown DLSS failure.")
+            if line.split(" ", 1)[0] in _PROTOCOL_WORDS:
+                return line
+            self.startup_noise.append(line)
+        raise HarnessError("The harness sent only logging, never a reply.")
 
     def _died(self) -> str:
         """Explain a harness that stopped talking without saying why.
@@ -346,8 +386,10 @@ class Harness(AbstractContextManager["Harness"]):
         if process is None:
             return "The harness is not running."
 
-        stderr = ""
-        if process.stderr is not None:
+        stderr = "\n".join(self._stderr_tail)
+        if not stderr and process.stderr is not None:
+            # No reader thread (the process was never spawned through _spawn).
+            # It has stopped talking, so this cannot block.
             try:
                 stderr = process.stderr.read() or ""
             except Exception:  # noqa: BLE001 - a dead pipe must not mask this

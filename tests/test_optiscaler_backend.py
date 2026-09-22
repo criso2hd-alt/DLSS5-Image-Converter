@@ -103,3 +103,21 @@ def test_backend_setting_survives_a_restart(tmp_path):
     s.save(tmp_path / "s.json")
     loaded = AppSettings.load(tmp_path / "s.json")
     assert loaded.backend == "optiscaler" and loaded.neural.passes == 3
+
+
+def test_the_neural_card_names_the_backend(tmp_path, monkeypatch):
+    """The card's tag said RENODX whichever backend was running."""
+    import pytest
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from dlss5_converter import app as app_mod
+    monkeypatch.setattr(app_mod.paths, "settings_path", lambda: tmp_path / "s.json")
+    window = app_mod.MainWindow(first_run_setup=False)
+    try:
+        assert window.neural_card.tag_label.text() == "RenoDX · DLAA"
+        window.backend_box.setCurrentIndex(window.backend_box.findData("optiscaler"))
+        assert window.neural_card.tag_label.text() == "OptiScaler · DLAA"
+    finally:
+        runtime.set_backend("renodx")
+        window.deleteLater()
