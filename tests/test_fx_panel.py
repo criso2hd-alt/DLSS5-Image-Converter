@@ -86,9 +86,28 @@ def test_duplicate_and_remove(page):
     assert page.effects.emitters == [] and not panel.props_card.isVisibleTo(page)
 
 
+def _row(panel, index):
+    return panel.list.itemWidget(panel.list.item(index))
+
+
 def test_unticking_hides_without_removing(page):
-    from PySide6.QtCore import Qt
     panel = page.fx_panel
     panel._add_volume("Smoke")
-    panel.list.item(0).setCheckState(Qt.CheckState.Unchecked)
+    _row(panel, 0).tick.setChecked(False)
     assert page.effects.volumes and not page.effects.volumes[0].enabled
+
+
+def test_the_eye_hides_a_gizmo_but_not_the_effect(page):
+    panel = page.fx_panel
+    panel._add_emitter("Rain")
+    panel._add_lightning()
+    rain, bolt = page.effects.emitters[0], page.effects.strikes[0]
+    page.fx_changed()
+    _row(panel, 0).eye.click()                       # hide the rain's gizmo
+    visible = [i.id for i in page.viewport._effect_items()]
+    assert rain.id not in visible and bolt.id in visible
+    assert rain.enabled                              # still rendered
+    panel.eye_all.click()                            # hide everything
+    assert page.viewport._effect_items() == []
+    panel.eye_all.click()                            # and bring it all back
+    assert {i.id for i in page.viewport._effect_items()} == {rain.id, bolt.id}

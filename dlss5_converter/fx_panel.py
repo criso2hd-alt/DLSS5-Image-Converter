@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QHBoxLayout,
                                QLabel, QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider,
@@ -74,6 +74,9 @@ def kind_of(item) -> str:
         return "plane"
     return "volume" if hasattr(item, "density") else "particles"
 
+
+#: Height of one row in the effects list.
+ROW_H = 32
 
 GLYPHS = {"volume": "☁", "particles": "✦", "lightning": "⚡", "plane": "▭"}
 TYPE_TAGS = {"volume": "VOLUME", "particles": "PARTICLES", "lightning": "WEATHER", "plane": "SURFACE"}
@@ -194,6 +197,81 @@ class KeyDiamond(QToolButton):
         p.drawPolygon(shape)
 
 
+class EyeButton(QToolButton):
+    """Open eye: the gizmo shows in the 3D view. Crossed out: hidden."""
+
+    toggled_eye = Signal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAutoRaise(True)
+        self.setCheckable(True)
+        self.setChecked(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(24, 22)
+        self._hover = False
+        self.toggled.connect(self._changed)
+        self._changed(True)
+
+    def _changed(self, on: bool) -> None:
+        self.setToolTip("Gizmo shown in the 3D view. Click to hide it (it still renders)."
+                        if on else "Gizmo hidden. Click to show it in the 3D view again.")
+        self.update()
+        self.toggled_eye.emit(on)
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt override
+        from PySide6.QtCore import QPointF, QRectF
+        from PySide6.QtGui import QPainter, QPainterPath, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        on = self.isChecked()
+        colour = QColor("#ffffff" if self._hover else ("#9fb0cc" if on else "#4d566b"))
+        cx, cy = self.width() / 2, self.height() / 2
+        eye = QPainterPath()
+        eye.moveTo(cx - 8, cy)
+        eye.quadTo(cx, cy - 7, cx + 8, cy)
+        eye.quadTo(cx, cy + 7, cx - 8, cy)
+        p.setPen(QPen(colour, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(eye)
+        p.setBrush(colour)
+        p.drawEllipse(QRectF(cx - 2.4, cy - 2.4, 4.8, 4.8))
+        if not on:
+            p.setPen(QPen(colour, 1.8))
+            p.drawLine(QPointF(cx - 7, cy + 6), QPointF(cx + 7, cy - 6))
+
+
+class _ListRow(QWidget):
+    """One effect in the list: on/off tick, icon and name, gizmo eye."""
+
+    def __init__(self, text: str, enabled: bool, shown: bool, parent: QWidget | None = None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 0, 4, 0)
+        row.setSpacing(6)
+        self.tick = QCheckBox()
+        self.tick.setChecked(enabled)
+        self.tick.setToolTip("Render this effect. Untick to switch it off without removing it.")
+        label = QLabel(text)
+        # Clicks on the name must reach the list, which does the selecting.
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.eye = EyeButton()
+        self.eye.setChecked(shown)
+        row.addWidget(self.tick)
+        row.addWidget(label, 1)
+        row.addWidget(self.eye)
+
+
 class FxSlider(QWidget):
     """Name, editable value and keyframe diamond over a full-width slider."""
 
@@ -291,6 +369,8 @@ class FxPanel(QWidget):
         super().__init__(parent)
         self.owner = owner
         self._item_id: str | None = None
+        #: Effects whose gizmo is switched off in the 3D view (editor only).
+        self._hidden: set[str] = set()
         self._sliders: dict[str, FxSlider] = {}
         self._rows: dict[str, _Row] = {}
         outer = QVBoxLayout(self)
@@ -308,20 +388,23 @@ class FxPanel(QWidget):
         self.key_all.setObjectName("secondary")
         self.key_all.setToolTip("Keyframe every effect's current settings at the playhead.")
         self.key_all.clicked.connect(self._key_all)
+        self.eye_all = EyeButton()
+        self.eye_all.setToolTip("Show or hide every effect's gizmo in the 3D view.")
+        self.eye_all.clicked.connect(self._eye_all_clicked)
         buttons.addWidget(self.add_button, 1)
         buttons.addWidget(self.key_all)
+        buttons.addWidget(self.eye_all)
         self.list_card.add_layout(buttons)
         self.list = QListWidget()
         # Selection as a quiet panel with an accent edge, like the tabs; the
         # global bright highlight made white text unreadable here.
         self.list.setStyleSheet(
             "QListWidget { background: transparent; border: none; outline: none; }"
-            "QListWidget::item { padding: 5px 6px; border-radius: 6px; color: #c9d1e0; }"
+            "QListWidget::item { margin: 1px 0; border-radius: 6px; color: #c9d1e0; }"
             "QListWidget::item:hover { background: #172033; }"
             "QListWidget::item:selected { background: #1d2940; color: #ffffff;"
             " border-left: 3px solid #35d6f5; }")
         self.list.currentItemChanged.connect(lambda *_: self._selected())
-        self.list.itemChanged.connect(self._list_toggled)
         self.list_card.add(self.list)
         self.empty_hint = QLabel("Add fog, particles, rain or lightning, then place them "
                                  "in the 3D view with the gizmo.")
@@ -396,12 +479,15 @@ class FxPanel(QWidget):
         self.list.clear()
         current = None
         for item in self.owner.effects.items():
-            li = QListWidgetItem(f"{GLYPHS[kind_of(item)]}   {item.name}")
+            li = QListWidgetItem()
             li.setData(Qt.ItemDataRole.UserRole, item.id)
-            li.setFlags(li.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            li.setCheckState(Qt.CheckState.Checked if item.enabled else Qt.CheckState.Unchecked)
-            li.setToolTip("Tick to show, untick to hide without removing it.")
             self.list.addItem(li)
+            row = _ListRow(f"{GLYPHS[kind_of(item)]}   {item.name}", item.enabled,
+                           item.id not in self._hidden)
+            row.tick.toggled.connect(lambda on, i=item.id: self._set_enabled(i, on))
+            row.eye.toggled_eye.connect(lambda on, i=item.id: self._set_shown(i, on))
+            li.setSizeHint(QSize(0, ROW_H))
+            self.list.setItemWidget(li, row)
             if item.id == self._item_id:
                 current = li
         self.list.blockSignals(False)
@@ -409,7 +495,7 @@ class FxPanel(QWidget):
         self.list.setVisible(has)
         # Exactly as tall as its rows (up to six), so the card never shows an
         # empty well under a short list.
-        self.list.setFixedHeight(min(self.list.count(), 6) * 30 + 4)
+        self.list.setFixedHeight(min(self.list.count(), 6) * (ROW_H + 2) + 6)
         self.empty_hint.setVisible(not has)
         if current is not None:
             self.list.setCurrentItem(current)
@@ -417,11 +503,30 @@ class FxPanel(QWidget):
             self._item_id = None
         self._selected()
 
-    def _list_toggled(self, li: QListWidgetItem) -> None:
-        item = self.owner.effects.item(li.data(Qt.ItemDataRole.UserRole))
+    def _set_enabled(self, item_id: str, on: bool) -> None:
+        item = self.owner.effects.item(item_id)
         if item is not None:
-            item.enabled = li.checkState() == Qt.CheckState.Checked
+            item.enabled = on
             self.owner.fx_changed()
+
+    def _set_shown(self, item_id: str, on: bool) -> None:
+        if on:
+            self._hidden.discard(item_id)
+        else:
+            self._hidden.add(item_id)
+        self.owner.viewport.set_hidden_effects(self._hidden)
+        # The header eye is open until every gizmo is hidden, so its first
+        # click always declutters (hides the rest) rather than undoing work.
+        everything = {i.id for i in self.owner.effects.items()}
+        self.eye_all.blockSignals(True)
+        self.eye_all.setChecked(not everything or not everything <= self._hidden)
+        self.eye_all.blockSignals(False)
+
+    def _eye_all_clicked(self) -> None:
+        on = self.eye_all.isChecked()
+        self._hidden = set() if on else {i.id for i in self.owner.effects.items()}
+        self.owner.viewport.set_hidden_effects(self._hidden)
+        self._refresh_list()
 
     def select(self, item_id: str) -> None:
         for i in range(self.list.count()):
