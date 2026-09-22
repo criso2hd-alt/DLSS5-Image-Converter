@@ -60,6 +60,7 @@ from . import (
 )
 from . import __version__
 from . import hdr as hdr_mod
+from . import gpus
 from . import onnx_depth
 from .creative_page import CreativePage
 from .depth_engine import MODELS, DepthEngine
@@ -2785,6 +2786,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 560)
 
         self.settings = AppSettings.load(paths.settings_path())
+        gpus.set_preference(self.settings.gpu)
+        gpus.note_harness_adapter(f"adapter: {self.settings.dlss_adapter}")
         # One engine for the window's lifetime. Reloading Depth Anything per
         # image would add several seconds and a gigabyte of churn to every run.
         # ONNX Runtime, not PyTorch: same depth, no 2.7 GB torch download, and
@@ -4134,6 +4137,42 @@ class MainWindow(QMainWindow):
         colour.setAlpha(150)
         self._convert_glow.setColor(colour)
 
+    def _add_gpu_picker(self, card) -> None:
+        """GPU choice, only on machines with more than one card.
+
+        It moves the app's own GPU work. The DLSS pass cannot be moved from
+        here (NGX refuses a device made on a named adapter, see gpus.py), so
+        the hint says where that one is set and which card it is on now."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel("GPU for 3D and AI models"))
+        self.gpu_box = QComboBox()
+        self.gpu_box.addItem("Automatic (same GPU as DLSS)", "")
+        for gpu in gpus.list_gpus():
+            self.gpu_box.addItem(gpu.label, gpu.name)
+        current = self.gpu_box.findData(self.settings.gpu)
+        self.gpu_box.setCurrentIndex(current if current >= 0 else 0)
+        self.gpu_box.setToolTip(
+            "Where the 3D view, SHARP, background fill, depth and AI upscale run. "
+            "Keep it on the card DLSS uses, so everything shares one GPU's memory.")
+        self.gpu_box.currentIndexChanged.connect(self._gpu_changed)
+        row.addStretch(1)
+        row.addWidget(self.gpu_box, 1)
+        card.add_layout(row)
+        dlss_on = gpus.harness_adapter() or "not checked yet"
+        hint = QLabel(
+            f"DLSS runs on: {dlss_on}. To move DLSS itself, set this app to your "
+            "preferred GPU in Windows Settings > System > Display > Graphics. "
+            "A change here applies after restarting the app.")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        card.add(hint)
+
+    def _gpu_changed(self, _index: int) -> None:
+        self.settings.gpu = self.gpu_box.currentData() or ""
+        self.settings.save(paths.settings_path())
+        gpus.set_preference(self.settings.gpu)
+        self.statusBar().showMessage("GPU choice saved. Restart the app to apply it.")
+
     def _theme_changed(self, _index: int) -> None:
         name = self.theme_box.currentData() or DEFAULT_THEME
         self.settings.theme = name
@@ -4300,6 +4339,8 @@ class MainWindow(QMainWindow):
         r_buttons.addWidget(check_btn)
         r_buttons.addStretch(1)
         runtime_grp.add_layout(r_buttons)
+        if gpus.multiple():
+            self._add_gpu_picker(runtime_grp)
 
         # HDR / display and Depth live in the single-image sidebar now (see
         # _hdr_card and _depth_card), not here — people went looking for them in
@@ -5382,6 +5423,9 @@ class MainWindow(QMainWindow):
 
     def _background_probe_done(self, ok: bool, report: str) -> None:
         self._runtime_probe = None
+        if gpus.harness_adapter() and gpus.harness_adapter() != self.settings.dlss_adapter:
+            self.settings.dlss_adapter = gpus.harness_adapter()
+            self.settings.save(paths.settings_path())
         if ok:
             self.statusBar().showMessage("DLSS 5 verified — the neural pass is live.")
             return

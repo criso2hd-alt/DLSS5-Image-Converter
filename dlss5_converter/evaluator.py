@@ -463,7 +463,10 @@ def probe(exe: Path, timeout: float = _PROBE_TIMEOUT) -> str:
         with _PROBE_LOCK:
             if _probe_process is process:
                 _probe_process = None
-    return (out or err or "").strip() or "No output."
+    report = (out or err or "").strip() or "No output."
+    from . import gpus
+    gpus.note_harness_adapter(report)
+    return report
 
 
 def interpret_probe(report: str) -> list[str]:

@@ -11,7 +11,7 @@ MIB = 1024 * 1024
 
 @dataclass(frozen=True)
 class VramInfo:
-    """The first NVIDIA GPU reported by the installed driver."""
+    """The NVIDIA GPU the app runs on (see gpus.selected), per the driver."""
 
     name: str
     total_bytes: int
@@ -45,7 +45,8 @@ def query_nvidia_vram() -> VramInfo | None:
     if result.returncode != 0:
         return None
 
-    line = next((line for line in result.stdout.splitlines() if line.strip()), "")
+    from . import gpus
+    line = gpus.pick_smi_line(result.stdout.splitlines())
     parts = [part.strip() for part in line.split(",")]
     if len(parts) < 4:
         return None

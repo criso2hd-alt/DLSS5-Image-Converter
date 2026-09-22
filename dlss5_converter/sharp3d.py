@@ -70,13 +70,14 @@ def _session():
         if _SESSION is None:
             import onnxruntime as ort
             from .onnx_depth import _providers
+            from . import gpus
             so = ort.SessionOptions()
             so.log_severity_level = 3
             path = download()
             last = None
             for prov in _providers():
                 try:
-                    _SESSION = ort.InferenceSession(path, sess_options=so, providers=[prov])
+                    _SESSION = ort.InferenceSession(path, sess_options=so, providers=gpus.ort_providers([prov]))
                     break
                 except Exception as error:  # noqa: BLE001 - try the next provider
                     last = error

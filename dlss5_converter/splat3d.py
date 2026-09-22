@@ -912,7 +912,8 @@ class SplatRenderer:
         import wgpu
         self._wgpu = wgpu
         if device is None:
-            adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+            from . import gpus
+            adapter = gpus.wgpu_adapter()
             limits = adapter.limits
             device = adapter.request_device_sync(required_limits={
                 "max-storage-buffer-binding-size": limits["max-storage-buffer-binding-size"],

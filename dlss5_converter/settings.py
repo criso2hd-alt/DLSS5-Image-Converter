@@ -325,6 +325,12 @@ class AppSettings:
     #: Zero only for a fresh install. Completing or skipping the introduction
     #: writes the current version so normal launches go straight to work.
     onboarding_version: int = 0
+    #: The GPU for the app's own GPU work (3D, depth, SHARP, fill, upscale) by
+    #: adapter name. Empty follows the card DLSS runs on. See gpus.py.
+    gpu: str = ""
+    #: The adapter the last runtime check said DLSS runs on, remembered so the
+    #: automatic choice is right from launch, before this session's check ends.
+    dlss_adapter: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)

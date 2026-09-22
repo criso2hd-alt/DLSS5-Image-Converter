@@ -221,10 +221,11 @@ class UpscaleEngine:
                 "Download it or point the app at the .onnx file."
             )
         import onnxruntime as ort
+        from . import gpus
 
         options = ort.SessionOptions()
         session = ort.InferenceSession(
-            str(path), sess_options=options, providers=_providers(model.fp32_only)
+            str(path), sess_options=options, providers=gpus.ort_providers(_providers(model.fp32_only))
         )
         self._session = session
         self._model = model
