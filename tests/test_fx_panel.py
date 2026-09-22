@@ -128,3 +128,10 @@ def test_strike_at_playhead_adds_marks_and_removes(page):
     assert item.strike_times == [1.25]
     panel._clear_strikes()
     assert item.strike_times == [] and page.timeline.markers == []
+
+
+def test_puddle_mirror_toggle(page):
+    panel = page.fx_panel
+    assert panel.mirror_box.isChecked() and page.effects.lighting.puddle_mirror
+    panel.mirror_box.setChecked(False)
+    assert page.effects.lighting.puddle_mirror is False

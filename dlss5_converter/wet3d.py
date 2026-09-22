@@ -29,7 +29,7 @@ struct WU {
     inv_view: mat4x4<f32>,
     size: vec4<f32>,     // x width, y height, z time
     amount: vec4<f32>,   // x wetness, y puddles, z ripples, w puddle size
-    up: vec4<f32>,       // xyz world up
+    up: vec4<f32>,       // xyz world up, w 1 = mirror fallback in puddles
 };
 @group(0) @binding(0) var<uniform> u: WU;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -185,6 +185,26 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
             t=t*1.1+0.012;
         }
     }
+    if (got<=0.0 && puddle>0.01 && u.up.w>0.5) {
+        // Mirror fallback: flip the image across the horizon, the classic fake
+        // reflection. It shows what is above the puddle even when the true ray
+        // leaves the frame (sky, rooftops), which real photos do constantly.
+        let fwd=vec3(0.0,0.0,-1.0);
+        let along=normalize(fwd-up_v*dot(fwd,up_v)+vec3(0.0,1e-5,0.0));
+        let hc=u.proj*vec4(along*1000.0,1.0);
+        let horizon=(0.5-(hc.y/hc.w)*0.5)*u.size.y;
+        let mx=clamp(fp.x+bend.x*40.0, 0.0, u.size.x-1.0);
+        let my=2.0*horizon-fp.y;
+        // Mirrored past the top of the frame: keep using the top rows (the
+        // classic trick) rather than fading, or low puddles stay empty.
+        let top_fade=mix(0.7,1.0,clamp((my+0.1*u.size.y)/(0.1*u.size.y),0.0,1.0));
+        let mc=vec2<i32>(i32(mx), i32(clamp(my,2.0,u.size.y-1.0)));
+        let ms=textureLoad(src, mc, 0);
+        if (ms.a>0.05 && my<fp.y) {
+            refl=ms.rgb/max(ms.a,1e-4);
+            got=puddle*top_fade*ms.a;
+        }
+    }
     if (got<=0.0) { refl=last; got=last_w; }
     rgb=mix(rgb, refl, strength*got);
     return vec4(rgb*here.a, here.a);
@@ -244,6 +264,7 @@ class WetPass:
         v[52:56] = (float(lighting.wetness), float(lighting.puddles),
                     float(lighting.ripples), float(lighting.puddle_size))
         v[56:59] = up
+        v[59] = 1.0 if getattr(lighting, "puddle_mirror", True) else 0.0
         self.device.queue.write_buffer(self._uniform, 0, v.tobytes())
         bind = self.device.create_bind_group(layout=self._layout, entries=[
             {"binding": 0, "resource": {"buffer": self._uniform}},

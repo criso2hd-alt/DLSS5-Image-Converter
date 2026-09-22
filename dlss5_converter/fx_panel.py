@@ -444,6 +444,13 @@ class FxPanel(QWidget):
             s.key_clicked.connect(lambda f=prop.field: self._toggle_env_key(f))
             self._env_sliders[prop.field] = s
             self.wet_card.add(s)
+        self.mirror_box = QCheckBox("Mirror puddles when the reflection leaves the frame")
+        self.mirror_box.setToolTip(
+            "A true reflection can only show what is in the picture. With this on, a "
+            "puddle whose reflection would come from outside the frame (sky, rooftops) "
+            "shows the image mirrored across the horizon instead.")
+        self.mirror_box.toggled.connect(self._mirror_toggled)
+        self.wet_card.add(self.mirror_box)
         note = QLabel("Wet ground reflects the scene, most strongly at low angles. "
                       "Reflections only show what is in frame.")
         note.setObjectName("hint")
@@ -959,11 +966,18 @@ class FxPanel(QWidget):
     def _sync_env(self) -> None:
         lighting = self.owner.effects_at(self.owner.time).lighting
         track, t = self.owner.effects_track, self.owner.time
+        self.mirror_box.blockSignals(True)
+        self.mirror_box.setChecked(bool(getattr(lighting, "puddle_mirror", True)))
+        self.mirror_box.blockSignals(False)
         for field, slider in self._env_sliders.items():
             slider.set_value(float(getattr(lighting, field)))
             path = self._env_path(field)
             slider.diamond.set_state("keyed" if track.is_keyed(t, path) else
                                      "animated" if track.is_animated(path) else "none")
+
+    def _mirror_toggled(self, on: bool) -> None:
+        self.owner.effects.lighting.puddle_mirror = bool(on)
+        self.owner.fx_changed()
 
     def set_env(self, field: str, value: float) -> None:
         track, t = self.owner.effects_track, self.owner.time

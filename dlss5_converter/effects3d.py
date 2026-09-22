@@ -40,6 +40,9 @@ class LightingSettings:
     ripples: float = 0.6
     #: Size of the puddle patches.
     puddle_size: float = 1.0
+    #: Where a puddle's reflection finds nothing in frame, mirror the image
+    #: across the horizon instead (see wet3d). Off keeps only true hits.
+    puddle_mirror: bool = True
 
 
 @dataclass(slots=True)
