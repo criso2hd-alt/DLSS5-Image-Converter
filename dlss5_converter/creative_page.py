@@ -504,7 +504,11 @@ class CreativePage(QWidget):
 
     def _card(self, title: str) -> tuple[QFrame, QVBoxLayout]:
         # The app's titled card, so this rail reads like the rest of the app.
+        # Tighter side padding than the main sidebar's: this rail is narrower,
+        # and the card's own 16 px each side pushed slider values and their
+        # keyframe diamonds past the right edge.
         card = ModuleCard(title)
+        card.body.setContentsMargins(12, 12, 12, 13)
         card.body.setSpacing(8)
         return card, card.body
 
@@ -597,7 +601,10 @@ class CreativePage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(340)
+        # Wide enough for a slider row's label, value and keyframe diamond
+        # without clipping; the effects panel needs more room than the old
+        # plain-form rail did.
+        scroll.setFixedWidth(392)
         return scroll
 
     def _empty_text(self) -> str:

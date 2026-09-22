@@ -196,3 +196,24 @@ def test_stream_merger_cleans_up_its_scratch(tmp_path):
     list(merger.rows())
     merger.close()
     assert not list(tmp_path.glob("*.dat"))  # memmap files removed
+
+
+def test_a_tile_is_never_planned_absurdly_small():
+    """With little free VRAM the affordable side went to 0 and Ultra planned
+    one-pixel tiles: 80 million for a 12k image, and a frozen window while the
+    size label built them all."""
+    from dlss5_converter import tiling
+    factor, tile_max, overlap = tiling.auto_ultra(
+        1920, 1040, requested_factor=0.0, ram_free=32 * 1024**3,
+        vram_free=300 * 1024**2)          # 300 MB free: not enough for a tile
+    assert tile_max >= tiling.MIN_TILE_SIDE
+    assert overlap < tile_max
+    assert tiling.count_tiles(int(1920 * factor), int(1040 * factor), tile_max, overlap) < 10_000
+
+
+def test_count_tiles_matches_plan_tiles():
+    from dlss5_converter import tiling
+    for w, h, tile, overlap in ((1920, 1080, 512, 64), (4000, 2000, 1024, 128),
+                                (900, 400, 1024, 128), (5000, 5000, 2048, 256)):
+        assert tiling.count_tiles(w, h, tile, overlap) == len(
+            tiling.plan_tiles(w, h, tile, overlap)), (w, h, tile, overlap)

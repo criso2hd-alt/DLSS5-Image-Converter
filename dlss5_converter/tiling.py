@@ -56,6 +56,14 @@ DEFAULT_OVERLAP_FRACTION = 0.125
 #: seam, so a small tile still gets a usable band.
 MIN_OVERLAP = 32
 
+#: Smallest tile side Ultra will ever plan. Free VRAM is a moving target (a
+#: browser, the 3D tab or another app can take most of it for a moment), and
+#: the affordable side went to 0 when it was low, which planned one-pixel
+#: tiles: 80 million of them for a 12k image, and minutes of a frozen window.
+#: Below this the machine cannot do Ultra at all, and saying so beats planning
+#: something absurd; the runtime is the authority on what it can allocate.
+MIN_TILE_SIDE = 512
+
 #: VRAM model for one evaluation at a given working size, mirroring pipeline's
 #: Boost preflight so a tile is sized against the same estimate the whole-image
 #: path uses. Fixed cost plus a per-pixel term above the harness's 24 B/px floor.
@@ -192,12 +200,34 @@ def auto_ultra(
         factor = ceiling
     factor = max(1.0, factor)
 
-    tile_max = max(1, min(int(tile_ceiling), _vram_side_limit(vram_free)))
+    tile_max = max(MIN_TILE_SIDE, min(int(tile_ceiling), _vram_side_limit(vram_free)))
     overlap = max(MIN_OVERLAP, int(tile_max * DEFAULT_OVERLAP_FRACTION))
     # Overlap must leave forward progress: a tile has to advance by at least one
     # pixel past the overlap, or plan_tiles would never reach the far edge.
     overlap = min(overlap, max(0, tile_max - 1))
     return factor, tile_max, overlap
+
+
+def count_tiles(width: int, height: int, tile_max: int, overlap: int) -> int:
+    """How many tiles plan_tiles would make, without making them.
+
+    The size label only ever wanted the number, and building the list to count
+    it is what froze the window when a tile came out tiny.
+    """
+    if tile_max <= 0:
+        raise ValueError("tile_max must be positive")
+    overlap = max(0, min(int(overlap), tile_max - 1))
+    step = max(1, tile_max - overlap)
+
+    def count(extent: int) -> int:
+        if extent <= tile_max:
+            return 1
+        whole = (extent - tile_max) // step + 1
+        # plan_tiles adds one more flush with the far edge when the last step
+        # does not land on it.
+        return whole + (1 if (extent - tile_max) % step else 0)
+
+    return count(width) * count(height)
 
 
 def plan_tiles(width: int, height: int, tile_max: int, overlap: int) -> list[Tile]:
