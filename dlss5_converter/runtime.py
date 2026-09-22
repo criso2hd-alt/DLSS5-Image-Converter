@@ -28,7 +28,8 @@ from .settings import (
 #: evaluation: the RenoDX ReShade add-on, or the OptiScaler Neural Rendering
 #: fork (which drives the same nvngx_dlssnr.dll itself).
 BACKENDS = ("renodx", "optiscaler")
-BACKEND_LABELS = {"renodx": "RenoDX add-on (ReShade)", "optiscaler": "OptiScaler Neural Rendering"}
+BACKEND_LABELS = {"renodx": "RenoDX add-on (ReShade)",
+                  "optiscaler": "OptiScaler (experimental, no effect yet)"}
 _backend = "renodx"
 
 

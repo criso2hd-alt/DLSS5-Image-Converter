@@ -148,6 +148,18 @@ That is also the answer when the runtime check shows `dlssnr_module_loaded: 0`
 while every other line reads `1`. The file is present and found; the add-on
 refused it.
 
+### Neural backend (experimental)
+
+**Settings > DLSS runtime > Neural backend** offers a second way to run the
+neural pass: the [OptiScaler Neural Rendering](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass)
+release, extracted into `dlss_files\optiscaler`, instead of ReShade and the
+RenoDX add-on. It uses the same `nvngx_dlssnr.dll` you already have.
+
+**It does not work yet.** OptiScaler loads, takes the app's settings and runs
+the model, but its result does not reach the converted image, so conversions
+come out unchanged. It is in this release so people can follow along while we
+work out why. **Use RenoDX for real conversions.**
+
 ### Two GPUs
 
 On a PC with more than one GPU (a laptop with an external card, for example),

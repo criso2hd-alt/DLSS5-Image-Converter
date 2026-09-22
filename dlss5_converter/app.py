@@ -4333,10 +4333,11 @@ class MainWindow(QMainWindow):
         found = self.backend_box.findData(self.settings.backend)
         self.backend_box.setCurrentIndex(found if found >= 0 else 0)
         self.backend_box.setToolTip(
-            "RenoDX: the ReShade add-on (dxgi.dll + renodx-dlss5.addon64 in dlss_files).\n\n"
-            "OptiScaler: the OptiScaler Neural Rendering release, extracted into "
-            "dlss_files\\optiscaler. Try it if the RenoDX add-on does not attach. "
-            "Both use your nvngx_dlssnr.dll and nvngx_dlss.dll.")
+            "RenoDX: the ReShade add-on (dxgi.dll + renodx-dlss5.addon64 in dlss_files). "
+            "This is the one that works.\n\n"
+            "OptiScaler: experimental. It loads and runs the neural model, but the result "
+            "does not reach the converted image yet, so the output looks untouched. "
+            "Under investigation; use RenoDX for real conversions.")
         self.backend_box.currentIndexChanged.connect(self._backend_changed)
         backend_row.addStretch(1)
         backend_row.addWidget(self.backend_box, 1)
@@ -4358,6 +4359,14 @@ class MainWindow(QMainWindow):
         self.passes_row_widget.setLayout(passes_row)
         runtime_grp.add(self.passes_row_widget)
         self.passes_row_widget.setVisible(self.settings.backend == "optiscaler")
+        self.backend_note = QLabel(
+            "OptiScaler is experimental: it starts and runs the neural model, but its "
+            "result does not reach the image yet, so conversions come out unchanged. "
+            "We are investigating. Use RenoDX for real work.")
+        self.backend_note.setObjectName("hint")
+        self.backend_note.setWordWrap(True)
+        self.backend_note.setVisible(self.settings.backend == "optiscaler")
+        runtime_grp.add(self.backend_note)
 
         self.settings_runtime_status = QLabel("")
         self.settings_runtime_status.setObjectName("hint")
@@ -4458,6 +4467,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "neural_card"):
             self.neural_card.set_tag(self._neural_tag())
         self.passes_row_widget.setVisible(name == "optiscaler")
+        self.backend_note.setVisible(name == "optiscaler")
         self._refresh_settings_runtime()
         self.refresh_runtime_status()
         self.statusBar().showMessage(
