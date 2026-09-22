@@ -4809,7 +4809,7 @@ class MainWindow(QMainWindow):
             max_factor=self.settings.detail.ultra_max_factor,
         )
         bw, bh = max(w, int(round(w * factor))), max(h, int(round(h * factor)))
-        n_tiles = len(tiling.plan_tiles(bw, bh, tile_max, overlap))
+        n_tiles = tiling.count_tiles(bw, bh, tile_max, overlap)
         mp = (bw * bh) / 1_000_000
         tiles_word = "tile" if n_tiles == 1 else "tiles"
         prefix = "Max → " if requested <= 0.0 else ""
