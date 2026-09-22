@@ -9,7 +9,9 @@ Volumes are raymarched inside an oriented box: 40 steps of fbm noise shaped per
 kind (fog, smoke, fire, cloud, god rays), stopping at the first splat surface
 and thinning as they approach it so fog touches a wall instead of being cut by
 it. Particles are camera-facing sprites animated entirely in the vertex shader
-(no CPU state per particle), hidden where a surface is nearer.
+(no CPU state per particle), hidden where a surface is nearer. Each kind has
+its own sprite shape and colour over life (embers cool from white hot to ash),
+and glowing ones blend additively.
 
 This runs through wgpu (D3D12/Vulkan), which on an NVIDIA card is the same GPU
 CUDA would use. CUDA would add a large dependency and a copy between the two
@@ -150,29 +152,51 @@ struct PU {
     style: vec4<f32>,        // x opacity, y plane count, z bounce, w growth
     dir: vec4<f32>,          // xyz travel direction, w drag
     planes: array<vec4<f32>, 4>,   // collision planes n.p + c >= 0 is free space
+    light: vec4<f32>,        // xyz key light direction (towards the light)
 };
 @group(0) @binding(0) var<uniform> u: PU;
 @group(0) @binding(1) var scene_depth: texture_2d<f32>;
+
+const SMOKE: i32 = 0;
+const FIRE: i32 = 1;
+const EMBERS: i32 = 2;
+const DUST: i32 = 3;
+const SNOW: i32 = 4;
+const CLOUDS: i32 = 5;
+// Embers glow until COOL_START of their life and are fully ash by ASH_AT.
+const COOL_START: f32 = 0.18;
+const ASH_AT: f32 = 0.62;
+
 fn hash(n:f32)->f32{return fract(sin(n)*43758.5453);}
-struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@location(1) fade:f32,
-           @location(2) depth:f32};
+fn h2(p:vec2<f32>)->f32{return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+fn vnoise(p:vec2<f32>)->f32{
+    let i=floor(p); let f=fract(p); let w=f*f*(3.0-2.0*f);
+    return mix(mix(h2(i),h2(i+vec2(1.0,0.0)),w.x),
+               mix(h2(i+vec2(0.0,1.0)),h2(i+vec2(1.0,1.0)),w.x),w.y);
+}
+fn fbm(p:vec2<f32>)->f32{
+    var a=0.5; var s=0.0; var q=p;
+    for (var i=0; i<4; i=i+1) { s+=a*vnoise(q); q=q*2.03+vec2(1.7,9.2); a*=0.5; }
+    return s;
+}
+fn kind()->i32{return i32(u.ambient_kind.w+0.5);}
 
-// Stateless physics: every particle's position is a closed-form function of
-// its age, so nothing is simulated per frame on the CPU and a frame at any
-// time (scrubbing, export) is exact.
-@vertex fn vs_main(@builtin(vertex_index) vi:u32)->Out{
-    let id=f32(vi/6u); let corner=vi%6u;
-    var quad=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
-    let q=quad[corner]; let phase=hash(id*19.19+u.physics.w);
-    let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let s=age*u.motion.y;
-
-    // Travel axis chosen by the user, and two axes across it for the cone.
+struct Axes{dir:vec3<f32>, side:vec3<f32>, side2:vec3<f32>};
+fn axes()->Axes{
     let dir=normalize(u.dir.xyz + vec3(1e-6, 0.0, 0.0));
     var helper=vec3(1.0,0.0,0.0);
     if (abs(dir.x) > 0.9) { helper=vec3(0.0,0.0,1.0); }
     let side=normalize(cross(dir,helper));
-    let side2=cross(dir,side);
+    return Axes(dir, side, cross(dir,side));
+}
 
+// Stateless physics: every particle's position is a closed-form function of
+// its age, so nothing is simulated per frame on the CPU and a frame at any
+// time (scrubbing, export) is exact. A function rather than inline code so
+// the vertex stage can evaluate it twice and get a velocity for streaks.
+fn position_at(id:f32, s:f32)->vec3<f32>{
+    let ax=axes();
+    let age=clamp(s/max(u.motion.y,0.01),0.0,1.0);
     let random=vec3(hash(id*7.1)-.5,hash(id*13.7)-.5,hash(id*31.3)-.5);
     // Spawn anywhere in the emitter's box, exactly the box drawn in the
     // editor; spread only fans particles out as they travel.
@@ -182,21 +206,31 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@loca
     // a constant push along the axis (buoyancy, or gravity when negative).
     let k=max(u.dir.w,1e-3);
     let launch=u.motion.w*(1.0-exp(-k*s))/k;
-    p+=dir*(launch+0.5*u.physics.y*s*s);
+    p+=ax.dir*(launch+0.5*u.physics.y*s*s);
     // Each particle leaves at its own angle; the plume widens with age,
     // faster for kinds that grow (smoke spreads as it rises).
-    let cone=(hash(id*3.3)-.5)*side+(hash(id*5.9)-.5)*side2;
+    let cone=(hash(id*3.3)-.5)*ax.side+(hash(id*5.9)-.5)*ax.side2;
     p+=cone*(abs(launch)*0.6+0.05*s)*u.physics.x*(1.0+u.style.w*age);
 
     // Turbulence: a swirling field of layered sines through space and time,
     // stronger as a particle ages, so smoke curls and breaks up instead of
     // rising in straight lines.
     let tq=u.physics.z;
-    let f=p*1.7+dir*(s*0.6);
+    let f=p*1.7+ax.dir*(s*0.6);
     let curl=vec3(sin(f.y*2.1+s*1.3+id)+0.5*sin(f.z*3.7+s*0.7),
                   sin(f.z*1.9+s*1.1)+0.5*sin(f.x*2.9+id*0.3),
                   sin(f.x*2.3+s*0.9)+0.5*sin(f.y*3.1+id));
     p+=curl*tq*0.09*(0.25+age);
+
+    // Ash: a cooled ember loses the heat that carried it up. From the moment
+    // it turns to ash it is pulled back down (against the travel direction,
+    // which for embers is up) and flutters side to side like a flake, so it
+    // settles on the floor instead of rising forever.
+    if (kind()==EMBERS) {
+        let t=max(s-ASH_AT*u.motion.y,0.0);
+        p-=ax.dir*(0.5*(max(u.physics.y,0.0)+0.35)*t*t + u.motion.w*0.25*t);
+        p+=(ax.side*sin(t*4.1+id)+ax.side2*cos(t*3.3+id*1.7))*0.05*t;
+    }
 
     // Collisions with the scene's floor, walls and ceiling. A particle that
     // ends up on the wrong side is put back on the surface (slides along it)
@@ -208,13 +242,76 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@loca
         let d=dot(pl.xyz,p)+pl.w;
         if (d<0.0) { p-=pl.xyz*d*(1.0+u.style.z); }
     }
-
-    let size=u.motion.z*(0.35+sin(age*3.14159)*0.9)*(1.0+u.style.w*age);
-    let centre_depth = -(dot(u.view_z.xyz, p) + u.view_z.w);
-    p+=u.right.xyz*q.x*size+u.up.xyz*q.y*size;
-    var out:Out; out.position=u.vp*vec4(p,1); out.uv=q; out.fade=sin(age*3.14159);
-    out.depth=centre_depth; return out;
+    return p;
 }
+
+struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
+           @location(1) age:f32, @location(2) depth:f32, @location(3) rnd:f32};
+
+@vertex fn vs_main(@builtin(vertex_index) vi:u32)->Out{
+    let id=f32(vi/6u); let corner=vi%6u;
+    var quad=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
+    let q=quad[corner]; let phase=hash(id*19.19+u.physics.w);
+    let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let s=age*u.motion.y;
+    let p=position_at(id,s);
+    let kd=kind();
+
+    var size=u.motion.z*(0.35+sin(age*3.14159)*0.9)*(1.0+u.style.w*age);
+    if (kd==EMBERS) {
+        // Sparks stay small and shrink as they cool; the ash flake left
+        // behind is a little bigger than the spark was.
+        let ash=smoothstep(COOL_START,ASH_AT,age);
+        size=u.motion.z*mix(1.0-0.35*age,1.35,ash);
+    } else if (kd==SNOW || kd==DUST) {
+        size=u.motion.z*(0.8+0.4*hash(id*2.7));
+    }
+
+    // Motion streak: stretch the sprite along its on-screen velocity, the
+    // way a camera shutter smears anything fast and bright. Only glowing
+    // embers and fire; ash and smoke are too slow to smear.
+    var along=vec2(1.0,0.0); var stretch=1.0;
+    if (kd==EMBERS || kd==FIRE) {
+        let dt=1.0/30.0;
+        let v=(p-position_at(id,max(s-dt,0.0)))/dt;
+        let sv=vec2(dot(v,u.right.xyz),dot(v,u.up.xyz));
+        let speed=length(sv);
+        let hot=1.0-smoothstep(COOL_START,ASH_AT*0.8,age);
+        if (speed>1e-4) { along=sv/speed; }
+        if (kd==FIRE) {
+            // Flames are tall whatever their speed: a tongue licking along
+            // the direction the fire rises. q.x runs along it, tip at +x.
+            stretch=1.9;
+        } else {
+            stretch=1.0+min(speed*(1.0/48.0)/max(size,1e-4),6.0)*hot;
+        }
+    }
+    let across=vec2(-along.y,along.x);
+    let o=along*q.x*size*stretch+across*q.y*size;
+
+    let centre_depth = -(dot(u.view_z.xyz, p) + u.view_z.w);
+    var out:Out;
+    out.position=u.vp*vec4(p+u.right.xyz*o.x+u.up.xyz*o.y,1.0);
+    out.uv=q; out.age=age; out.depth=centre_depth; out.rnd=hash(id*1.37+u.physics.w);
+    return out;
+}
+
+// Returns premultiplied colour. The alpha written is coverage times
+// (1 - glow): a glowing particle adds light like fire does and a cool one
+// covers like smoke, and one ember can pass from the first to the second.
+fn shade(rgb:vec3<f32>, cover:f32, glow:f32)->vec4<f32>{
+    let a=clamp(cover,0.0,1.0)*u.style.x;
+    return vec4(rgb*a, a*(1.0-glow));
+}
+
+// Soft lighting for a round puff: treat the sprite as a sphere facing the
+// camera and wrap the key light around it, so smoke has a lit side.
+fn puff_light(uv:vec2<f32>, r:f32)->f32{
+    let n=vec3(uv.x,uv.y,sqrt(max(1.0-r*r,0.0)));
+    let l=normalize(vec3(dot(u.right.xyz,u.light.xyz),dot(u.up.xyz,u.light.xyz),
+                         -dot(u.view_z.xyz,u.light.xyz))+vec3(0.0,1e-5,0.0));
+    return 0.55+0.45*dot(n,l);
+}
+
 @fragment fn fs_main(in:Out)->@location(0) vec4<f32>{
     let r=length(in.uv); if(r>1.0){discard;}
     // Hidden behind nearer splats, with a soft edge so a particle drifting
@@ -225,10 +322,70 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@loca
         let surface = d.r / d.a;
         occl = clamp((surface - in.depth) / 0.08, 0.0, 1.0);
     }
-    let soft=pow(1.0-smoothstep(.15,1.0,r),1.4)*in.fade*occl;
+    let age=in.age; let t=u.motion.x; let kd=kind();
     let lit=u.ambient_kind.rgb+vec3(0.25);
-    let rgb=u.colour.rgb*(lit+vec3(u.colour.w));
-    return vec4(rgb,soft*0.72*u.style.x);
+    let life=smoothstep(0.0,0.04,age)*(1.0-smoothstep(0.85,1.0,age));
+
+    if (kd==EMBERS) {
+        // Temperature 1 = white hot, 0 = cold. It falls quickly at first,
+        // the way a spark flashes and then dulls.
+        let temp=1.0-smoothstep(0.0,ASH_AT,age);
+        let hotc=mix(u.colour.rgb,vec3(1.0,0.86,0.6),smoothstep(0.85,1.0,temp)*0.8);
+        let dull=u.colour.rgb*vec3(0.55,0.16,0.07);
+        let ash_c=vec3(0.16,0.15,0.14)*lit*1.4;
+        var c=mix(dull,hotc,smoothstep(0.35,0.8,temp));
+        let ash=smoothstep(COOL_START,ASH_AT,age);
+        c=mix(c*(1.0+u.colour.w*0.6*temp*temp*temp),ash_c,ash);
+        // A spark is a soft glowing core; ash is a jagged flake with a hard
+        // edge, spinning. The shape changes with the colour.
+        let core=exp(-r*r*5.0);
+        let ang=in.rnd*6.2832+t*(1.5+in.rnd*2.0);
+        let rot=mat2x2(cos(ang),-sin(ang),sin(ang),cos(ang))*in.uv;
+        let edge=0.55+0.35*vnoise(vec2(atan2(rot.y,rot.x)*1.6+in.rnd*40.0,in.rnd*9.0));
+        let flake=1.0-smoothstep(edge-0.08,edge,length(rot*vec2(1.0,1.8)));
+        let cover=mix(core*1.2,flake*0.9,ash)*life*occl;
+        return shade(c,cover,1.0-ash);
+    }
+    if (kd==FIRE) {
+        // A flame tongue along uv.x (the rise direction, tip at +x): wide
+        // at the root, narrowing to a point, its edge eaten by noise that
+        // scrolls towards the tip. Hottest low in the core. Late in life it
+        // burns out into a wisp of dark smoke that covers rather than glows.
+        let along01=in.uv.x*0.5+0.5;
+        let width=mix(0.95,0.18,along01*along01);
+        let n=fbm(vec2(in.uv.x*1.6-t*3.2,in.uv.y*2.4)+vec2(in.rnd*17.0,in.rnd*5.0));
+        let shape=length(vec2(in.uv.x*0.9,in.uv.y/width));
+        let flame=1.0-smoothstep(0.35,1.0,shape+(n-0.5)*0.55);
+        let heat=flame*(1.0-along01*0.6)*(1.0-smoothstep(0.1,0.7,age));
+        var c=mix(u.colour.rgb*vec3(0.75,0.3,0.12),u.colour.rgb,smoothstep(0.1,0.45,heat));
+        c=mix(c,vec3(1.0,0.82,0.5),smoothstep(0.62,0.95,heat)*0.85);
+        c=c*(1.0+u.colour.w*0.35*heat*heat);
+        let smoke=smoothstep(0.45,0.85,age);
+        let smoke_c=vec3(0.12,0.11,0.1)*lit;
+        let cover=mix(flame*0.75,flame*0.3,smoke)*life*occl;
+        return shade(mix(c,smoke_c,smoke),cover,1.0-smoke);
+    }
+    if (kd==SNOW) {
+        let flake=1.0-smoothstep(0.45,0.7,r);
+        let glint=0.85+0.15*sin(t*6.0+in.rnd*40.0);
+        return shade(u.colour.rgb*lit*glint*(1.0+u.colour.w),flake*life*occl,0.0);
+    }
+    if (kd==DUST) {
+        // Motes that catch the light now and then.
+        let mote=exp(-r*r*6.0);
+        let glint=0.55+0.45*pow(0.5+0.5*sin(t*2.3+in.rnd*60.0),6.0);
+        return shade(u.colour.rgb*(lit+vec3(0.35))*(glint+0.35+u.colour.w),mote*life*occl,glint*0.3);
+    }
+    // Smoke and cloud puffs: billowing noise inside a soft round edge,
+    // turning slowly, lit from the key light's side.
+    let ang=in.rnd*6.2832+age*(in.rnd-0.5)*2.0;
+    let rot=mat2x2(cos(ang),-sin(ang),sin(ang),cos(ang))*in.uv;
+    let n=fbm(rot*1.8+vec2(in.rnd*23.0,age*1.5));
+    let body=(1.0-smoothstep(0.25,1.0,r+(0.5-n)*0.45));
+    var dens=0.72;
+    if (kd==CLOUDS) { dens=0.6; }
+    let c=u.colour.rgb*(lit*puff_light(in.uv,r)+vec3(u.colour.w));
+    return shade(c,body*dens*sin(age*3.14159)*occl,0.0);
 }
 """
 
@@ -290,10 +447,11 @@ class FxPass:
                               "alpha": {"src_factor": "one",
                                         "dst_factor": "one-minus-src-alpha", "operation": "add"}}}]})
 
-        # The raymarch returns premultiplied colour; particles return straight
-        # alpha, so their colour is scaled by alpha in the blend instead.
+        # Both return premultiplied colour. Particles also lower their alpha
+        # as they glow, which turns the same blend additive for fire and hot
+        # embers while smoke and ash still cover what is behind them.
         self._volume = pipe(VOLUME_SHADER, wgpu.CullMode.front, "one")
-        self._particle = pipe(PARTICLE_SHADER, wgpu.CullMode.none, "src-alpha")
+        self._particle = pipe(PARTICLE_SHADER, wgpu.CullMode.none, "one")
         self._pool: dict[str, list] = {"v": [], "p": []}
 
     def _group(self, kind: str, index: int, values: np.ndarray, depth_view):
@@ -359,7 +517,7 @@ class FxPass:
         for em in effects.emitters:
             if not em.enabled or em.count <= 0:
                 continue
-            v = np.zeros(80, np.float32)
+            v = np.zeros(84, np.float32)
             v[:16] = np.ascontiguousarray(vp.T).ravel()
             v[16:19] = view[0, :3]
             v[20:23] = view[1, :3]
@@ -411,6 +569,7 @@ class FxPass:
                     v[63 + 4 * count] = c
                     count += 1
                 v[53] = count
+            v[80:83] = key_dir
             rp.set_bind_group(0, self._group("p", slot, v, depth_view))
             slot += 1
             rp.draw(min(int(em.count), MAX_PARTICLES) * 6, 1, 0, 0)
