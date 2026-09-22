@@ -148,6 +148,21 @@ That is also the answer when the runtime check shows `dlssnr_module_loaded: 0`
 while every other line reads `1`. The file is present and found; the add-on
 refused it.
 
+### Two GPUs
+
+On a PC with more than one GPU (a laptop with an external card, for example),
+**Settings > DLSS runtime** shows **GPU for 3D and AI models**. It picks where
+the 3D view, SHARP, the background fill, depth and AI upscale run. Leave it on
+Automatic to use the same card as DLSS, so everything shares one GPU's memory.
+The GPU readout in the top right shows the card in use. A change applies after
+restarting the app.
+
+![The GPU picker in Settings, on a laptop with an external RTX 5060](app_images_examples/gpu_picker.png)
+
+DLSS itself follows Windows: set `DLSS5Converter.exe` to your preferred GPU in
+**Windows Settings > System > Display > Graphics**. With a single GPU the
+option is hidden, since there is nothing to choose.
+
 ## Install (portable)
 
 1. Download the zip from [Releases](../../releases) and unpack it anywhere.
