@@ -2145,6 +2145,56 @@ class VideoPage(QWidget):
         )
         export_card.add(self.estimate_depth)
 
+        # -- 3D card: optional 3D export (see stereo.py) --
+        from .stereo import FORMATS
+        from .settings import StereoSettings
+        self._stereo = StereoSettings()
+        stereo_card = ModuleCard("3D")
+        self.stereo_on = QCheckBox("Export as 3D")
+        self.stereo_on.setToolTip(
+            "Adds depth to every frame (Depth Anything) and exports a 3D video for "
+            "3D TVs, VR headsets or red/cyan glasses.")
+        self.stereo_on.toggled.connect(self._stereo_toggled)
+        stereo_card.add(self.stereo_on)
+        self.stereo_format = QComboBox()
+        for key, (label, where) in FORMATS.items():
+            self.stereo_format.addItem(label, key)
+            self.stereo_format.setItemData(self.stereo_format.count() - 1, where,
+                                           Qt.ItemDataRole.ToolTipRole)
+        self.stereo_format.currentIndexChanged.connect(self._stereo_changed)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Format"))
+        row.addStretch(1)
+        self.stereo_format.setMinimumWidth(150)
+        row.addWidget(self.stereo_format)
+        stereo_card.add_layout(row)
+        self.stereo_where = QLabel("")
+        self.stereo_where.setObjectName("hint")
+        self.stereo_where.setWordWrap(True)
+        stereo_card.add(self.stereo_where)
+        self.stereo_strength = SliderRow(
+            "Depth", self._stereo.strength, lambda v: self._stereo_set("strength", v),
+            "How deep the 3D feels. Stronger is more dramatic and harder on the eyes.")
+        self.stereo_pop = SliderRow(
+            "Pop-out", self._stereo.pop_out, lambda v: self._stereo_set("pop_out", v),
+            "0 keeps everything behind the screen. Higher brings the nearest things "
+            "out in front of it.")
+        self.stereo_steady = SliderRow(
+            "Steadiness", self._stereo.smoothing, lambda v: self._stereo_set("smoothing", v),
+            "Smooths depth across frames so surfaces do not wobble. Lower follows fast "
+            "motion more closely.", maximum=0.95)
+        for w in (self.stereo_strength, self.stereo_pop, self.stereo_steady):
+            stereo_card.add(w)
+        self.stereo_dlss = QCheckBox("Run DLSS")
+        self.stereo_dlss.setChecked(True)
+        self.stereo_dlss.setToolTip(
+            "Off converts to 3D only, much faster, straight from the source frames "
+            "(colour grade and effects still apply).")
+        self.stereo_dlss.toggled.connect(lambda v: self._stereo_set("run_dlss", bool(v)))
+        stereo_card.add(self.stereo_dlss)
+        self.stereo_card = stereo_card
+        self.on_stereo_changed = None           # set by the window: persists the settings
+
         self.info_label = QLabel("")
         self.info_label.setObjectName("hint")
         self.info_label.setWordWrap(True)
@@ -2169,6 +2219,7 @@ class VideoPage(QWidget):
         rail_col.setContentsMargins(0, 0, 0, 0)
         rail_col.setSpacing(12)
         rail_col.addWidget(source_card)
+        rail_col.addWidget(self.stereo_card)
         rail_col.addWidget(export_card)
         rail_col.addWidget(self.info_label)
         rail_col.addStretch(1)
@@ -2182,6 +2233,51 @@ class VideoPage(QWidget):
 
     def show_preview(self) -> None:
         self.stack.setCurrentWidget(self.preview)
+
+    # -- 3D card -------------------------------------------------------------
+
+    def set_stereo(self, stereo) -> None:
+        import copy as _copy
+        self._stereo = _copy.deepcopy(stereo)
+        for w in (self.stereo_on, self.stereo_format, self.stereo_dlss):
+            w.blockSignals(True)
+        self.stereo_on.setChecked(bool(stereo.enabled))
+        index = self.stereo_format.findData(stereo.format)
+        self.stereo_format.setCurrentIndex(max(0, index))
+        self.stereo_dlss.setChecked(bool(stereo.run_dlss))
+        for w in (self.stereo_on, self.stereo_format, self.stereo_dlss):
+            w.blockSignals(False)
+        self.stereo_strength.set_value(stereo.strength)
+        self.stereo_pop.set_value(stereo.pop_out)
+        self.stereo_steady.set_value(stereo.smoothing)
+        self._stereo_refresh()
+
+    def stereo_settings(self):
+        import copy as _copy
+        return _copy.deepcopy(self._stereo)
+
+    def _stereo_refresh(self) -> None:
+        on = self._stereo.enabled
+        views = self._stereo.format not in ("depth", "rgbd")
+        for w in (self.stereo_format, self.stereo_where, self.stereo_steady, self.stereo_dlss):
+            w.setEnabled(on)
+        for w in (self.stereo_strength, self.stereo_pop):
+            w.setEnabled(on and views)
+        from .stereo import FORMATS
+        self.stereo_where.setText(FORMATS.get(self._stereo.format, ("", ""))[1])
+
+    def _stereo_toggled(self, on: bool) -> None:
+        self._stereo_set("enabled", bool(on))
+
+    def _stereo_changed(self, _index: int) -> None:
+        self._stereo_set("format", self.stereo_format.currentData())
+
+    def _stereo_set(self, name: str, value) -> None:
+        setattr(self._stereo, name, value)
+        self._stereo_refresh()
+        if self.on_stereo_changed is not None:
+            self.on_stereo_changed(self.stereo_settings())
+
 
 
 class SequenceWorker(QObject):
@@ -2934,6 +3030,8 @@ class MainWindow(QMainWindow):
         # theme, density, HDR and Depth controls Settings owns exist as instance
         # state the rail and the rest of the app read.
         self.video_page = VideoPage()
+        self.video_page.set_stereo(self.settings.stereo)
+        self.video_page.on_stereo_changed = self._stereo_changed
         self.sequence_page = SequencePage()
         self.effects_page = EffectsPage(self.settings.effects, self._effects_changed)
         self.creative_page = CreativePage()
@@ -4888,6 +4986,10 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError) as error:    # bad or deleted .cube
             page.set_lut_status(f"Cannot use {e.lut_name}: {error}")
 
+    def _stereo_changed(self, stereo) -> None:
+        self.settings.stereo = stereo
+        self.settings.save(paths.settings_path())
+
     def _effects_changed(self) -> None:
         """An effect toggled or a slider moved: persist, redraw, keep it live.
 
@@ -4910,6 +5012,10 @@ class MainWindow(QMainWindow):
         self.effects_page.show_preview(self._graded_preview(self.result))
 
     def _tab_changed(self, _index: int) -> None:
+        # "Apply to folder" runs the single-image settings over a folder, so it
+        # only means something on that tab; elsewhere it sat over other tabs'
+        # controls (on 3D, right above the rail) and read as their action.
+        self.tab_apply.setVisible(self.tabs.currentWidget() is self.single_page)
         # Draw the effects preview when its tab comes forward, so it reflects the
         # latest result and settings even if nothing changed while it was hidden.
         if self.tabs.currentWidget() is self.effects_page:
@@ -5087,6 +5193,7 @@ class MainWindow(QMainWindow):
         # neural strengths, style and colour still come from the live settings.
         settings = copy.deepcopy(self.settings)
         settings.evaluation.frames = int(page.mode_box.currentData() or 1)
+        settings.stereo = page.stereo_settings()
 
         # The range comes from the timeline's In/Out when ranging, else the
         # whole clip. Frames, inclusive of Out, which is why limit is +1.

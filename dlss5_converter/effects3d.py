@@ -15,6 +15,8 @@ import uuid
 from bisect import bisect_left
 from dataclasses import dataclass, field, fields
 
+import numpy as np
+
 
 def _id() -> str:
     return uuid.uuid4().hex[:10]
@@ -43,6 +45,21 @@ class LightingSettings:
     #: Where a puddle's reflection finds nothing in frame, mirror the image
     #: across the horizon instead (see wet3d). Off keeps only true hits.
     puddle_mirror: bool = True
+    # Wind: one scene-wide wind that carries particles and volumes. Direction
+    # is the compass heading it blows toward, in degrees (0 = away from the
+    # camera, 90 = to the right); strength in scene units per second.
+    wind_direction: float = 90.0
+    wind_strength: float = 0.0
+    # 0 steady, 1 strong gusts: how much the strength rises and falls.
+    wind_gusts: float = 0.35
+    # Extra swirl the wind stirs into what it carries.
+    wind_turbulence: float = 0.3
+    # Snow cover on everything facing up (floors, tops of things), 0..1.
+    snow_cover: float = 0.0
+    # Seconds to build up to that amount (0 = already there).
+    snow_build: float = 0.0
+    # Seconds of build-up already done before the first frame.
+    snow_preroll: float = 0.0
 
 
 @dataclass(slots=True)
@@ -64,6 +81,8 @@ class VolumeEffect:
     emission: float = 0.0
     light_response: float = 0.8
     seed: float = 1.0
+    # How much the scene's wind carries this volume (0 ignores it).
+    wind_response: float = 1.0
 
 
 @dataclass(slots=True)
@@ -106,6 +125,16 @@ class ParticleEmitter:
     emission: float = 0.0
     light_response: float = 0.8
     seed: float = 2.0
+    # How much the scene's wind carries these particles (0 ignores it).
+    wind_response: float = 1.0
+    # Physics mode: simulated step by step (see particlesim) instead of the
+    # closed-form formula, so smoke pools under ceilings and snow piles up.
+    physics: bool = False
+    # Seconds simulated before frame 0: start with snow already settled or a
+    # room already full of smoke.
+    preroll: float = 0.0
+    # Seconds a particle stays where it lands (snow). 0 slides and fades as usual.
+    settle: float = 0.0
 
 
 @dataclass(slots=True)
@@ -555,7 +584,7 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
                       drag=1.4, growth=2.5, turbulence=0.9, opacity=0.55),
         "fire": dict(name="Fire emitter", count=520, speed=0.9, gravity=0.08,
                      colour=(1.0, 0.24, 0.03), emission=4.0, particle_size=0.075,
-                     drag=0.8, growth=0.4, turbulence=0.7),
+                     drag=0.8, growth=0.4, turbulence=0.7, wind_response=0.5),
         "embers": dict(name="Ember emitter", count=300, speed=1.2, gravity=0.12,
                        colour=(1.0, 0.32, 0.04), emission=5.0, particle_size=0.035,
                        drag=0.3, turbulence=0.6, bounce=0.4),
@@ -573,14 +602,14 @@ def emitter_preset(kind: str, pivot_z: float = -4.0) -> ParticleEmitter:
                      opacity=0.7, lifetime=1.4),
         "clouds": dict(name="Cloud particles", count=260, speed=0.08, gravity=0.0,
                        colour=(0.9, 0.93, 1.0), particle_size=0.22, drag=3.0,
-                       growth=1.0, turbulence=0.4, collide=False),
+                       growth=1.0, turbulence=0.4, collide=False, wind_response=0.6),
     }
     values = presets.get(kind, presets["smoke"])
     if kind == "snow":
         # Snow falls from above the whole scene, not from a spot on the ground
         # (where it would land on the floor at once and never be seen).
         return ParticleEmitter(kind="snow", position=(0.0, 1.4, pivot_z), size=(4.5, 0.3, 3.0),
-                               **{**values, "count": 1600, "lifetime": 5.0})
+                               **{**values, "count": 1600, "lifetime": 5.0, "settle": 30.0})
     if kind == "rain":
         return ParticleEmitter(kind="rain", position=(0.0, 1.8, pivot_z), size=(5.0, 0.3, 4.0),
                                **values)
@@ -617,3 +646,72 @@ def normalise_direction(value) -> tuple[float, float, float]:
     if length <= 1e-8:
         return (0.0, 1.0, 0.0)
     return tuple(float(v) / length for v in value)
+
+
+def wind_vector(lighting, t: float = 0.0) -> tuple[np.ndarray, float, float]:
+    """(velocity at time t, average velocity, turbulence) of the scene wind.
+
+    Gusts are a smooth sum of slow waves, never negative, so the wind swells
+    and eases instead of reversing. Deterministic in t: scrubbing and export
+    see the same wind.
+    """
+    a = math.radians(float(getattr(lighting, "wind_direction", 90.0)))
+    heading = np.array([math.sin(a), 0.0, -math.cos(a)])
+    strength = max(0.0, float(getattr(lighting, "wind_strength", 0.0)))
+    g = min(max(float(getattr(lighting, "wind_gusts", 0.0)), 0.0), 1.0)
+    wave = 0.55 * math.sin(t * 0.61) + 0.3 * math.sin(t * 1.37 + 1.1) + 0.15 * math.sin(t * 2.9 + 2.3)
+    gust = max(0.0, 1.0 + g * wave)
+    return heading * strength * gust, heading * strength, float(getattr(lighting, "wind_turbulence", 0.0))
+
+
+def snow_amount(lighting, t: float) -> float:
+    """Snow cover at time t: the set amount, reached over the build-up time
+    (with pre-roll already counted) or at once when there is none."""
+    cover = min(max(float(getattr(lighting, "snow_cover", 0.0)), 0.0), 1.0)
+    build = float(getattr(lighting, "snow_build", 0.0))
+    if cover <= 0.0 or build <= 0.0:
+        return cover
+    grown = (float(t) + max(float(getattr(lighting, "snow_preroll", 0.0)), 0.0)) / build
+    return cover * min(max(grown, 0.0), 1.0)
+
+
+#: How far a duplicate is nudged sideways, so its gizmo does not sit exactly
+#: on the original's.
+DUPLICATE_NUDGE = 0.3
+
+
+def duplicate_effect(state: EffectsState, track: "EffectsTrack | None", item_id: str):
+    """Copy an effect with every value, and its keyframes, under a new id.
+
+    The copy goes right after the original in its list, named "... copy" and
+    nudged sideways. Returns the new effect, or None when there is no such id.
+    """
+    original = state.item(item_id)
+    if original is None:
+        return None
+    new_id = _id()
+
+    def cloned(item):
+        c = copy.deepcopy(item)
+        c.id = new_id
+        c.name = f"{item.name} copy"
+        x, y, z = item.position
+        c.position = (x + DUPLICATE_NUDGE, y, z)
+        return c
+
+    def insert(target: EffectsState, item) -> None:
+        for attr in ("volumes", "emitters", "planes", "strikes"):
+            items = getattr(target, attr)
+            for index, existing in enumerate(items):
+                if existing.id == item.id:
+                    items.insert(index + 1, cloned(existing))
+                    return
+
+    insert(state, original)
+    if track is not None:
+        for key in track.keys:
+            if key.state.item(item_id) is not None:
+                insert(key.state, key.state.item(item_id))
+            prefix = f"{item_id}."
+            key.paths |= {new_id + p[len(item_id):] for p in key.paths if p.startswith(prefix)}
+    return state.item(new_id)

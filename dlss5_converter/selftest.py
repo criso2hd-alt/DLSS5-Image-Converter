@@ -35,11 +35,28 @@ def _report_file():
     return _REPORT or None
 
 
+def _echoes_to_console() -> bool:
+    """True when printing is worth doing and cannot corrupt the report.
+
+    A user who runs ``--selftest 2> report.txt`` points the shell at the same
+    name we open ourselves. Two writers then interleave in one file, and the
+    shell's UTF-16 header makes a reader decode our UTF-8 bytes as CJK, so the
+    whole report comes back as mojibake. Echo only to a real console; when
+    stderr has been redirected anywhere, the file we wrote is the report.
+    """
+    try:
+        return bool(sys.stderr) and sys.stderr.isatty()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _line(text: str = "") -> None:
     report = _report_file()
     if report is not None:
         report.write(text + "\n")
         report.flush()
+    if report is not None and not _echoes_to_console():
+        return
     try:
         print(text, file=sys.stderr, flush=True)
     except (OSError, ValueError, AttributeError):

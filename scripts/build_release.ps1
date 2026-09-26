@@ -24,7 +24,12 @@ $AssetsSrc = Join-Path $ProjectRoot "dlss5_converter\assets"
 # place. Keeping them across rebuilds is what buys back that guarantee.
 # No "pytorch" folder any more - depth is ONNX Runtime and the model is bundled,
 # so nothing large is downloaded on first run.
-$UserFolders = @("dlss_files", "models", "output")
+$UserFolders = @("dlss_files", "models", "output", "scenes")
+
+# Files in release\ that belong to whoever runs it, not to the build. Wiping
+# settings.json on every rebuild reset their choices (the neural backend, the
+# GPU, the theme) and looked like the app failing to remember them.
+$UserFiles = @("settings.json", "crash.log")
 
 $Python = Join-Path $ProjectRoot ".venv-cuda\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $Python)) {
@@ -175,7 +180,7 @@ if ($Running) {
 # Replace only the frozen application, leaving the user's folders alone.
 New-Item -ItemType Directory -Force -Path $Release | Out-Null
 Get-ChildItem -LiteralPath $Release -Force | Where-Object {
-    $UserFolders -notcontains $_.Name
+    $UserFolders -notcontains $_.Name -and $UserFiles -notcontains $_.Name
 } | Remove-Item -Recurse -Force
 
 Write-Host "Copying the frozen application into release\ ..." -ForegroundColor Cyan
@@ -221,6 +226,19 @@ foreach ($Folder in $UserFolders) {
 }
 New-Item -ItemType Directory -Force -Path $Engine | Out-Null
 Copy-Item -LiteralPath $Harness -Destination $Engine -Force
+
+# The scene capture add-on for ReShade (our own code): the app installs it
+# into games from here. Built by scripts\build_capture.ps1.
+$Capture = Join-Path $ProjectRoot "native\bin"
+$CaptureOut = Join-Path $Engine "capture"
+if (Test-Path -LiteralPath (Join-Path $Capture "dlss5_scene_capture.addon64")) {
+    New-Item -ItemType Directory -Force -Path $CaptureOut | Out-Null
+    foreach ($File in @("dlss5_scene_capture.addon64", "DLSS5Capture.fx")) {
+        Copy-Item -LiteralPath (Join-Path $Capture $File) -Destination $CaptureOut -Force
+    }
+} else {
+    Write-Warning "Capture add-on not built (scripts\build_capture.ps1); the release will not include it."
+}
 
 # The one thing a new user has to do, written where they will look for it.
 $Readme = @'

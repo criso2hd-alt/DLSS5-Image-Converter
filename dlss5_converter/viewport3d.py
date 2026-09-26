@@ -55,12 +55,19 @@ class EditorViewport(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.renderer = None
+        # What the view says before there is a scene; the 3D tab changes it
+        # with its source (one image, or a folder of shots).
+        self.empty_text = "Convert an image on the Single image tab first"
         self.pivot_z = -4.0
         self.track: CameraTrack | None = None
         self.current_time = 0.0
         self.duration = 4.0
         self.mode = "Textured"
         self.show_gizmo = True
+        # Scene from shots with a main shot: where the scene looks its best.
+        # {"vfov": degrees, "aspect": w/h} with the main camera at the origin
+        # looking down -z, or None.
+        self.main_zone = None
         self.scan_phase = 0.0
         self.effects = None
         self.show_effect_widgets = False
@@ -182,7 +189,7 @@ class EditorViewport(QWidget):
             painter.drawText(
                 self.rect(),
                 Qt.AlignmentFlag.AlignCenter,
-                "Convert an image on the Single image tab first",
+                self.empty_text,
             )
             return
 
@@ -213,10 +220,13 @@ class EditorViewport(QWidget):
         )
         painter.drawPixmap(self.rect(), QPixmap.fromImage(image.copy()))
 
+        if self.main_zone is not None:
+            self._paint_main_zone(painter, camera)
         if self.show_gizmo:
             self._paint_gizmo(painter, camera)
         if self.show_effect_widgets:
             self._paint_effect_widgets(painter, camera)
+        self._paint_wind(painter, camera)
         self._paint_hud(painter)
 
     def _effect_items(self):
@@ -686,6 +696,96 @@ class EditorViewport(QWidget):
         painter.setBrush(QColor("#78e6ff"))
         painter.setPen(QPen(QColor("#06222b"), 1))
         painter.drawEllipse(apex, 4, 4)
+
+    #: The high-quality zone: camera within this distance of the main shot's
+    #: position and looking within this angle of its direction.
+    ZONE_RADIUS = 0.5
+    ZONE_ANGLE = 30.0
+
+    def in_main_zone(self, camera: Camera) -> bool:
+        eye = np.array(camera.position, np.float64)
+        fwd = np.array(camera.target, np.float64) - eye
+        fwd /= max(np.linalg.norm(fwd), 1e-9)
+        angle = math.degrees(math.acos(float(np.clip(-fwd[2], -1.0, 1.0))))
+        return float(np.linalg.norm(eye)) <= self.ZONE_RADIUS and angle <= self.ZONE_ANGLE
+
+    def _paint_main_zone(self, painter: QPainter, camera: Camera) -> None:
+        """The main shot's camera and the zone around it where the scene is
+        the main shot itself; outside it, the surroundings are filled from
+        other shots and get softer."""
+        vp = camera.view_projection(self.width() / max(self.height(), 1))
+        size = self.size()
+        green = QColor(110, 230, 140)
+        reach = 1.2
+        half_h = math.tan(math.radians(self.main_zone["vfov"]) * 0.5) * reach
+        half_w = half_h * self.main_zone["aspect"]
+        apex = _project(np.zeros(3), vp, size)
+        corners = [_project(np.array([x * half_w, y * half_h, -reach]), vp, size)
+                   for x, y in ((1, 1), (-1, 1), (-1, -1), (1, -1))]
+        if apex is not None and all(c is not None for c in corners):
+            painter.setBrush(QColor(110, 230, 140, 28))
+            painter.setPen(QPen(green, 2))
+            painter.drawPolygon(corners)
+            painter.setPen(QPen(QColor(110, 230, 140, 160), 1))
+            for c in corners:
+                painter.drawLine(apex, c)
+        ring = [_project(np.array([math.cos(t) * self.ZONE_RADIUS, 0.0, math.sin(t) * self.ZONE_RADIUS]), vp, size)
+                for t in np.linspace(0, 2 * math.pi, 49)]
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(110, 230, 140, 200), 2, Qt.PenStyle.DashLine))
+        for a, b in zip(ring, ring[1:]):
+            if a is not None and b is not None:
+                painter.drawLine(a, b)
+        if apex is not None:
+            painter.setBrush(green)
+            painter.setPen(QPen(QColor("#0b2412"), 1))
+            painter.drawEllipse(apex, 5, 5)
+            painter.setPen(green)
+            painter.setFont(QFont("Segoe UI", 8))
+            painter.drawText(apex + QPoint(9, -8), "Main shot")
+        painter.setFont(QFont("Segoe UI", 9))
+        box = QRect(8, 8, 300, 22)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(8, 11, 17, 200))
+        painter.drawRoundedRect(box, 5, 5)
+        inside = self.in_main_zone(camera)
+        painter.setPen(QColor("#6ee68c") if inside else QColor("#EF9F27"))
+        painter.drawText(box.adjusted(8, 0, 0, 0), Qt.AlignmentFlag.AlignVCenter,
+                         "In the main shot's best area" if inside else "Outside the main shot's best area")
+
+    def _paint_wind(self, painter: QPainter, camera: Camera) -> None:
+        """A compass in the corner: which way the wind blows as seen from the
+        current camera, and how hard. Hidden in still air."""
+        lighting = getattr(self.effects, "lighting", None)
+        strength = float(getattr(lighting, "wind_strength", 0.0) or 0.0)
+        if strength <= 0.0:
+            return
+        from .effects3d import wind_vector
+        _now, avg, _turb = wind_vector(lighting, self.current_time)
+        eye = np.array(camera.position, np.float64)
+        fwd = np.array(camera.target, np.float64) - eye
+        fwd[1] = 0.0
+        fwd /= max(np.linalg.norm(fwd), 1e-9)
+        right = np.array([-fwd[2], 0.0, fwd[0]])
+        heading = avg / max(np.linalg.norm(avg), 1e-9)
+        # Screen arrow: right is right, "away from the camera" is up.
+        dx, dy = float(heading @ right), -float(heading @ fwd)
+        centre = QPoint(self.width() - 44, 44)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(8, 11, 17, 190))
+        painter.drawEllipse(centre, 30, 30)
+        tip = QPoint(centre.x() + int(dx * 22), centre.y() + int(dy * 22))
+        tail = QPoint(centre.x() - int(dx * 14), centre.y() - int(dy * 14))
+        painter.setPen(QPen(QColor("#9fd8ff"), 3))
+        painter.drawLine(tail, tip)
+        side = np.array([-dy, dx])
+        for sign in (1, -1):
+            back = np.array([tip.x(), tip.y()]) - np.array([dx, dy]) * 9 + side * 6 * sign
+            painter.drawLine(tip, QPoint(int(back[0]), int(back[1])))
+        painter.setPen(QColor("#9fd8ff"))
+        painter.setFont(QFont("Segoe UI", 8))
+        painter.drawText(QRect(centre.x() - 40, centre.y() + 32, 80, 14),
+                         Qt.AlignmentFlag.AlignCenter, f"Wind {strength:.1f}")
 
     def _paint_hud(self, painter: QPainter) -> None:
         painter.setFont(QFont("Segoe UI", 8))

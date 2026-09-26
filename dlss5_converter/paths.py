@@ -43,6 +43,7 @@ OUTPUT_DIR = "output"
 #: the ReShade/film-emulation world works because .cube is the portable format
 #: those tools export.
 LUTS_DIR = "luts"
+SCENES_DIR = "scenes"
 
 #: The native harness, and at run time the staged NVIDIA binaries beside it.
 #: Deliberately *not* the release root: ReShade attaches to any process that
@@ -169,6 +170,17 @@ def luts_dir() -> Path:
     button that lands somewhere real, even before any LUT has been added.
     """
     path = data_dir() / LUTS_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def scenes_dir() -> Path:
+    """Scenes built from shots, saved so they can be reopened, reused, shared.
+
+    In the data dir, never a scratch folder: a thirty-shot build takes minutes
+    and a user expects it to still be there next week.
+    """
+    path = data_dir() / SCENES_DIR
     path.mkdir(parents=True, exist_ok=True)
     return path
 

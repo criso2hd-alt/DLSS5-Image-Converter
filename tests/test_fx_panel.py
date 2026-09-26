@@ -135,3 +135,14 @@ def test_puddle_mirror_toggle(page):
     assert panel.mirror_box.isChecked() and page.effects.lighting.puddle_mirror
     panel.mirror_box.setChecked(False)
     assert page.effects.lighting.puddle_mirror is False
+
+
+def test_row_duplicate_button_copies_that_effect(page):
+    panel = page.fx_panel
+    panel._add_volume("Fog")
+    panel._add_emitter("Rain")
+    page.effects.volumes[0].density = 1.7
+    _row(panel, 0).duplicate.click()
+    assert [v.density for v in page.effects.volumes] == [1.7, 1.7]
+    assert page.effects.volumes[1].name.endswith("copy")
+    assert len(page.effects.emitters) == 1

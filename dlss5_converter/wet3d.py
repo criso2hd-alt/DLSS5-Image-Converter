@@ -30,6 +30,7 @@ struct WU {
     size: vec4<f32>,     // x width, y height, z time
     amount: vec4<f32>,   // x wetness, y puddles, z ripples, w puddle size
     up: vec4<f32>,       // xyz world up, w 1 = mirror fallback in puddles
+    snow: vec4<f32>,     // x snow cover 0..1 at this moment
 };
 @group(0) @binding(0) var<uniform> u: WU;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -40,15 +41,39 @@ struct WU {
     return vec4(p[i], 0.0, 1.0);
 }
 
-fn h2(p:vec2<f32>)->f32{return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
-fn vnoise(p:vec2<f32>)->f32{
-    let i=floor(p); let f=fract(p); let w=f*f*(3.0-2.0*f);
-    return mix(mix(h2(i),h2(i+vec2(1.0,0.0)),w.x),
-               mix(h2(i+vec2(0.0,1.0)),h2(i+vec2(1.0,1.0)),w.x),w.y);
+// Integer hash (PCG): exact on every GPU. The old fract(sin(x) * 43758.5)
+// runs out of float precision for larger x, which made neighbouring cells and
+// particle ids get near-identical "random" values: square blotches in snow
+// and puddles, particles marching in lines.
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
 }
+fn u01(v: u32) -> f32 { return f32(v >> 8u) * (1.0 / 16777216.0); }
+fn h2(p:vec2<f32>)->f32{
+    let i = vec2<i32>(floor(p));
+    return u01(pcg(bitcast<u32>(i.x) ^ pcg(bitcast<u32>(i.y) + 0x9E3779B9u)));
+}
+// Gradient (Perlin-style) noise, 0..1. Value noise on a square grid shows the
+// grid wherever it is thresholded into shapes; gradient noise has no visible
+// cells.
+fn grad2(i:vec2<f32>, f:vec2<f32>)->f32{
+    let a = h2(i) * 6.2831853;
+    return dot(vec2(cos(a), sin(a)), f);
+}
+fn vnoise(p:vec2<f32>)->f32{
+    let i=floor(p); let f=fract(p);
+    let w=f*f*f*(f*(f*6.0-15.0)+10.0);
+    let n=mix(mix(grad2(i,f),grad2(i+vec2(1.0,0.0),f-vec2(1.0,0.0)),w.x),
+              mix(grad2(i+vec2(0.0,1.0),f-vec2(0.0,1.0)),grad2(i+vec2(1.0,1.0),f-vec2(1.0,1.0)),w.x),w.y);
+    return clamp(0.5+n*0.95,0.0,1.0);
+}
+// Each octave turned against the last, so no layer lines up with the floor.
 fn fbm(p:vec2<f32>)->f32{
     var a=0.5; var s=0.0; var q=p;
-    for (var i=0; i<4; i=i+1) { s+=a*vnoise(q); q=q*2.03+vec2(1.7,9.2); a*=0.5; }
+    let r=mat2x2<f32>(0.8,0.6,-0.6,0.8);
+    for (var i=0; i<4; i=i+1) { s+=a*vnoise(q); q=r*q*2.03+vec2(1.7,9.2); a*=0.5; }
     return s;
 }
 
@@ -86,9 +111,18 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
     // depths noisy enough to flip a 1-pixel normal (speckle in the shine).
     var n=normalize(cross(side(c,vec2(3,0),z,pc), side(c,vec2(0,3),z,pc)));
     if (dot(n,-pc)<0.0) { n=-n; }
+    // A wider-baseline normal too: splat depth jitters pixel to pixel, and a
+    // 3-pixel normal alone makes reflections sparkle as the camera moves.
+    var n8=normalize(cross(side(c,vec2(8,0),z,pc), side(c,vec2(0,8),z,pc)));
+    if (dot(n8,-pc)<0.0) { n8=-n8; }
+    var n16=normalize(cross(side(c,vec2(16,0),z,pc), side(c,vec2(0,16),z,pc)));
+    if (dot(n16,-pc)<0.0) { n16=-n16; }
+    let n_steady=normalize(n+n8*2.0+n16*2.0);
     let up_v=normalize((u.view*vec4(u.up.xyz,0.0)).xyz);
     let facing=dot(n,up_v);
-    let ground=smoothstep(0.55,0.85,facing);
+    // Ground is judged on the steady normal: with the 3-pixel one, pixels
+    // flip between wet-dark and dry as the camera moves (shimmer).
+    let ground=smoothstep(0.5,0.85,dot(n_steady,up_v));
 
     // Coordinates on the ground plane, for puddle shapes and ripple cells.
     let world=(u.inv_view*vec4(pc,1.0)).xyz;
@@ -100,7 +134,7 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
 
     let wet=u.amount.x;
     let puddle_n=fbm(gp*(1.6/max(u.amount.w,0.05))+vec2(3.1,7.7));
-    let puddle=ground*smoothstep(1.0-u.amount.y*0.75-0.05, 1.0-u.amount.y*0.75+0.05, puddle_n)
+    let puddle=ground*smoothstep(1.0-u.amount.y*0.75-0.1, 1.0-u.amount.y*0.75+0.1, puddle_n)
                *step(0.001,u.amount.y);
     let dampness=max(wet*(0.25+0.75*ground), puddle);
 
@@ -123,11 +157,13 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
     let rdir=rv/max(rd,1e-4);
     // A little micro-roughness away from puddles, so wet ground's reflection
     // is soft and a puddle's is sharp.
-    let rough=(1.0-puddle)*0.035;
+    // Faded out with distance: past a few metres the grain is finer than a
+    // pixel and would only shimmer.
+    let rough=(1.0-puddle)*0.035*clamp(1.0-(z-2.0)/6.0,0.0,1.0);
     let jitter=vec2(vnoise(gp*14.0)-0.5, vnoise(gp*14.0+9.0)-0.5)*rough;
     let bend=(rdir*ring*0.5+jitter);
     let tv1=normalize((u.view*vec4(t1,0.0)).xyz); let tv2=normalize((u.view*vec4(t2,0.0)).xyz);
-    let n2=normalize(n+(tv1*bend.x+tv2*bend.y)*ground);
+    let n2=normalize(n_steady+(tv1*bend.x+tv2*bend.y)*ground);
 
     let v=normalize(pc);
     let r=reflect(v,n2);
@@ -157,7 +193,7 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
                 let ls=textureLoad(src, vec2<i32>(px), 0);
                 last=ls.rgb/max(ls.a,1e-4);
                 let edge=min(min(px.x,u.size.x-px.x), min(px.y,u.size.y-px.y));
-                last_w=clamp(edge/(0.06*u.size.y),0.0,1.0)*ls.a*0.6;
+                last_w=clamp(edge/(0.06*u.size.y),0.0,1.0)*ls.a*0.25;
             }
             if (sd>0.0 && pz>sd+0.005 && pz-sd<max(0.12,t*0.25)) {
                 // Refine between the previous step and this one, so the hit
@@ -173,8 +209,19 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
                     let qd=dist_at(vec2<i32>(qp));
                     if (qd>0.0 && -q.z>qd) { hi=mid; hp=qp; } else { lo=mid; }
                 }
+                // A small average around the hit, not one pixel: a single
+                // pixel flips colour with every tiny camera move (shimmer).
+                // Wider on damp ground, tight in puddles so they stay sharp.
+                let blur=mix(9.0,1.0,puddle);
+                var acc=vec3(0.0); var wsum=0.0;
+                for (var k=0; k<9; k=k+1) {
+                    let o=vec2(f32(k%3)-1.0, f32(k/3)-1.0)*blur;
+                    let tap=clamp(hp+o, vec2(0.0), u.size.xy-1.0);
+                    let ts=textureLoad(src, vec2<i32>(tap), 0);
+                    acc+=ts.rgb/max(ts.a,1e-4)*ts.a; wsum+=ts.a;
+                }
                 let s=textureLoad(src, vec2<i32>(hp), 0);
-                refl=s.rgb/max(s.a,1e-4);
+                refl=acc/max(wsum,1e-4);
                 // Fade near the frame edges, where the reflection would
                 // otherwise stop at a hard line.
                 let edge=min(min(px.x,u.size.x-px.x), min(px.y,u.size.y-px.y));
@@ -207,6 +254,25 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
     }
     if (got<=0.0) { refl=last; got=last_w; }
     rgb=mix(rgb, refl, strength*got);
+
+    // Snow: settles on whatever faces up, flattest first, broken up by noise
+    // so it gathers in patches before it closes into a blanket. It keeps the
+    // scene's own light and shadow (a snowy floor in shade is grey, not glowing)
+    // and hides the wet shine underneath.
+    let snow=u.snow.x;
+    if (snow>0.001) {
+        // Faces up at two scales, or it is a noisy normal on a wall: a
+        // single 3-pixel normal flickers upward often enough to speckle walls.
+        let facing_snow=min(facing, dot(n8,up_v));
+        let flat_up=smoothstep(0.3,0.85,facing_snow);
+        let breakup=fbm(gp*2.3+vec2(11.0,5.0))-0.5+(vnoise(gp*11.0)-0.5)*0.35;
+        let cover=smoothstep(0.0,1.0,clamp((flat_up*1.25-(1.0-snow)*1.15+breakup*0.7)*2.2,0.0,1.0))*smoothstep(0.15,0.3,facing_snow);
+        let lum_here=dot(here.rgb/max(here.a,1e-4),vec3(0.299,0.587,0.114));
+        let shade=clamp(0.3+lum_here*1.7,0.25,1.0);
+        let glint=step(0.985,h2(floor(gp*90.0)))*0.25*shade;
+        let snow_rgb=vec3(0.90,0.93,0.98)*shade+vec3(glint);
+        rgb=mix(rgb,snow_rgb,cover);
+    }
     return vec4(rgb*here.a, here.a);
 }
 """
@@ -215,7 +281,8 @@ fn side(c:vec2<i32>, step:vec2<i32>, z:f32, pc:vec3<f32>)->vec3<f32>{
 def active(effects) -> bool:
     lighting = getattr(effects, "lighting", None) if effects is not None else None
     return lighting is not None and (getattr(lighting, "wetness", 0.0) > 0.0
-                                     or getattr(lighting, "puddles", 0.0) > 0.0)
+                                     or getattr(lighting, "puddles", 0.0) > 0.0
+                                     or getattr(lighting, "snow_cover", 0.0) > 0.0)
 
 
 class WetPass:
@@ -239,7 +306,7 @@ class WetPass:
             fragment={"module": mod, "entry_point": "fs_main",
                       "targets": [{"format": "rgba16float"}]})
         self._uniform = device.create_buffer(
-            size=256, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            size=512, usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._copy = None
         self._size = None
 
@@ -256,7 +323,7 @@ class WetPass:
         # texture cannot be both, so it reads from a copy.
         enc.copy_texture_to_texture({"texture": colour_tex}, {"texture": self._copy}, (w, h, 1))
         lighting = effects.lighting
-        v = np.zeros(64, np.float32)
+        v = np.zeros(68, np.float32)
         v[0:16] = np.ascontiguousarray(view.T, np.float32).ravel()
         v[16:32] = np.ascontiguousarray(proj.T, np.float32).ravel()
         v[32:48] = np.ascontiguousarray(np.linalg.inv(view).T, np.float32).ravel()
@@ -265,6 +332,8 @@ class WetPass:
                     float(lighting.ripples), float(lighting.puddle_size))
         v[56:59] = up
         v[59] = 1.0 if getattr(lighting, "puddle_mirror", True) else 0.0
+        from .effects3d import snow_amount
+        v[60] = snow_amount(lighting, time_seconds)
         self.device.queue.write_buffer(self._uniform, 0, v.tobytes())
         bind = self.device.create_bind_group(layout=self._layout, entries=[
             {"binding": 0, "resource": {"buffer": self._uniform}},

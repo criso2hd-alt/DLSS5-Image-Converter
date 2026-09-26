@@ -254,6 +254,28 @@ def _providers() -> list[str]:
     return chosen or ["CPUExecutionProvider"]
 
 
+#: Substrings that mark a lost GPU rather than a bad model or bad input. A
+#: Blackwell card under DirectML can have its device suspended mid-inference
+#: (DXGI 0x887A0005) - the driver recovers, but every later run on the dead
+#: session fails the same way, so the session has to be rebuilt.
+_DEVICE_LOST = (
+    "887a0005",
+    "887a0006",
+    "887a0007",
+    "device instance has been suspended",
+    "device has been removed",
+    "getdeviceremovedreason",
+    "device_removed",
+    "device_reset",
+    "dxgi_error_device",
+)
+
+
+def _is_device_lost(error: BaseException) -> bool:
+    text = f"{error}".lower()
+    return any(mark in text for mark in _DEVICE_LOST)
+
+
 class OnnxDepthEngine:
     """Depth estimation via ONNX Runtime, interchangeable with DepthEngine."""
 
@@ -261,6 +283,7 @@ class OnnxDepthEngine:
         self.session = None
         self.model_id: str | None = None
         self.device = "cpu"
+        self._path: Path | None = None
 
     @classmethod
     def is_downloaded(cls, model_id: str) -> bool:
@@ -343,8 +366,17 @@ class OnnxDepthEngine:
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         from . import gpus
-        self.session = ort.InferenceSession(str(path), options,
-                                            providers=gpus.ort_providers(providers))
+        try:
+            self.session = ort.InferenceSession(str(path), options,
+                                                providers=gpus.ort_providers(providers))
+        except Exception as error:  # noqa: BLE001 - CPU always works
+            if providers == ["CPUExecutionProvider"]:
+                raise
+            if progress:
+                progress("The GPU refused the depth model; using the CPU.")
+            self.session = ort.InferenceSession(str(path), options,
+                                                providers=["CPUExecutionProvider"])
+        self._path = path
         active = self.session.get_providers()[0]
         # Report the real backend rather than a blanket "gpu": the shipped build
         # runs on DirectML (any DX12 GPU), a user who installs onnxruntime-gpu
@@ -363,6 +395,36 @@ class OnnxDepthEngine:
         x = resized.astype(np.float32) / 255.0
         x = (x - _MEAN) / _STD
         return np.ascontiguousarray(x.transpose(2, 0, 1)[None], dtype=np.float32)
+
+    def _run(
+        self,
+        pixel_values: np.ndarray,
+        progress: Callable[[str], None] | None = None,
+    ) -> np.ndarray:
+        """One inference, retried on the CPU if the GPU device goes away.
+
+        Reported by a user on an RTX 5080: DirectML suspended the device part
+        way through and every depth run after it failed with the same error,
+        because the session was still bound to the dead device. Slow depth
+        beats no depth, so rebuild on the CPU and finish the job.
+        """
+        name = self.session.get_inputs()[0].name
+        try:
+            return self.session.run(None, {name: pixel_values})[0]
+        except Exception as error:  # noqa: BLE001
+            if self.device == "cpu" or not _is_device_lost(error):
+                raise
+            if progress:
+                progress("The GPU dropped out; finishing depth on the CPU.")
+            import onnxruntime as ort
+
+            options = ort.SessionOptions()
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self.session = ort.InferenceSession(str(self._path), options,
+                                                providers=["CPUExecutionProvider"])
+            self.device = "cpu"
+            name = self.session.get_inputs()[0].name
+            return self.session.run(None, {name: pixel_values})[0]
 
     def infer(
         self,
@@ -384,8 +446,7 @@ class OnnxDepthEngine:
 
         height, width = image_rgb.shape[:2]
         pixel_values = self._preprocess(image_rgb)
-        name = self.session.get_inputs()[0].name
-        raw = self.session.run(None, {name: pixel_values})[0]
+        raw = self._run(pixel_values, progress)
         depth = np.asarray(raw, np.float32).reshape(INPUT, INPUT)
 
         # Back to the source resolution, then the same percentile normalisation
