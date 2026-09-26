@@ -990,15 +990,24 @@ def convert_video(
     if limit is not None:
         total = min(limit, total - start) if total else limit
 
-    status = runtime.detect(settings.runtime_dir or None)
-    if not status.ready:
-        raise RuntimeError("\n".join(status.problems))
-    staged = runtime.stage_runtime(status)
-    assert status.harness is not None
-    runtime.write_config(staged, settings.neural)
+    stereo_on = bool(getattr(settings, "stereo", None) and settings.stereo.enabled)
+    # A 3D-only conversion skips DLSS entirely: much faster, and the DLSS
+    # runtime does not even need to be present. Without 3D the neural pass is
+    # the whole point, so it always runs.
+    run_dlss = not stereo_on or bool(getattr(settings.stereo, "run_dlss", True))
+    if run_dlss:
+        status = runtime.detect(settings.runtime_dir or None)
+        if not status.ready:
+            raise RuntimeError("\n".join(status.problems))
+        staged = runtime.stage_runtime(status)
+        assert status.harness is not None
+        runtime.write_config(staged, settings.neural)
 
-    if estimate_depth:
+    if estimate_depth or stereo_on:
         engine.load(settings.depth.model_id, progress=progress)
+    if stereo_on:
+        from . import stereo
+        smoother = stereo.DepthSmoother(settings.stereo.smoothing)
     offsets = contract.jitter_sequence(settings.evaluation.frames)
     if not settings.evaluation.jitter:
         offsets = [(0.0, 0.0)] * len(offsets)
@@ -1025,7 +1034,11 @@ def convert_video(
             fitted = contract.fit_to_budget(source_rgb, settings.evaluation.max_edge)
             height, width = fitted.shape[:2]
 
-            if harness is None:
+            if size is None and not run_dlss:
+                size = (width, height)
+                out_size = stereo.output_size(settings.stereo.format, size)
+                writer = video.VideoWriter(video_only, codec, info.fps, out_size)
+            elif harness is None and run_dlss:
                 # The first frame fixes the size for the whole clip: one harness,
                 # one set of NGX buffers, and one output stream.
                 np.zeros((height, width, 2), np.float16).tofile(motion_path)
@@ -1041,7 +1054,10 @@ def convert_video(
                 )
                 harness.__enter__()
                 size = (width, height)
-                writer = video.VideoWriter(video_only, codec, info.fps, size)
+                # 3D formats can be wider or taller than the frame (full side by
+                # side is twice the width), so the stream takes the packed size.
+                out_size = stereo.output_size(settings.stereo.format, size) if stereo_on else size
+                writer = video.VideoWriter(video_only, codec, info.fps, out_size)
                 # The colour plane is 66 MB at 4K and identical in shape every
                 # pass of every frame, so it is allocated once and rewritten in
                 # place. With shared memory this buffer *is* the mapping the
@@ -1057,30 +1073,33 @@ def convert_video(
                     f"started at {size[0]}x{size[1]}."
                 )
 
-            if estimate_depth:
-                inverse = engine.infer(
-                    (np.clip(fitted, 0, 1) * 255).astype(np.uint8),
-                    input_size=settings.depth.input_size, tiled=settings.depth.tiled,
+            if not run_dlss:
+                enhanced = np.clip(fitted, 0.0, 1.0)
+            else:
+                if estimate_depth:
+                    inverse = engine.infer(
+                        (np.clip(fitted, 0, 1) * 255).astype(np.uint8),
+                        input_size=settings.depth.input_size, tiled=settings.depth.tiled,
+                    )
+                    shaped = contract.to_hardware_depth(inverse, settings.depth.contrast)
+                    np.ascontiguousarray(shaped).tofile(depth_path)
+                    harness.set_depth(depth_path)
+
+                linear = contract.srgb_to_linear(np.clip(fitted, 0, 1))
+                harness.reset_history()
+                for offset in offsets:
+                    shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+                    # Reused buffer: only the colour channels change per pass; alpha
+                    # was set to 1.0 when it was allocated. commit_colour sends it
+                    # through shared memory or the file, whichever is live.
+                    colour_plane[..., :3] = shifted.astype(np.float16)
+                    harness.commit_colour(colour_plane, colour_path, offset)
+                harness.write(out_path)
+
+                enhanced = np.clip(
+                    contract.linear_to_srgb(contract.read_output(out_path, width, height)),
+                    0.0, 1.0,
                 )
-                shaped = contract.to_hardware_depth(inverse, settings.depth.contrast)
-                np.ascontiguousarray(shaped).tofile(depth_path)
-                harness.set_depth(depth_path)
-
-            linear = contract.srgb_to_linear(np.clip(fitted, 0, 1))
-            harness.reset_history()
-            for offset in offsets:
-                shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-                # Reused buffer: only the colour channels change per pass; alpha
-                # was set to 1.0 when it was allocated. commit_colour sends it
-                # through shared memory or the file, whichever is live.
-                colour_plane[..., :3] = shifted.astype(np.float16)
-                harness.commit_colour(colour_plane, colour_path, offset)
-            harness.write(out_path)
-
-            enhanced = np.clip(
-                contract.linear_to_srgb(contract.read_output(out_path, width, height)),
-                0.0, 1.0,
-            )
             if grade_settings is not None:
                 enhanced = grade.apply(enhanced, grade_settings)
             # Detail (Boost/Ultra) is a single-image, supersampled operation and
@@ -1090,6 +1109,13 @@ def convert_video(
             # Video frames are display-referred (the codecs are 8-bit SDR), so
             # the plain sRGB effect path — the same one the photo save uses.
             enhanced = effects.apply(enhanced, settings.effects, luts_dir)
+            if stereo_on:
+                # 3D from the finished frame, so both eyes carry the DLSS look.
+                inverse = engine.infer(
+                    (np.clip(enhanced, 0, 1) * 255).astype(np.uint8),
+                    input_size=settings.depth.input_size, tiled=settings.depth.tiled,
+                )
+                enhanced = stereo.frame(enhanced.astype(np.float32), inverse, settings.stereo, smoother)
             assert writer is not None
             writer.write(enhanced)
             done += 1

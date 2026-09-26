@@ -29,7 +29,10 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 # in. nvngx_dlssnr.dll is a leaked pre-release NVIDIA binary; the others are
 # not ours to redistribute either.
 $Contraband = @("nvngx_dlssnr.dll", "nvngx_dlss.dll", "renodx-dlss5.addon64", "dxgi.dll",
-                "ReShade64.dll", "ReShade.ini", "ReShade.log")
+                "ReShade64.dll", "ReShade.ini", "ReShade.log",
+                # Not ours to ship either: these are this machine's own state,
+                # and settings.json carries local paths.
+                "settings.json", "crash.log", "OptiScaler.ini", "OptiScaler.log")
 
 $Name = "DLSS5-Image-Converter"
 $Staging = Join-Path ([System.IO.Path]::GetTempPath()) ("dlss5-package-" + [guid]::NewGuid().ToString("N"))
@@ -46,6 +49,12 @@ Copy-Item -LiteralPath (Join-Path $Release "_internal") -Destination $Root -Recu
 New-Item -ItemType Directory -Force -Path (Join-Path $Root "engine") | Out-Null
 Copy-Item -LiteralPath (Join-Path $Release "engine\dlss5_eval.exe") `
           -Destination (Join-Path $Root "engine")
+
+# The scene capture add-on (ours), which the app installs into games.
+$CaptureDir = Join-Path $Release "engine\capture"
+if (Test-Path -LiteralPath $CaptureDir) {
+    Copy-Item -LiteralPath $CaptureDir -Destination (Join-Path $Root "engine") -Recurse
+}
 
 # A note so nobody hand-copies files here. This is the folder people get told,
 # wrongly, to fill in as well as dlss_files - it is managed by the app.

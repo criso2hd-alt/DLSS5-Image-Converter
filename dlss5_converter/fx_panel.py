@@ -103,6 +103,8 @@ SPECS: dict[str, list[tuple[str, list[Prop]]]] = {
         ]),
         ("Motion", [
             Prop("speed", "Drift", -3.0, 3.0, tip="How fast the noise flows."),
+            Prop("wind_response", "Wind response", 0.0, 2.0,
+                 tip="How much the scene's wind carries this volume. 0 ignores it."),
             Prop("noise_scale", "Noise scale", 0.1, 8.0, tip="Size of the swirls."),
             Prop("detail", "Detail", 0.0, 1.0, tip="Fine breakup on top of the swirls."),
         ]),
@@ -125,10 +127,20 @@ SPECS: dict[str, list[tuple[str, list[Prop]]]] = {
             Prop("growth", "Growth", 0.0, 5.0, tip="How much each particle swells as it ages."),
             Prop("bounce", "Bounce", 0.0, 1.0,
                  tip="0 slides along floors and walls, 1 bounces straight back."),
+            Prop("wind_response", "Wind response", 0.0, 2.0,
+                 tip="How much the scene's wind carries these particles. 0 ignores it."),
         ]),
         ("Look", [
             Prop("emission", "Glow", 0.0, 10.0, 1),
             Prop("light_response", "Light response", 0.0, 2.0),
+        ]),
+        ("Physics", [
+            Prop("preroll", "Pre-roll", 0.0, 60.0, 1, " s",
+                 tip="Seconds simulated before the first frame: start with snow already "
+                     "settled or the room already full of smoke. Needs Simulate physics."),
+            Prop("settle", "Stay after landing", 0.0, 120.0, 1, " s",
+                 tip="How long a particle stays where it lands, so snow piles up. 0 slides "
+                     "along surfaces instead. Needs Simulate physics."),
         ]),
     ],
     "lightning": [
@@ -158,6 +170,31 @@ WET_PROPS = [
     Prop("puddle_size", "Puddle size", 0.2, 5.0, curve=2.0, tip="Size of the puddle patches."),
     Prop("ripples", "Rain ripples", 0.0, 1.0,
          tip="Rings from raindrops disturbing the reflections."),
+]
+
+
+#: The scene-wide wind (fields of LightingSettings). It carries every
+#: particle emitter and volume, each by its own "Wind response".
+WIND_PROPS = [
+    Prop("wind_strength", "Strength", 0.0, 8.0, curve=1.5,
+         tip="Wind speed. 0 is still air."),
+    Prop("wind_direction", "Direction", 0.0, 360.0, 0, "°",
+         tip="Where the wind blows toward: 0 away from the camera, 90 to the right, "
+             "180 toward the camera, 270 to the left."),
+    Prop("wind_gusts", "Gusts", 0.0, 1.0, tip="0 steady, 1 strong gusts that swell and ease."),
+    Prop("wind_turbulence", "Turbulence", 0.0, 2.0, tip="Swirl the wind stirs into what it carries."),
+]
+
+
+#: Scene-wide snow cover (fields of LightingSettings).
+SNOW_PROPS = [
+    Prop("snow_cover", "Amount", 0.0, 1.0,
+         tip="Snow on everything facing up: floors, counter tops, the tops of things. "
+             "Low values settle in patches on the flattest surfaces."),
+    Prop("snow_build", "Build-up time", 0.0, 120.0, 1, " s",
+         tip="Seconds to build up to the amount. 0 is already there."),
+    Prop("snow_preroll", "Pre-roll", 0.0, 120.0, 1, " s",
+         tip="Seconds of build-up already done before the first frame."),
 ]
 
 
@@ -263,6 +300,30 @@ class EyeButton(QToolButton):
             p.drawLine(QPointF(cx - 7, cy + 6), QPointF(cx + 7, cy - 6))
 
 
+class DuplicateButton(QToolButton):
+    """Two overlapping squares: duplicate this effect with all its values."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(24, 22)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Duplicate: a copy with every value and keyframe.")
+        self.setAutoRaise(True)
+
+    def paintEvent(self, _event) -> None:
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QPainter, QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        colour = QColor("#b9c3d6" if self.underMouse() else "#7d879b")
+        p.setPen(QPen(colour, 1.4))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        cx, cy = self.width() / 2, self.height() / 2
+        p.drawRoundedRect(QRectF(cx - 7, cy - 6, 9, 9), 1.5, 1.5)
+        p.setBrush(self.palette().window())
+        p.drawRoundedRect(QRectF(cx - 3, cy - 2, 9, 9), 1.5, 1.5)
+
+
 class _ListRow(QWidget):
     """One effect in the list: on/off tick, icon and name, gizmo eye."""
 
@@ -277,10 +338,12 @@ class _ListRow(QWidget):
         label = QLabel(text)
         # Clicks on the name must reach the list, which does the selecting.
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.duplicate = DuplicateButton()
         self.eye = EyeButton()
         self.eye.setChecked(shown)
         row.addWidget(self.tick)
         row.addWidget(label, 1)
+        row.addWidget(self.duplicate)
         row.addWidget(self.eye)
 
 
@@ -435,9 +498,39 @@ class FxPanel(QWidget):
         self.props_card.setVisible(False)
         outer.addWidget(self.props_card)
 
+        # -- wind: scene-wide, carries particles and volumes -----------------
+        self.wind_card = ModuleCard("Wind")
+        self._env_sliders: dict[str, FxSlider] = {}
+        for prop in WIND_PROPS:
+            s = FxSlider(prop)
+            s.changed.connect(lambda v, f=prop.field: self.set_env(f, v))
+            s.key_clicked.connect(lambda f=prop.field: self._toggle_env_key(f))
+            self._env_sliders[prop.field] = s
+            self.wind_card.add(s)
+        wind_note = QLabel("Carries rain, snow, smoke, dust and fog. Each effect's Wind "
+                           "response sets how much it follows.")
+        wind_note.setObjectName("hint")
+        wind_note.setWordWrap(True)
+        self.wind_card.add(wind_note)
+        outer.addWidget(self.wind_card)
+
+        # -- snow cover: scene-wide -------------------------------------------
+        self.snow_card = ModuleCard("Snow cover")
+        for prop in SNOW_PROPS:
+            s = FxSlider(prop)
+            s.changed.connect(lambda v, f=prop.field: self.set_env(f, v))
+            s.key_clicked.connect(lambda f=prop.field: self._toggle_env_key(f))
+            self._env_sliders[prop.field] = s
+            self.snow_card.add(s)
+        snow_note = QLabel("Settles on the scene's own surfaces, tops of objects included. "
+                           "Pair it with a snow emitter for falling flakes.")
+        snow_note.setObjectName("hint")
+        snow_note.setWordWrap(True)
+        self.snow_card.add(snow_note)
+        outer.addWidget(self.snow_card)
+
         # -- wet surfaces: scene-wide, so a card of its own ------------------
         self.wet_card = ModuleCard("Wet surfaces")
-        self._env_sliders: dict[str, FxSlider] = {}
         for prop in WET_PROPS:
             s = FxSlider(prop)
             s.changed.connect(lambda v, f=prop.field: self.set_env(f, v))
@@ -521,6 +614,7 @@ class FxPanel(QWidget):
                            item.id not in self._hidden)
             row.tick.toggled.connect(lambda on, i=item.id: self._set_enabled(i, on))
             row.eye.toggled_eye.connect(lambda on, i=item.id: self._set_shown(i, on))
+            row.duplicate.clicked.connect(lambda _c=False, i=item.id: self._duplicate(i))
             li.setSizeHint(QSize(0, ROW_H))
             self.list.setItemWidget(li, row)
             if item.id == self._item_id:
@@ -643,6 +737,14 @@ class FxPanel(QWidget):
                 self._colour_row()
 
         if kind == "particles":
+            physics = QCheckBox("Simulate physics")
+            physics.setToolTip(
+                "Simulate the particles step by step instead of the fast formula: smoke "
+                "pools and spreads under ceilings, snow piles up where it lands, wind "
+                "and drag act as real forces. Frames are cached as you scrub.")
+            physics.setChecked(bool(getattr(item, "physics", False)))
+            physics.toggled.connect(lambda v: self.set_value("physics", v))
+            self.props_layout.addWidget(physics)
             collide = QCheckBox("Collide with floor, walls and ceiling")
             collide.setChecked(bool(getattr(item, "collide", True)))
             collide.toggled.connect(lambda v: self.set_value("collide", v))
@@ -658,7 +760,7 @@ class FxPanel(QWidget):
         actions = QHBoxLayout()
         dup = QPushButton("Duplicate")
         dup.setObjectName("secondary")
-        dup.clicked.connect(self._duplicate)
+        dup.clicked.connect(lambda _c=False: self._duplicate())
         rem = QPushButton("Remove")
         rem.setObjectName("secondary")
         rem.clicked.connect(self._remove)
@@ -928,22 +1030,19 @@ class FxPanel(QWidget):
         self.owner.keys_changed()
         self.sync()
 
-    def _duplicate(self) -> None:
-        import copy
-        from .effects3d import _id
-        base = self.base_item()
-        if base is None:
-            return
-        twin = copy.deepcopy(base)
-        twin.id = _id()
-        twin.name = f"{base.name} copy"
-        x, y, z = base.position
-        twin.position = (x + 0.3, y, z)
-        for attr in ("volumes", "emitters", "planes", "strikes"):
-            group = getattr(self.owner.effects, attr)
-            if any(i.id == base.id for i in group):
-                group.append(twin)
-        self._added(twin)
+    def _duplicate(self, item_id: str | None = None) -> None:
+        """A copy with every value and keyframe, right after the original.
+        From a row's duplicate button (its id) or the Properties card (the
+        selected effect)."""
+        from .effects3d import duplicate_effect
+        if item_id is None:
+            base = self.base_item()
+            if base is None:
+                return
+            item_id = base.id
+        copy_ = duplicate_effect(self.owner.effects, self.owner.effects_track, item_id)
+        if copy_ is not None:
+            self._added(copy_)
 
     def _remove(self) -> None:
         base = self.base_item()

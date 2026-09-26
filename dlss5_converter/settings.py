@@ -302,6 +302,23 @@ class EffectsSettings:
 
 
 @dataclass
+class StereoSettings:
+    """3D video export (see stereo.py). Off by default."""
+
+    enabled: bool = False
+    format: str = "sbs_half"
+    #: 0..1 how deep the 3D feels.
+    strength: float = 0.5
+    #: 0..1 what sits at screen depth: 0 puts everything behind the screen,
+    #: 1 brings the nearest things out in front of it.
+    pop_out: float = 0.3
+    #: 0..1 how much depth is steadied across frames.
+    smoothing: float = 0.6
+    #: Off for a quick 3D-only conversion that skips the DLSS pass.
+    run_dlss: bool = True
+
+
+@dataclass
 class AppSettings:
     neural: NeuralSettings = field(default_factory=NeuralSettings)
     depth: DepthSettings = field(default_factory=DepthSettings)
@@ -314,6 +331,8 @@ class AppSettings:
     effects: EffectsSettings = field(default_factory=EffectsSettings)
     #: Detail recovery (Preserve / Boost / AI sharpen). Neutral by default.
     detail: DetailSettings = field(default_factory=DetailSettings)
+    #: 3D video export: format and depth feel. Off by default.
+    stereo: StereoSettings = field(default_factory=StereoSettings)
     #: Folder holding the user's own nvngx_dlssnr.dll and the RenoDX add-on.
     #: Empty means "search the usual places" (see paths.runtime_search_roots).
     runtime_dir: str = ""
@@ -376,6 +395,7 @@ class AppSettings:
             grade=build(GradeSettings, raw.get("grade")),
             effects=build(EffectsSettings, raw.get("effects")),
             detail=build(DetailSettings, raw.get("detail")),
+            stereo=build(StereoSettings, raw.get("stereo")),
             runtime_dir=str(raw.get("runtime_dir") or ""),
             last_output_dir=str(raw.get("last_output_dir") or ""),
             theme=str(raw.get("theme") or "Neural Cyan"),

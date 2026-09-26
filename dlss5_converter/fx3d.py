@@ -193,8 +193,17 @@ struct VU {
     rot1: vec4<f32>,
     rot2: vec4<f32>,
     forward: vec4<f32>,      // xyz camera forward, w soft-fade distance
+    wind: vec4<f32>,         // xyz average wind velocity (world, x response), w gusts
 };
 @group(0) @binding(0) var<uniform> u: VU;
+// The wind's travelled distance up to time t, per unit of average strength:
+// the integral of 1 + gusts * (a sum of slow waves), so a particle's drift
+// is exact for any moment without stepping through time.
+fn wind_path(t: f32, g: f32) -> f32 {
+    return t + g * (-0.55 * cos(t * 0.61) / 0.61 - 0.3 * cos(t * 1.37 + 1.1) / 1.37
+                    - 0.15 * cos(t * 2.9 + 2.3) / 2.9);
+}
+
 @group(0) @binding(1) var scene_depth: texture_2d<f32>;
 
 fn to_world(v: vec3<f32>) -> vec3<f32> {
@@ -229,15 +238,39 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) world: vec3<f3
     out.position = u.vp * vec4(out.world, 1.0);
     return out;
 }
-fn hash31(p: vec3<f32>) -> f32 { return fract(sin(dot(p, vec3(127.1,311.7,74.7))) * 43758.5453); }
+// Integer hash (PCG): exact on every GPU. The old fract(sin(x) * 43758.5)
+// runs out of float precision for larger x, which made neighbouring cells and
+// particle ids get near-identical "random" values: square blotches in snow
+// and puddles, particles marching in lines.
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+fn u01(v: u32) -> f32 { return f32(v >> 8u) * (1.0 / 16777216.0); }
+fn hash31(p: vec3<f32>) -> f32 {
+    let i = vec3<i32>(floor(p));
+    return u01(pcg(bitcast<u32>(i.x) ^ pcg(bitcast<u32>(i.y) ^ pcg(bitcast<u32>(i.z) + 0x9E3779B9u))));
+}
+fn grad3(i: vec3<f32>, f: vec3<f32>) -> f32 {
+    let z = hash31(i) * 2.0 - 1.0;
+    let a = hash31(i + vec3(17.0, 59.0, 3.0)) * 6.2831853;
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    return dot(vec3(r * cos(a), r * sin(a), z), f);
+}
+// Gradient noise, 0..1: no visible lattice as the fog and smoke flow.
 fn noise(p: vec3<f32>) -> f32 {
-    let i=floor(p); let f=fract(p); let q=f*f*(3.0-2.0*f);
-    return mix(mix(mix(hash31(i),hash31(i+vec3(1,0,0)),q.x),mix(hash31(i+vec3(0,1,0)),hash31(i+vec3(1,1,0)),q.x),q.y),
-               mix(mix(hash31(i+vec3(0,0,1)),hash31(i+vec3(1,0,1)),q.x),mix(hash31(i+vec3(0,1,1)),hash31(i+vec3(1,1,1)),q.x),q.y),q.z);
+    let i=floor(p); let f=fract(p); let q=f*f*f*(f*(f*6.0-15.0)+10.0);
+    let n=mix(mix(mix(grad3(i,f),grad3(i+vec3(1,0,0),f-vec3(1,0,0)),q.x),
+                  mix(grad3(i+vec3(0,1,0),f-vec3(0,1,0)),grad3(i+vec3(1,1,0),f-vec3(1,1,0)),q.x),q.y),
+              mix(mix(grad3(i+vec3(0,0,1),f-vec3(0,0,1)),grad3(i+vec3(1,0,1),f-vec3(1,0,1)),q.x),
+                  mix(grad3(i+vec3(0,1,1),f-vec3(0,1,1)),grad3(i+vec3(1,1,1),f-vec3(1,1,1)),q.x),q.y),q.z);
+    return clamp(0.5+n*0.95,0.0,1.0);
 }
 fn fbm(p0: vec3<f32>) -> f32 {
     var p=p0; var value=0.0; var amp=0.55;
-    for(var i=0;i<4;i=i+1){ value += noise(p)*amp; p=p*2.03+vec3(1.7,3.1,2.4); amp*=0.5; }
+    let r=mat3x3<f32>(0.00,0.80,0.60, -0.80,0.36,-0.48, -0.60,-0.48,0.64);
+    for(var i=0;i<4;i=i+1){ value += noise(p)*amp; p=r*p*2.03+vec3(1.7,3.1,2.4); amp*=0.5; }
     return value;
 }
 // Drawn with FRONT faces culled: the back faces of the box are always on
@@ -263,7 +296,10 @@ fn fbm(p0: vec3<f32>) -> f32 {
         let world=u.camera.xyz+world_dir*travelled;
         let p=to_local(world-u.centre.xyz)/u.half_size.xyz;
         let radial=max(0.0,1.0-dot(p,p)*0.34);
-        let drift=vec3(0.13,-u.shape.w,0.09)*u.timing.x;
+        // The noise flows with the wind: the pattern moves by the distance
+        // the wind has carried it, in the box's own normalised space.
+        let carried=to_local(u.wind.xyz)/u.half_size.xyz*wind_path(u.timing.x, u.wind.w);
+        let drift=vec3(0.13,-u.shape.w,0.09)*u.timing.x-carried*0.5;
         let n=fbm(p*u.shape.y+drift+u.timing.y);
         let kind=u.ambient_kind.w;
         var d=u.shape.x*radial*smoothstep(0.22,0.82,n);
@@ -303,8 +339,20 @@ struct PU {
     dir: vec4<f32>,          // xyz travel direction, w drag
     planes: array<vec4<f32>, 4>,   // collision planes n.p + c >= 0 is free space
     light: vec4<f32>,        // xyz key light direction (towards the light)
+    wind: vec4<f32>,         // xyz average wind velocity (world, x response), w gusts
+    wind2: vec4<f32>,        // x scene time, y wind turbulence, z emitter time scale, w 1 = simulated
 };
 @group(0) @binding(0) var<uniform> u: PU;
+// Physics mode: per particle (position, age) and (previous position, on a surface).
+@group(0) @binding(2) var<storage, read> sim: array<vec4<f32>>;
+// The wind's travelled distance up to time t, per unit of average strength:
+// the integral of 1 + gusts * (a sum of slow waves), so a particle's drift
+// is exact for any moment without stepping through time.
+fn wind_path(t: f32, g: f32) -> f32 {
+    return t + g * (-0.55 * cos(t * 0.61) / 0.61 - 0.3 * cos(t * 1.37 + 1.1) / 1.37
+                    - 0.15 * cos(t * 2.9 + 2.3) / 2.9);
+}
+
 @group(0) @binding(1) var scene_depth: texture_2d<f32>;
 
 const SMOKE: i32 = 0;
@@ -318,16 +366,40 @@ const RAIN: i32 = 6;
 const COOL_START: f32 = 0.18;
 const ASH_AT: f32 = 0.62;
 
-fn hash(n:f32)->f32{return fract(sin(n)*43758.5453);}
-fn h2(p:vec2<f32>)->f32{return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
-fn vnoise(p:vec2<f32>)->f32{
-    let i=floor(p); let f=fract(p); let w=f*f*(3.0-2.0*f);
-    return mix(mix(h2(i),h2(i+vec2(1.0,0.0)),w.x),
-               mix(h2(i+vec2(0.0,1.0)),h2(i+vec2(1.0,1.0)),w.x),w.y);
+// Integer hash (PCG): exact on every GPU. The old fract(sin(x) * 43758.5)
+// runs out of float precision for larger x, which made neighbouring cells and
+// particle ids get near-identical "random" values: square blotches in snow
+// and puddles, particles marching in lines.
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
 }
+fn u01(v: u32) -> f32 { return f32(v >> 8u) * (1.0 / 16777216.0); }
+fn hash(n:f32)->f32{ return u01(pcg(bitcast<u32>(n))); }
+fn h2(p:vec2<f32>)->f32{
+    let i = vec2<i32>(floor(p));
+    return u01(pcg(bitcast<u32>(i.x) ^ pcg(bitcast<u32>(i.y) + 0x9E3779B9u)));
+}
+// Gradient (Perlin-style) noise, 0..1. Value noise on a square grid shows the
+// grid wherever it is thresholded into shapes; gradient noise has no visible
+// cells.
+fn grad2(i:vec2<f32>, f:vec2<f32>)->f32{
+    let a = h2(i) * 6.2831853;
+    return dot(vec2(cos(a), sin(a)), f);
+}
+fn vnoise(p:vec2<f32>)->f32{
+    let i=floor(p); let f=fract(p);
+    let w=f*f*f*(f*(f*6.0-15.0)+10.0);
+    let n=mix(mix(grad2(i,f),grad2(i+vec2(1.0,0.0),f-vec2(1.0,0.0)),w.x),
+              mix(grad2(i+vec2(0.0,1.0),f-vec2(0.0,1.0)),grad2(i+vec2(1.0,1.0),f-vec2(1.0,1.0)),w.x),w.y);
+    return clamp(0.5+n*0.95,0.0,1.0);
+}
+// Each octave turned against the last, so no layer lines up with the floor.
 fn fbm(p:vec2<f32>)->f32{
     var a=0.5; var s=0.0; var q=p;
-    for (var i=0; i<4; i=i+1) { s+=a*vnoise(q); q=q*2.03+vec2(1.7,9.2); a*=0.5; }
+    let r=mat2x2<f32>(0.8,0.6,-0.6,0.8);
+    for (var i=0; i<4; i=i+1) { s+=a*vnoise(q); q=r*q*2.03+vec2(1.7,9.2); a*=0.5; }
     return s;
 }
 fn kind()->i32{return i32(u.ambient_kind.w+0.5);}
@@ -374,6 +446,22 @@ fn position_at(id:f32, s:f32)->vec4<f32>{
                   sin(f.x*2.3+s*0.9)+0.5*sin(f.y*3.1+id));
     p+=curl*tq*0.09*(0.25+age);
 
+    // Wind: carried by the scene wind for the time the particle has been
+    // alive (in scene seconds: the emitter's time scale speeds its own clock),
+    // gusts included, and stirred by the wind's own turbulence.
+    let now=u.wind2.x;
+    let alive=s/max(u.wind2.z,1e-3);
+    let carried=wind_path(now,u.wind.w)-wind_path(now-alive,u.wind.w);
+    p+=u.wind.xyz*carried;
+    // Weather fills a space instead of streaming from a point: start it half
+    // a lifetime upwind so a strong wind does not blow the whole curtain away
+    // from where the emitter was placed.
+    let kk=kind();
+    if (kk==RAIN || kk==SNOW || kk==DUST || kk==CLOUDS) {
+        p-=u.wind.xyz*(u.motion.y/max(u.wind2.z,1e-3))*0.5;
+    }
+    p+=curl*u.wind2.y*length(u.wind.xyz)*0.12*alive;
+
     // Ash: a cooled ember loses the heat that carried it up. From the moment
     // it turns to ash it is pulled back down (against the travel direction,
     // which for embers is up) and flutters side to side like a flake, so it
@@ -406,8 +494,16 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
     let id=f32(vi/6u); let corner=vi%6u;
     var quad=array<vec2<f32>,6>(vec2(-1,-1),vec2(1,-1),vec2(1,1),vec2(-1,-1),vec2(1,1),vec2(-1,1));
     let q=quad[corner]; let phase=hash(id*19.19+u.physics.w);
-    let age=fract(u.motion.x/max(u.motion.y,0.01)+phase); let s=age*u.motion.y;
-    let at=position_at(id,s);
+    let simulated=u.wind2.w>0.5;
+    var age=fract(u.motion.x/max(u.motion.y,0.01)+phase);
+    var at=vec4<f32>(0.0);
+    var prev=vec3<f32>(0.0);
+    if (simulated) {
+        let a=sim[u32(id)*2u]; let b=sim[u32(id)*2u+1u];
+        age=a.w; at=vec4<f32>(a.xyz,b.w); prev=b.xyz;
+    }
+    let s=age*u.motion.y;
+    if (!simulated) { at=position_at(id,s); }
     let p=at.xyz;
     let kd=kind();
     // A raindrop that has reached the floor becomes a splash lying on it.
@@ -432,7 +528,9 @@ struct Out{@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,
     var along=vec2(1.0,0.0); var stretch=1.0;
     if ((kd==EMBERS || kd==FIRE || kd==RAIN) && !splash) {
         let dt=1.0/30.0;
-        let v=(p-position_at(id,max(s-dt,0.0)).xyz)/dt;
+        var before=prev;
+        if (!simulated) { before=position_at(id,max(s-dt,0.0)).xyz; }
+        let v=(p-before)/dt;
         let sv=vec2(dot(v,u.right.xyz),dot(v,u.up.xyz));
         let speed=length(sv);
         let hot=1.0-smoothstep(COOL_START,ASH_AT*0.8,age);
@@ -620,8 +718,13 @@ class FxPass:
             {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
              "buffer": {"type": wgpu.BufferBindingType.uniform}},
             {"binding": 1, "visibility": wgpu.ShaderStage.FRAGMENT,
-             "texture": {"sample_type": wgpu.TextureSampleType.unfilterable_float}}])
+             "texture": {"sample_type": wgpu.TextureSampleType.unfilterable_float}},
+            # Simulated particle positions (physics mode); a dummy otherwise.
+            {"binding": 2, "visibility": wgpu.ShaderStage.VERTEX,
+             "buffer": {"type": wgpu.BufferBindingType.read_only_storage}}])
         self._layout = layout
+        self._dummy = device.create_buffer(size=32, usage=wgpu.BufferUsage.STORAGE)
+        self._sim_bufs: dict[int, object] = {}
         pl = device.create_pipeline_layout(bind_group_layouts=[layout])
 
         def pipe(code: str, cull, colour_src: str, buffers=()):
@@ -650,7 +753,7 @@ class FxPass:
                 {"format": wgpu.VertexFormat.float32, "offset": 16, "shader_location": 2}]}])
         self._pool: dict[str, list] = {"v": [], "p": [], "b": []}
 
-    def _group(self, kind: str, index: int, values: np.ndarray, depth_view):
+    def _group(self, kind: str, index: int, values: np.ndarray, depth_view, sim=None):
         wgpu = self._wgpu
         pool = self._pool[kind]
         while len(pool) <= index:
@@ -660,7 +763,18 @@ class FxPass:
         self.device.queue.write_buffer(buf, 0, values.astype(np.float32).tobytes())
         return self.device.create_bind_group(layout=self._layout, entries=[
             {"binding": 0, "resource": {"buffer": buf}},
-            {"binding": 1, "resource": depth_view}])
+            {"binding": 1, "resource": depth_view},
+            {"binding": 2, "resource": {"buffer": sim if sim is not None else self._dummy}}])
+
+    def _sim_buffer(self, slot: int, data: np.ndarray):
+        wgpu = self._wgpu
+        size = max(32, data.nbytes)
+        buf = self._sim_bufs.get(slot)
+        if buf is None or buf.size < size:
+            buf = self.device.create_buffer(size=size, usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+            self._sim_bufs[slot] = buf
+        self.device.queue.write_buffer(buf, 0, data.tobytes())
+        return buf
 
     def encode(self, enc, colour_view, depth_view, view: np.ndarray, proj: np.ndarray,
                camera_pos, effects, time_seconds: float, planes=None) -> None:
@@ -672,6 +786,9 @@ class FxPass:
         ambient, _key, key_dir = lighting_values(effects)
         ambient = np.clip(ambient, 0.0, 8.0)
         forward = -view[2, :3]
+        from .effects3d import wind_vector
+        _now, wind_avg, wind_turb = wind_vector(effects.lighting, time_seconds)
+        wind_gusts = float(np.clip(getattr(effects.lighting, "wind_gusts", 0.0), 0.0, 1.0))
         rp = enc.begin_render_pass(color_attachments=[{
             "view": colour_view, "load_op": wgpu.LoadOp.load, "store_op": wgpu.StoreOp.store}])
         rp.set_pipeline(self._volume)
@@ -679,7 +796,7 @@ class FxPass:
         for vol in effects.volumes:
             if not vol.enabled or vol.density <= 0.0:
                 continue
-            v = np.zeros(64, np.float32)
+            v = np.zeros(68, np.float32)
             v[:16] = np.ascontiguousarray(vp.T).ravel()
             v[16:19] = camera_pos
             v[20:23] = vol.position
@@ -696,6 +813,8 @@ class FxPass:
             v[48:51], v[52:55], v[56:59] = rot[0], rot[1], rot[2]
             v[60:63] = forward
             v[63] = max(float(np.min(vol.size)) * 0.25, 0.05)
+            v[64:67] = wind_avg * float(getattr(vol, "wind_response", 1.0))
+            v[67] = wind_gusts
             rp.set_bind_group(0, self._group("v", slot, v, depth_view))
             slot += 1
             rp.draw(36, 1, 0, 0)
@@ -714,7 +833,7 @@ class FxPass:
         for em in effects.emitters:
             if not em.enabled or em.count <= 0:
                 continue
-            v = np.zeros(84, np.float32)
+            v = np.zeros(88, np.float32)
             v[:16] = np.ascontiguousarray(vp.T).ravel()
             v[16:19] = view[0, :3]
             v[20:23] = view[1, :3]
@@ -766,10 +885,27 @@ class FxPass:
                     v[63 + 4 * count] = c
                     count += 1
                 v[53] = count
-            v[80:83] = key_dir
-            rp.set_bind_group(0, self._group("p", slot, v, depth_view))
+            # Matches the PU struct: planes fill 60-75, so the light is at 76.
+            # (It used to be written at 80, one slot past it, which left
+            # particles always lit from straight above.)
+            v[76:79] = key_dir
+            v[80:83] = wind_avg * float(getattr(em, "wind_response", 1.0))
+            v[83] = wind_gusts
+            v[84:87] = (time_seconds, wind_turb, max(float(em.rate), 1e-3))
+            sim_buf = None
+            sim_count = min(int(em.count), MAX_PARTICLES)
+            if getattr(em, "physics", False):
+                from . import particlesim
+                used = []
+                for i in range(int(v[53])):
+                    used.append((v[60 + 4 * i: 63 + 4 * i].copy(), float(v[63 + 4 * i])))
+                data = particlesim.simulation(em, effects.lighting, used, direction).buffer_at(time_seconds)
+                sim_buf = self._sim_buffer(slot, data)
+                v[87] = 1.0
+                sim_count = len(data)
+            rp.set_bind_group(0, self._group("p", slot, v, depth_view, sim_buf))
             slot += 1
-            rp.draw(min(int(em.count), MAX_PARTICLES) * 6, 1, 0, 0)
+            rp.draw(sim_count * 6, 1, 0, 0)
         rp.set_pipeline(self._bolt)
         slot = 0
         for item in getattr(effects, "strikes", []):
