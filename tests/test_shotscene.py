@@ -143,3 +143,17 @@ def test_saved_scene_draws_from_its_own_layer_cache(tmp_path):
     (tmp_path / "a.png").unlink()                    # the original is gone
     assert np.allclose(back.depth(0, size), 2.5, rtol=2e-3)
     assert np.abs(back.colour(0, size).astype(int) - scene.colour(0, size).astype(int)).max() <= 6
+
+
+def test_delete_saved_removes_only_a_scene_folder(tmp_path):
+    root = tmp_path / "scenes"
+    scene = root / "Game 2026-01-01 10-00-00"
+    scene.mkdir(parents=True)
+    (scene / "scene.json").write_text("{}", encoding="utf-8")
+    elsewhere = tmp_path / "screenshots"
+    elsewhere.mkdir()
+    (elsewhere / "scene.json").write_text("{}", encoding="utf-8")
+    assert not multishot.delete_saved(elsewhere, root)        # outside the scenes folder
+    assert not multishot.delete_saved(root, root)             # the scenes folder itself
+    assert elsewhere.exists()
+    assert multishot.delete_saved(scene, root) and not scene.exists()

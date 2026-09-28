@@ -58,6 +58,9 @@ def startup_crash_advice() -> str:
         driver = hardware.query_driver_version()
     except Exception:  # noqa: BLE001 - advice must never raise
         driver = None
+    blocked = hardware.driver_warning(driver) if driver else None
+    if blocked:
+        return "DLSS crashed while starting on the GPU. " + blocked
     now = f" Your driver is {driver}." if driver else ""
     return ("DLSS crashed while starting on the GPU, before the first frame, while "
             "it was creating the DLSS feature with the neural add-on. Your files "
@@ -619,6 +622,12 @@ def interpret_probe(report: str) -> list[str]:
     healthy = test.lower() == "ok" and is_on("dlssnr_module_loaded")
     if healthy:
         return []
+    # A driver NVIDIA has blocked explains any failure below it, so it comes
+    # first and alone: chasing file versions on such a driver is wasted effort.
+    from . import hardware
+    blocked = hardware.driver_warning(fields.get("driver_version"))
+    if blocked:
+        return [blocked]
     if "did not respond within" in report or report.strip() == "No output." or (
             "adapter" in fields and "test_evaluation" not in fields
             and is_on("dlss_available") is not False):

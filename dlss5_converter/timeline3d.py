@@ -10,13 +10,32 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .animation3d import CameraTrack, Easing
-from .effects3d import EffectsTrack
+from .effects3d import ENVIRONMENT, EffectsTrack
+
+#: Readable names for property paths on the FX rows.
+_COMPONENTS = {"position": "XYZ", "size": "XYZ", "rotation": "XYZ", "direction": "XYZ",
+               "colour": "RGB", "ambient_colour": "RGB", "key_colour": "RGB",
+               "key_direction": "XYZ"}
+
+
+def property_label(path: str, names: dict[str, str]) -> str:
+    """'abc123.lifetime' -> 'Rain emitter · Lifetime'."""
+    owner, _, rest = path.partition(".")
+    field, _, component = rest.partition(".")
+    who = "Environment" if owner == ENVIRONMENT else names.get(owner, "Effect")
+    what = field.replace("_", " ").capitalize()
+    if component:
+        axes = _COMPONENTS.get(field, "")
+        index = int(component) if component.isdigit() else 0
+        what += f" {axes[index]}" if index < len(axes) else f" {component}"
+    return f"{who} · {what}"
 
 RULER_HEIGHT = 22
 ROW_HEIGHT = 25
 KEY_RADIUS = 5
 MARGIN = 10
-LABEL_WIDTH = 92
+#: Wide enough for an effect property row ("Rain emitter · Lifetime").
+LABEL_WIDTH = 150
 PROPERTY_ROWS = (
     ("Orbit", "yaw"),
     ("Height", "pitch"),
@@ -75,6 +94,8 @@ class TimelineWidget(QWidget):
     key_selected = Signal(float)
     property_selected = Signal(str)
     keys_changed = Signal()
+    #: An effects key was moved or removed on the timeline.
+    fx_keys_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -89,6 +110,12 @@ class TimelineWidget(QWidget):
         self.selection: set[float] = set()
         self.selected_property = "camera"
         self.expanded = False
+        #: The FX group, open: one row per animated effect property.
+        self.fx_expanded = False
+        self.effect_names: dict[str, str] = {}
+        #: The effects key being dragged / last clicked: (row property, time).
+        self._dragging_fx: tuple[str, float] | None = None
+        self._fx_selected: tuple[str, float] | None = None
         self._dragging_key: float | None = None
         self._scrubbing = False
         self._marquee_origin: QPoint | None = None
@@ -105,10 +132,13 @@ class TimelineWidget(QWidget):
         if self.expanded:
             rows.extend(PROPERTY_ROWS)
         rows.append(("FX & Lighting", "effects"))
+        if self.fx_expanded:
+            rows.extend((property_label(path, self.effect_names), "fx:" + path)
+                        for path in self.effects_track.animated_paths())
         return rows
 
     def _update_height(self) -> None:
-        row_count = 2 + (len(PROPERTY_ROWS) if self.expanded else 0)
+        row_count = len(self._rows())
         height = RULER_HEIGHT + ROW_HEIGHT * row_count + 14
         self.setMinimumHeight(height)
         self.setMaximumHeight(height)
@@ -163,7 +193,32 @@ class TimelineWidget(QWidget):
 
     def set_effects_track(self, track: EffectsTrack) -> None:
         self.effects_track = track
+        self._update_height()
         self.update()
+
+    def set_effect_names(self, names: dict[str, str]) -> None:
+        self.effect_names = dict(names)
+        self.update()
+
+    def set_fx_expanded(self, expanded: bool) -> None:
+        self.fx_expanded = bool(expanded)
+        self._update_height()
+        self.update()
+
+    def _row_keys(self, property_name: str):
+        """The keys a row shows: camera keys, every effects key on the FX
+        summary row, or the keys pinning one property on its own row."""
+        if property_name == "effects":
+            return sorted(self.effects_track.keys, key=lambda key: key.time)
+        if property_name.startswith("fx:"):
+            path = property_name[3:]
+            return sorted((k for k in self.effects_track.keys if k.covers(path)),
+                          key=lambda key: key.time)
+        return self.track.sorted_keys()
+
+    def _is_fx_row(self, row: int) -> bool:
+        name = self._rows()[row][1]
+        return name == "effects" or name.startswith("fx:")
 
     def set_markers(self, times) -> None:
         self.markers = sorted(float(t) for t in times)
@@ -215,10 +270,8 @@ class TimelineWidget(QWidget):
 
     def _paint_rows(self, painter: QPainter, area: QRect) -> None:
         for row_index, (label, property_name) in enumerate(self._rows()):
-            keys = (
-                sorted(self.effects_track.keys, key=lambda key: key.time)
-                if property_name == "effects" else self.track.sorted_keys()
-            )
+            keys = self._row_keys(property_name)
+            fx_row = property_name == "effects" or property_name.startswith("fx:")
             top = RULER_HEIGHT + row_index * ROW_HEIGHT
             rect = QRect(area.left(), top, area.width(), ROW_HEIGHT - 1)
             selected_row = self.selected_property == property_name
@@ -226,8 +279,14 @@ class TimelineWidget(QWidget):
             painter.setBrush(QColor("#1a2030") if selected_row else QColor("#151b26"))
             painter.drawRoundedRect(rect, 4, 4)
             painter.setPen(QColor("#d5d9e4") if selected_row else QColor("#8792a8"))
-            indent = 18 if row_index else 0
-            prefix = ("▾ " if self.expanded else "▸ ") if row_index == 0 else ""
+            indent = 0 if row_index == 0 or property_name == "effects" else 18
+            if row_index == 0:
+                prefix = "▾ " if self.expanded else "▸ "
+            elif property_name == "effects" and self.effects_track.animated_paths():
+                prefix = "▾ " if self.fx_expanded else "▸ "
+            else:
+                prefix = ""
+            painter.setFont(QFont("Segoe UI", 8))
             painter.drawText(
                 QRect(8 + indent, top, LABEL_WIDTH - 12 - indent, ROW_HEIGHT),
                 Qt.AlignmentFlag.AlignVCenter,
@@ -246,16 +305,21 @@ class TimelineWidget(QWidget):
                 x = self._x_for(key.time)
                 if index + 1 < len(keys):
                     next_x = self._x_for(keys[index + 1].time)
-                    colour = QColor("#41b9c6") if property_name == "effects" else (
+                    colour = QColor("#41b9c6") if fx_row else (
                         QColor("#4a5570") if key.easing is Easing.STEP else QColor("#7464e8")
                     )
                     painter.setPen(QPen(colour, 2 if row_index else 3))
                     painter.drawLine(x, y, next_x, y)
-                chosen = property_name != "effects" and any(abs(key.time - time) < 1e-6 for time in self.selection)
+                if fx_row:
+                    chosen = (self._fx_selected is not None
+                              and self._fx_selected[0] == property_name
+                              and abs(self._fx_selected[1] - key.time) < 1e-6)
+                else:
+                    chosen = any(abs(key.time - time) < 1e-6 for time in self.selection)
                 painter.setPen(QPen(QColor("#ffffff") if chosen else QColor("#b7adff"), 1))
                 painter.setBrush(QColor("#8b79ff") if chosen else QColor("#2a2450"))
                 radius = KEY_RADIUS if row_index == 0 else KEY_RADIUS - 1
-                if property_name == "effects":
+                if fx_row:
                     left = right = "linear"
                 else:
                     prev = keys[index - 1] if index > 0 else None
@@ -283,7 +347,11 @@ class TimelineWidget(QWidget):
         row = self._row_at(pos.y())
         if row is None or abs(pos.y() - self._track_y(row)) > KEY_RADIUS * 2.2:
             return None
-        if self._rows()[row][1] == "effects":
+        name = self._rows()[row][1]
+        if name == "effects" or name.startswith("fx:"):
+            for key in self._row_keys(name):
+                if abs(self._x_for(key.time) - pos.x()) <= KEY_RADIUS * 1.8:
+                    return key.time, row
             return None
         for key in self.track.sorted_keys():
             if abs(self._x_for(key.time) - pos.x()) <= KEY_RADIUS * 1.8:
@@ -299,12 +367,23 @@ class TimelineWidget(QWidget):
         if pos.x() < LABEL_WIDTH and row is not None:
             if row == 0:
                 self.set_expanded(not self.expanded)
+            elif self._rows()[row][1] == "effects":
+                self.set_fx_expanded(not self.fx_expanded)
             else:
                 self.selected_property = self._rows()[row][1]
                 self.property_selected.emit(self.selected_property)
                 self.update()
             return
         hit = self._key_at(pos)
+        if hit is not None and self._is_fx_row(hit[1]):
+            time, row = hit
+            name = self._rows()[row][1]
+            self._fx_selected = (name, time)
+            self._dragging_fx = (name, time)
+            self.selection.clear()
+            self.set_time(time)
+            self.update()
+            return
         if hit is not None:
             time, row = hit
             additive = bool(
@@ -344,6 +423,20 @@ class TimelineWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position()
+        if self._dragging_fx is not None:
+            name, old = self._dragging_fx
+            new = self.snap(self._time_for(pos.x()))
+            if abs(new - old) > 1e-6:
+                if name == "effects":
+                    moved = self.effects_track.move_key(old, new)
+                else:
+                    moved = self.effects_track.move_property_key(old, new, name[3:])
+                self._dragging_fx = (name, moved)
+                self._fx_selected = (name, moved)
+                self.set_time(moved)
+                self.fx_keys_changed.emit()
+                self.update()
+            return
         if self._dragging_key is not None:
             key = self.track.nearest(self._dragging_key, tolerance=1e-3)
             if key is not None:
@@ -390,13 +483,27 @@ class TimelineWidget(QWidget):
             elif self.selected is not None:
                 self.key_selected.emit(self.selected)
         self._dragging_key = None
+        self._dragging_fx = None
         self._scrubbing = False
         self._marquee_origin = None
         self._marquee_rect = None
         self._marquee_base_selection.clear()
         self.update()
 
+    def _remove_fx_key(self, name: str, time: float) -> bool:
+        if name == "effects":
+            return self.effects_track.remove_at(time, tolerance=1e-3)
+        return self.effects_track.unkey_property(time, name[3:], tolerance=1e-3)
+
     def keyPressEvent(self, event) -> None:
+        if (event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)
+                and self._fx_selected is not None):
+            if self._remove_fx_key(*self._fx_selected):
+                self._fx_selected = None
+                self._update_height()
+                self.fx_keys_changed.emit()
+                self.update()
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             removed = False
             for time in list(self.selection):
@@ -411,6 +518,13 @@ class TimelineWidget(QWidget):
 
     def mouseDoubleClickEvent(self, event) -> None:
         hit = self._key_at(event.position())
+        if hit is not None and self._is_fx_row(hit[1]):
+            if self._remove_fx_key(self._rows()[hit[1]][1], hit[0]):
+                self._fx_selected = None
+                self._update_height()
+                self.fx_keys_changed.emit()
+                self.update()
+            return
         if hit is not None and self.track.remove_at(hit[0], tolerance=1e-3):
             self.selected = None
             self.selection.discard(hit[0])

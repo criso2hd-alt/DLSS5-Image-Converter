@@ -580,6 +580,26 @@ def _save_thumb(folder: Path, report: Report) -> None:
             buf.tofile(str(folder / "thumb.jpg"))
 
 
+def delete_saved(folder: str | Path, root: Path | None = None) -> bool:
+    """Remove one saved scene from disk. Only a scene folder inside the scenes
+    folder is ever removed (it must hold scene.json), so a bad path can never
+    take anything else with it. The screenshots it was built from are not
+    touched: they were never copied here."""
+    import shutil
+    from . import paths
+
+    root = Path(root) if root is not None else paths.scenes_dir()
+    folder = Path(folder)
+    try:
+        inside = folder.resolve().parent == root.resolve()
+    except OSError:
+        return False
+    if not inside or not (folder / "scene.json").is_file():
+        return False
+    shutil.rmtree(folder, ignore_errors=True)
+    return not folder.exists()
+
+
 def list_saved(root: Path | None = None) -> list[SavedScene]:
     """Saved scenes, newest first. A damaged entry is skipped, never fatal."""
     import json

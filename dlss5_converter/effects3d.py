@@ -490,6 +490,33 @@ class EffectsTrack:
             self.keys.remove(key)
         return True
 
+    def animated_paths(self) -> list[str]:
+        """Every property some key pins by name, for one timeline row each.
+        (Snapshot keys pin everything and show on the summary row.)"""
+        return sorted({path for key in self.keys for path in key.paths})
+
+    def move_key(self, old_time: float, new_time: float, tolerance: float = 1e-3) -> float:
+        """Slide a whole key (every property it pins) to a new time."""
+        key = self.nearest(old_time, tolerance)
+        if key is None:
+            return old_time
+        key.time = float(new_time)
+        self.keys.sort(key=lambda item: item.time)
+        return key.time
+
+    def move_property_key(self, old_time: float, new_time: float, path: str,
+                          tolerance: float = 1e-3) -> float:
+        """Slide one property's key to a new time, keeping its value, while
+        anything else keyed at the old time stays where it is."""
+        key = self.nearest(old_time, tolerance)
+        if key is None or not key.covers(path) or abs(float(new_time) - key.time) < 1e-9:
+            return old_time
+        if key.paths == {path}:
+            return self.move_key(old_time, new_time, tolerance)
+        carried = key.state.clone()                 # holds the value at the old time
+        self.unkey_property(key.time, path, tolerance)
+        return self.key_property(float(new_time), path, carried, tolerance).time
+
     def is_keyed(self, time: float, path: str, tolerance: float = 0.02) -> bool:
         key = self.nearest(time, tolerance)
         return key is not None and key.covers(path)

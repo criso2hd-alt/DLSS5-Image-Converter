@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dlss5_converter.evaluator import interpret_probe
 
-# The exact report from issue #6 (RTX 5080, everything 0, feature init failed).
+# The report from issue #6 (RTX 5080, everything 0, feature init failed), on
+# a driver before NVIDIA's block so these tests exercise the load-order
+# diagnosis. (The real report was on 616.64, which the driver check now names
+# as the cause; see test_issue_6_as_reported_is_the_driver.)
 ISSUE_6 = """adapter: NVIDIA GeForce RTX 5080
 dlss_available: 0
 needs_driver_update: 0
-driver_version: 616.64
+driver_version: 591.44
 neural_addon_loaded: 0
 reshade_proxy_loaded: 0
 dlssnr_module_loaded: 0
@@ -75,3 +78,9 @@ def test_a_hung_or_dying_probe_is_a_startup_crash(monkeypatch):
     # Crashed before printing anything at all.
     silent = evaluator.interpret_probe("No output.")
     assert len(silent) == 1 and "while starting" in silent[0]
+
+
+def test_issue_6_as_reported_is_the_driver():
+    """On 616.64 itself, NVIDIA's driver block is the cause worth naming."""
+    problems = interpret_probe(ISSUE_6.replace("591.44", "616.64"))
+    assert len(problems) == 1 and "616.64" in problems[0]
