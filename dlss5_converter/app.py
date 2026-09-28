@@ -2213,16 +2213,31 @@ class VideoPage(QWidget):
         self.stop.setObjectName("secondary")
         self.stop.setVisible(False)
 
+        # The cards scroll and the actions stay pinned under them, as on the
+        # Single image tab. With the 3D card added the column no longer fits a
+        # smaller window, and an unscrolled column squeezed every slider until
+        # its handle was cut off.
+        cards = QWidget()
+        cards_col = QVBoxLayout(cards)
+        cards_col.setContentsMargins(0, 0, 0, 0)
+        cards_col.setSpacing(12)
+        cards_col.addWidget(source_card)
+        cards_col.addWidget(self.stereo_card)
+        cards_col.addWidget(export_card)
+        cards_col.addWidget(self.info_label)
+        cards_col.addStretch(1)
+        scroller = QScrollArea()
+        scroller.setWidget(cards)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.Shape.NoFrame)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         rail = QWidget()
         rail.setFixedWidth(SIDEBAR_WIDTH + 18)
         rail_col = QVBoxLayout(rail)
         rail_col.setContentsMargins(0, 0, 0, 0)
         rail_col.setSpacing(12)
-        rail_col.addWidget(source_card)
-        rail_col.addWidget(self.stereo_card)
-        rail_col.addWidget(export_card)
-        rail_col.addWidget(self.info_label)
-        rail_col.addStretch(1)
+        rail_col.addWidget(scroller, 1)
         rail_col.addWidget(self.queue_button)
         rail_col.addWidget(self.stop)
         rail_col.addWidget(self.start)
@@ -2872,6 +2887,9 @@ def _alive(widget) -> bool:
 
 
 class MainWindow(QMainWindow):
+    #: The NVIDIA driver version, found off the UI thread at startup ("" if none).
+    driver_checked = Signal(str)
+
     def __init__(self, first_run_setup: bool = True) -> None:
         super().__init__()
         self.setWindowTitle("DLSS 5 Image & Video Converter")
@@ -3124,6 +3142,50 @@ class MainWindow(QMainWindow):
         # (issue #12).
         if first_run_setup:
             QTimer.singleShot(0, self._start_initial_setup)
+            # nvidia-smi can take a moment, so the driver check runs off the UI
+            # thread and reports back; launch is never held up by it.
+            self.driver_checked.connect(self._driver_checked)
+            QTimer.singleShot(1200, self._check_driver)
+
+    def _check_driver(self) -> None:
+        import threading
+
+        def work() -> None:
+            try:
+                version = hardware.query_driver_version()
+            except Exception:  # noqa: BLE001 - a missing nvidia-smi is not an error
+                version = None
+            if _alive(self):
+                self.driver_checked.emit(version or "")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _driver_checked(self, version: str) -> None:
+        """Warn once per driver that NVIDIA has blocked the neural pass on it."""
+        message = hardware.driver_warning(version)
+        if not message:
+            return
+        self.statusBar().showMessage(
+            f"NVIDIA driver {version} blocks the DLSS 5 neural pass: roll back to "
+            f"{hardware.LAST_WORKING_DRIVER} or older.")
+        if self.settings.driver_warning_dismissed == version:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("This driver cannot run the neural pass")
+        box.setText(message)
+        open_page = box.addButton("Open NVIDIA drivers", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("OK", QMessageBox.ButtonRole.AcceptRole)
+        again = QCheckBox("Don't show this again for this driver")
+        box.setCheckBox(again)
+        box.exec()
+        if again.isChecked():
+            self.settings.driver_warning_dismissed = version
+            self.settings.save(paths.settings_path())
+        if box.clickedButton() is open_page:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(hardware.DRIVER_DOWNLOADS_URL))
 
     # -- command bar ---------------------------------------------------------
 

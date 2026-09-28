@@ -71,3 +71,27 @@ def test_duplicate_copies_every_value_and_keyframe():
     mid = track.evaluate(1.0, state)
     assert mid.item(copy_.id).count == mid.item(smoke.id).count < 999
     assert fx.duplicate_effect(state, track, "nope") is None
+
+
+def test_effect_keys_slide_per_property_or_as_a_whole():
+    state = fx.EffectsState()
+    rain = fx.emitter_preset("rain")
+    state.emitters.append(rain)
+    track = fx.EffectsTrack()
+    life, spread = f"{rain.id}.lifetime", f"{rain.id}.spread"
+    track.key_property(1.0, life, state)
+    track.key_property(1.0, spread, state)
+    later = state.clone()
+    later.emitters[0].lifetime = 9.0
+    track.key_property(3.0, life, later)
+    assert track.animated_paths() == sorted([life, spread])
+
+    # Slide only Lifetime's key at 1 s to 2 s: Spread stays at 1 s.
+    assert track.move_property_key(1.0, 2.0, life) == pytest.approx(2.0)
+    assert track.is_keyed(1.0, spread) and not track.is_keyed(1.0, life)
+    assert track.is_keyed(2.0, life)
+    assert track.evaluate(2.0, state).item(rain.id).lifetime == pytest.approx(rain.lifetime)
+
+    # Slide the whole 3 s key.
+    assert track.move_key(3.0, 4.0) == pytest.approx(4.0)
+    assert track.is_keyed(4.0, life) and track.nearest(3.0, 1e-3) is None

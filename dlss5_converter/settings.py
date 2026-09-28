@@ -355,6 +355,9 @@ class AppSettings:
     #: The adapter the last runtime check said DLSS runs on, remembered so the
     #: automatic choice is right from launch, before this session's check ends.
     dlss_adapter: str = ""
+    #: The driver version whose "cannot run the neural pass" warning the user
+    #: asked not to see again. A different driver warns again.
+    driver_warning_dismissed: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -407,6 +410,7 @@ class AppSettings:
             gpu=str(raw.get("gpu") or ""),
             backend=str(raw.get("backend") or "renodx"),
             dlss_adapter=str(raw.get("dlss_adapter") or ""),
+            driver_warning_dismissed=str(raw.get("driver_warning_dismissed") or ""),
         )
 
     def save(self, path: Path) -> None:

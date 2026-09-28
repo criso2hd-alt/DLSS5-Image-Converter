@@ -30,7 +30,7 @@ from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import splat3d, video
@@ -611,6 +611,7 @@ class CreativePage(QWidget):
         self.timeline.time_changed.connect(self._seek)
         self.timeline.key_selected.connect(self._key_selected)
         self.timeline.keys_changed.connect(self._keys_changed)
+        self.timeline.fx_keys_changed.connect(self._fx_keys_moved)
         outer.addWidget(self.timeline)
 
         status_row = QHBoxLayout()
@@ -1169,19 +1170,63 @@ class CreativePage(QWidget):
         for entry in saved:
             when = time.strftime("%d %b %H:%M", time.localtime(entry.created))
             quality = "SHARP" if entry.sharp else "depth only"
-            item = QListWidgetItem(f"{entry.label.split(':')[0]}\n{when}, {entry.placed} of "
-                                   f"{entry.shots} shots, {quality}")
-            if entry.thumbnail.is_file():
-                item.setIcon(QIcon(QPixmap(str(entry.thumbnail))))
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, str(entry.folder))
             item.setToolTip(f"{entry.label}\n{entry.splats:,} splats\n{entry.folder}")
             self.scene_list.addItem(item)
+            # A row of its own: thumbnail, name and a delete button at the end.
+            row = QWidget()
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(4, 2, 4, 2)
+            lay.setSpacing(8)
+            thumb = QLabel()
+            if entry.thumbnail.is_file():
+                thumb.setPixmap(QPixmap(str(entry.thumbnail)).scaled(
+                    80, 34, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            thumb.setFixedSize(80, 34)
+            text = QLabel(f"{entry.label.split(':')[0]}\n{when}, {entry.placed} of "
+                          f"{entry.shots} shots, {quality}")
+            # Clicks on the picture and text must reach the list, which opens it.
+            for label in (thumb, text):
+                label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            delete = QToolButton()
+            delete.setText("🗑")
+            delete.setAutoRaise(True)
+            delete.setCursor(Qt.CursorShape.PointingHandCursor)
+            delete.setToolTip("Delete this saved scene (your screenshots are not touched).")
+            delete.clicked.connect(lambda _c=False, e=entry: self._delete_scene(e))
+            lay.addWidget(thumb)
+            lay.addWidget(text, 1)
+            lay.addWidget(delete)
+            item.setSizeHint(QSize(0, 42))
+            self.scene_list.setItemWidget(item, row)
+
+    def _delete_scene(self, entry) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from . import multishot
+        answer = QMessageBox.question(
+            self, "Delete scene",
+            f"Delete \"{entry.label.split(':')[0]}\" from {time.strftime('%d %b %H:%M', time.localtime(entry.created))}?"
+            "\n\nThe saved scene is removed from disk. The screenshots it was built from "
+            "are not touched.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not multishot.delete_saved(entry.folder):
+            QMessageBox.warning(self, "Delete scene", f"Could not delete {entry.folder}.")
+        elif str(entry.folder) == getattr(self, "_shots_folder", None):
+            # The scene on screen is gone: back to the empty view.
+            self._shots_scene = self._shots_folder = None
+            if self._mode == "shots":
+                self._show_scene(None)
+        self._refresh_scenes()
 
     def _scene_clicked(self, item: QListWidgetItem) -> None:
         folder = item.data(Qt.ItemDataRole.UserRole)
         if not folder:
             return
         self._shots_gen += 1
+        self._shots_folder = folder
         self._set_status("Opening scene…")
         self._request_load.emit(folder, self._shots_gen)
 
@@ -1493,11 +1538,18 @@ class CreativePage(QWidget):
         # Placed lightning strikes show as ticks on the FX row.
         self.timeline.set_markers([t for s in self.effects.strikes if s.enabled
                                    for t in s.strike_times])
+        # Effect names label the timeline's per-property FX rows.
+        self.timeline.set_effect_names({i.id: i.name for i in self.effects.items()})
         self._request_redraw()
 
     def keys_changed(self) -> None:
         self.timeline.set_effects_track(self.effects_track)
         self.fx_changed()
+
+    def _fx_keys_moved(self) -> None:
+        """An effects key was slid or removed on the timeline."""
+        self.fx_changed()
+        self.fx_panel.sync()
 
     def strikes_changed(self) -> None:
         self.fx_changed()
