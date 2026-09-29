@@ -76,9 +76,14 @@ from .settings import (
     NR_STRENGTH_MAX,
     NR_STYLES,
     NR_TRANSFER_MAX,
+    VIDEO_MAX_EDGE,
+    VIDEO_PASSES,
     AppSettings,
+    DepthSettings,
+    DetailSettings,
     style_slug,
 )
+from .grade import GradeSettings
 from .widgets import (
     FONT_DISPLAY,
     FONT_MONO,
@@ -1556,9 +1561,8 @@ class VideoQueueDialog(QDialog):
     than a mode on the Video tab, for the same reason the image batch is one:
     the tab is where you tune the look on a single clip — scrub it, mark a
     range, watch a preview — and the queue is the separate act of pointing that
-    look at a stack of whole clips and leaving. Codec, effort and depth default
-    from the tab; the neural and colour settings come from the shared sidebar,
-    exactly as a single conversion reads them.
+    look at a stack of whole clips and leaving. Everything comes from the Video
+    tab, exactly as a single conversion reads it (MainWindow.video_run_settings).
     """
 
     def __init__(self, window: MainWindow) -> None:
@@ -1584,8 +1588,8 @@ class VideoQueueDialog(QDialog):
         layout.setSpacing(10)
 
         blurb = QLabel(
-            "Videos are converted back to back with the settings below and the "
-            "neural and colour settings in the sidebar. Each clip is converted "
+            "Videos are converted back to back with the Video tab's settings. "
+            "Each clip is converted "
             "whole — to convert only part of one, use Convert video on the tab "
             "instead. You can keep using the app; leave this open while it runs."
         )
@@ -1628,28 +1632,14 @@ class VideoQueueDialog(QDialog):
             self.codec_box.addItem(codecdef.label, codecdef.key)
         self.codec_box.setCurrentIndex(max(0, window.video_page.codec_box.currentIndex()))
         opts.addWidget(self.codec_box)
-        opts.addSpacing(12)
-        opts.addWidget(QLabel("Effort"))
-        self.mode_box = QComboBox()
-        self.mode_box.addItem("Quick (1 pass)", 1)
-        self.mode_box.addItem("Quality (4 passes)", 4)
-        self.mode_box.setCurrentIndex(max(0, window.video_page.mode_box.currentIndex()))
-        opts.addWidget(self.mode_box)
         opts.addStretch(1)
         layout.addLayout(opts)
 
-        self.estimate_depth = QCheckBox("Estimate depth per frame")
-        self.estimate_depth.setChecked(window.video_page.estimate_depth.isChecked())
-        self.estimate_depth.setToolTip(
-            "Off by default: DLSS does not read depth on a still frame, so this "
-            "changes nothing in the output and is by far the slowest step."
-        )
         self.skip_existing = QCheckBox("Skip videos already converted")
         self.skip_existing.setChecked(True)
         self.skip_existing.setToolTip(
             "Lets an interrupted queue be restarted without redoing everything."
         )
-        layout.addWidget(self.estimate_depth)
         layout.addWidget(self.skip_existing)
 
         self.preview = ImageView()
@@ -1742,14 +1732,13 @@ class VideoQueueDialog(QDialog):
         # A distinct name so a queue pointed at its own source folder never
         # overwrites an input, and the H.264 default does not collide with an
         # H.264 source of the same stem.
-        style = style_slug(self._window.settings.neural.style)
+        style = style_slug(self._window.settings.video.neural.style)
         return self.destination / f"{source.stem}_dlss5_{style}{suffix}"
 
     def _start(self) -> None:
         if not self.jobs or self._thread is not None:
             return
-        settings = copy.deepcopy(self._window.settings)
-        settings.evaluation.frames = int(self.mode_box.currentData() or 1)
+        settings = self._window.video_run_settings()
         codec_key = self.codec_box.currentData()
         suffix = video.CODECS_BY_KEY[codec_key].suffix
         pairs = [(source, self._output_for(source, suffix)) for source in self.jobs]
@@ -1772,7 +1761,7 @@ class VideoQueueDialog(QDialog):
         self._thread = QThread(self)
         self._worker = VideoQueueWorker(
             pairs, settings, self._window.engine, codec_key,
-            self.estimate_depth.isChecked(), self.skip_existing.isChecked(),
+            False, self.skip_existing.isChecked(),
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1941,6 +1930,51 @@ class VideoWorker(QObject):
         self.finished.emit(self._destination)
 
 
+#: Longest edge of the DLSS preview frame on the Video tab. A proxy: the
+#: harness start (~3.5 s) dominates a preview anyway, and 1080p is plenty to
+#: judge the look on.
+VIDEO_PREVIEW_EDGE = 1920
+
+
+class VideoPreviewWorker(QObject):
+    """DLSS on one frame of the loaded video, with the Video tab's settings."""
+
+    finished = Signal(object)   # (before, after, seconds), display RGB floats
+    failed = Signal(str)
+
+    def __init__(self, source: Path, seconds: float, hdr: str, settings: AppSettings,
+                 engine) -> None:
+        super().__init__()
+        self._source = source
+        self._seconds = seconds
+        self._hdr = hdr
+        self._settings = settings
+        self._engine = engine
+
+    def run(self) -> None:
+        try:
+            from . import contract, effects, hdrvideo
+
+            frame = video.frame_at(self._source, self._seconds, VIDEO_PREVIEW_EDGE, hdr=self._hdr)
+            depth = np.zeros(frame.shape[:2], np.float32)   # DLSS ignores depth on a still
+            if self._hdr:
+                display = np.clip(contract.linear_to_srgb(hdrvideo.tone_map(frame)), 0, 1)
+                prepared = pipeline.Prepared(source=display.astype(np.float32), inverse_depth=depth,
+                                             linear=frame, hdr=True)
+            else:
+                display = frame.astype(np.float32) / 255.0
+                prepared = pipeline.Prepared(source=display, inverse_depth=depth,
+                                             linear=contract.srgb_to_linear(display))
+            result = pipeline.convert(self._source, self._settings, self._engine, prepared=prepared)
+            after = result.enhanced
+            # Effects are baked into the video, so the preview shows them too.
+            if not self._settings.effects.is_neutral:
+                after = effects.apply(after, self._settings.effects, paths.luts_dir())
+            self.finished.emit((result.original, after, self._seconds))
+        except Exception as error:  # noqa: BLE001 - the UI is the error handler
+            self.failed.emit(str(error))
+
+
 class VideoQueueWorker(QObject):
     """Convert a list of videos back to back, off the UI thread.
 
@@ -2016,10 +2050,11 @@ class VideoQueueWorker(QObject):
 class VideoPage(QWidget):
     """The Video tab: inspect a clip, mark a range, convert it, keep the audio.
 
-    Shares the sidebar with the photo tab - the neural strengths, style, depth
-    and colour all mean the same thing on a frame of video - and adds a small
-    player so the clip can be scrubbed and watched before committing to a
-    conversion. The player uses QMediaPlayer (Windows Media Foundation / the
+    Its own neural and HDR controls, independent of the Single image sidebar
+    (see settings.VideoSettings): what this tab shows is exactly what a video
+    gets. Passes, size, depth model and Detail are fixed for video and not
+    shown. A small player lets the clip be scrubbed and watched before
+    committing to a conversion. The player uses QMediaPlayer (Windows Media Foundation / the
     bundled FFmpeg backend), which handles decode, audio and sync; the app's own
     PyAV path is for the conversion, not for playback.
     """
@@ -2053,6 +2088,9 @@ class VideoPage(QWidget):
         self.stack.addWidget(self.placeholder)    # 0 — until a clip loads
         self.stack.addWidget(self.video_widget)   # 1
         self.stack.addWidget(self.preview)         # 2
+        # 3: the DLSS preview of one frame, as a before/after wipe.
+        self.dlss_view = WipeView()
+        self.stack.addWidget(self.dlss_view)
         self.stack.setCurrentWidget(self.placeholder)
 
         stage = QFrame()
@@ -2079,10 +2117,40 @@ class VideoPage(QWidget):
         self.bar.setTextVisible(True)
         self.bar.setVisible(False)
 
+        # DLSS preview of the frame on screen: a proxy-size still through the
+        # same pass the conversion runs, so the look is judged before a long
+        # conversion rather than after it.
+        preview_row = QHBoxLayout()
+        self.view_switch = SegmentedControl(["Video", "DLSS preview"], current=0)
+        self.view_switch.setToolTip("Switch between the video and the DLSS preview of a frame "
+                                    "(drag the divider to compare before and after).")
+        self.view_switch.setEnabled(False)
+        self.view_switch.changed.connect(self._view_switched)
+        self.preview_frame = QPushButton("Preview DLSS on this frame")
+        self.preview_frame.setObjectName("secondary")
+        self.preview_frame.setEnabled(False)
+        self.preview_frame.setToolTip(
+            "Runs DLSS on the frame on screen with the settings on the right, at up to "
+            "1080p, so you can see the look before converting. Takes a few seconds.")
+        self.live_dlss = QCheckBox("Live DLSS preview (slower, re-runs on every frame change)")
+        self.live_dlss.setToolTip(
+            "Re-runs the preview by itself whenever you pause, scrub to another frame or "
+            "change a setting. Each run takes a few seconds; while one runs, only the "
+            "latest request is kept.")
+        preview_row.addWidget(self.view_switch)
+        preview_row.addWidget(self.preview_frame)
+        preview_row.addWidget(self.live_dlss)
+        preview_row.addStretch(1)
+        self.preview_status = QLabel("")
+        self.preview_status.setObjectName("hint")
+        self.preview_status.setWordWrap(True)
+
         left = QVBoxLayout()
         left.setSpacing(10)
         left.addWidget(stage, 1)
         left.addLayout(transport)
+        left.addLayout(preview_row)
+        left.addWidget(self.preview_status)
         left.addWidget(self.bar)
         outer.addLayout(left, 1)
 
@@ -2113,13 +2181,6 @@ class VideoPage(QWidget):
             "H.265 is smaller for modern editors. VP9/WebM is for web upload, "
             "not for editing - editors do not import WebM cleanly."
         )
-        self.mode_box = QComboBox()
-        self.mode_box.addItem("Quick (1 pass)", 1)
-        self.mode_box.addItem("Quality (4 passes)", 4)
-        self.mode_box.setToolTip(
-            "Passes let DLSS's accumulator settle. One is fast and usually "
-            "plenty for video; four is steadier on tricky material."
-        )
         self.range_box = QComboBox()
         self.range_box.addItem("Whole clip", "whole")
         self.range_box.addItem("Select In/Out", "range")
@@ -2128,22 +2189,13 @@ class VideoPage(QWidget):
             "timeline - drag them to the part you want, scroll to zoom in for a "
             "precise edit."
         )
-        for label, widget in (
-            ("Format", self.codec_box), ("Effort", self.mode_box), ("Range", self.range_box),
-        ):
+        for label, widget in (("Format", self.codec_box), ("Range", self.range_box)):
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addStretch(1)
             widget.setMinimumWidth(150)
             row.addWidget(widget)
             export_card.add_layout(row)
-        self.estimate_depth = QCheckBox("Estimate depth per frame")
-        self.estimate_depth.setToolTip(
-            "Off by default, and honestly labelled: DLSS does not read the depth "
-            "plane on a still frame (there is no motion to reproject through), "
-            "so this changes nothing in the output and is by far the slowest step."
-        )
-        export_card.add(self.estimate_depth)
 
         # -- 3D card: optional 3D export (see stereo.py) --
         from .stereo import FORMATS
@@ -2189,7 +2241,7 @@ class VideoPage(QWidget):
         self.stereo_dlss.setChecked(True)
         self.stereo_dlss.setToolTip(
             "Off converts to 3D only, much faster, straight from the source frames "
-            "(colour grade and effects still apply).")
+            "(effects from the Effects tab still apply).")
         self.stereo_dlss.toggled.connect(lambda v: self._stereo_set("run_dlss", bool(v)))
         stereo_card.add(self.stereo_dlss)
         self.stereo_card = stereo_card
@@ -2198,6 +2250,11 @@ class VideoPage(QWidget):
         self.info_label = QLabel("")
         self.info_label.setObjectName("hint")
         self.info_label.setWordWrap(True)
+        # Effects are the one thing from another tab a video still gets (the
+        # Effects tab says so), so the Video tab says whether any are on.
+        self.effects_note = QLabel("")
+        self.effects_note.setObjectName("hint")
+        self.effects_note.setWordWrap(True)
 
         self.queue_button = QPushButton("Convert several…")
         self.queue_button.setObjectName("secondary")
@@ -2218,14 +2275,24 @@ class VideoPage(QWidget):
         # smaller window, and an unscrolled column squeezed every slider until
         # its handle was cut off.
         cards = QWidget()
+        # The sidebar's width, as on the Single image tab: without it a wide
+        # row (the neural chips, the style buttons) pushes the column past the
+        # rail and the right edge of every card is clipped.
+        cards.setFixedWidth(SIDEBAR_WIDTH)
         cards_col = QVBoxLayout(cards)
         cards_col.setContentsMargins(0, 0, 0, 0)
         cards_col.setSpacing(12)
+        # Source, then output, then the look, then 3D. The Neural and HDR cards
+        # go in after export_card once the window hands over the settings
+        # (build_dlss_cards).
+        self.source_card, self.export_card = source_card, export_card
         cards_col.addWidget(source_card)
-        cards_col.addWidget(self.stereo_card)
         cards_col.addWidget(export_card)
+        cards_col.addWidget(self.stereo_card)
+        cards_col.addWidget(self.effects_note)
         cards_col.addWidget(self.info_label)
         cards_col.addStretch(1)
+        self._cards_col = cards_col
         scroller = QScrollArea()
         scroller.setWidget(cards)
         scroller.setWidgetResizable(True)
@@ -2243,8 +2310,95 @@ class VideoPage(QWidget):
         rail_col.addWidget(self.start)
         outer.addWidget(rail)
 
+    # -- Neural and HDR cards ------------------------------------------------
+
+    def build_dlss_cards(self, neural, density: str, on_changed) -> ChipSliderGroup:
+        """The Video tab's own neural and HDR / display controls, editing
+        `neural` (settings.video.neural) in place. Returns the chip group so
+        the window's density toggle can switch it with the others."""
+        self._neural = neural
+        self._on_neural = on_changed
+        card = ModuleCard("Neural", tag="Video")
+        self.style_box = SegmentedControl(
+            list(NR_STYLES), current=min(len(NR_STYLES) - 1, max(0, int(neural.style))))
+        self.style_box.setToolTip(
+            "The add-on's overall look for this video.\n\n"
+            "Default: the look DLSS 5 starts with.\n"
+            "Natural: subtle grade, closer to the source.\n"
+            "Cinematic: stronger grade, moves furthest from the source.")
+        self.style_box.changed.connect(lambda index: self._neural_set("style", int(index)))
+        card.add(self.style_box)
+        self.neural_params = ChipSliderGroup([
+            ("Intensity", neural.intensity, lambda v: self._neural_set("intensity", v),
+             "Overall strength of the neural pass. At 0 this is a plain DLAA resolve.",
+             0.0, NR_STRENGTH_MAX),
+            ("Skin", neural.skin, lambda v: self._neural_set("skin", v),
+             "Subsurface scattering and pore detail on faces. Lower this first if "
+             "faces look waxy.", 0.0, NR_STRENGTH_MAX),
+            ("Local tone", neural.local_tone, lambda v: self._neural_set("local_tone", v),
+             "How much the model may relight the scene.", 0.0, NR_STRENGTH_MAX),
+            ("Structure", neural.structure, lambda v: self._neural_set("structure", v),
+             "Micro-contrast in fabric, hair, and surface material.", 0.0, NR_STRENGTH_MAX),
+        ], mode=density)
+        card.add(self.neural_params)
+        note = QLabel("For video only: the Single image tab keeps its own settings. "
+                      "Video always runs one pass at up to 4K.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        card.add(note)
+
+        hdr = ModuleCard("HDR / display")
+        hdr.setToolTip("The add-on's HDR controls for this video. They change the "
+                       "neural result even on an SDR clip. Defaults match the add-on's own.")
+        for label, name, maximum, tip in (
+            ("Paper white", "paper_white", NR_PAPER_WHITE_MAX,
+             "The luminance the model treats as diffuse white: how hard highlights "
+             "are pushed. The add-on defaults to 1; game configs use 16."),
+            ("HDR transfer", "transfer_strength", NR_TRANSFER_MAX,
+             "Strength of the transfer curve the pass works through. Range 0..1."),
+            ("Colour strength", "color_strength", NR_COLOR_MAX,
+             "How much of the model's colour change is kept. At 0 the source colour "
+             "survives and only structure changes."),
+        ):
+            hdr.add(SliderRow(label, getattr(neural, name),
+                              lambda v, n=name: self._neural_set(n, v), tip, maximum=maximum))
+        self.neural_card, self.hdr_card = card, hdr
+        self._cards_col.insertWidget(2, card)
+        self._cards_col.insertWidget(3, hdr)
+        return self.neural_params
+
+    def _neural_set(self, name: str, value) -> None:
+        setattr(self._neural, name, value)
+        if self._on_neural is not None:
+            self._on_neural()
+
+    def set_effects_note(self, effects_on: bool) -> None:
+        self.effects_note.setText(
+            "Effects from the Effects tab are on and will be applied to this video."
+            if effects_on else "")
+        self.effects_note.setVisible(effects_on)
+
     def show_video(self) -> None:
         self.stack.setCurrentWidget(self.video_widget)
+        self.view_switch.blockSignals(True)
+        self.view_switch.set_index(0)
+        self.view_switch.blockSignals(False)
+
+    def show_dlss(self, before=None, after=None) -> None:
+        """Show the DLSS preview (optionally replacing it first)."""
+        if before is not None and after is not None:
+            self.dlss_view.set_images(before, after)
+            self.view_switch.setEnabled(True)
+        self.stack.setCurrentWidget(self.dlss_view)
+        self.view_switch.blockSignals(True)
+        self.view_switch.set_index(1)
+        self.view_switch.blockSignals(False)
+
+    def _view_switched(self, index: int) -> None:
+        if index == 1:
+            self.stack.setCurrentWidget(self.dlss_view)
+        elif self.source is not None:
+            self.stack.setCurrentWidget(self.video_widget)
 
     def show_preview(self) -> None:
         self.stack.setCurrentWidget(self.preview)
@@ -3050,6 +3204,9 @@ class MainWindow(QMainWindow):
         self.video_page = VideoPage()
         self.video_page.set_stereo(self.settings.stereo)
         self.video_page.on_stereo_changed = self._stereo_changed
+        self._chip_groups.append(self.video_page.build_dlss_cards(
+            self.settings.video.neural, self.settings.density, self._video_neural_changed))
+        self.video_page.set_effects_note(not self.settings.effects.is_neutral)
         self.sequence_page = SequencePage()
         self.effects_page = EffectsPage(self.settings.effects, self._effects_changed)
         self.creative_page = CreativePage()
@@ -5002,7 +5159,6 @@ class MainWindow(QMainWindow):
         page.start.clicked.connect(self._start_video)
         page.stop.clicked.connect(self._stop_video)
         page.queue_button.clicked.connect(self.open_video_queue)
-        page.mode_box.currentIndexChanged.connect(self._video_mode_changed)
         page.range_box.currentIndexChanged.connect(self._video_range_changed)
         page.play_button.clicked.connect(self._toggle_video_play)
         # Player <-> timeline. The player drives the playhead as it advances;
@@ -5012,7 +5168,20 @@ class MainWindow(QMainWindow):
         page.player.playbackStateChanged.connect(self._video_playback_state)
         page.player.mediaStatusChanged.connect(self._video_media_status)
         page.timeline.seeked.connect(self._video_scrub)
+        page.preview_frame.clicked.connect(lambda: self._video_preview(show=True))
+        page.live_dlss.toggled.connect(self._video_live_toggled)
         page.output_path: Path | None = None
+        # One preview runs at a time; a request made meanwhile is remembered
+        # (latest wins) and runs when the current one lands.
+        self._vpreview_thread: QThread | None = None
+        self._vpreview_worker: VideoPreviewWorker | None = None
+        self._vpreview_pending: float | None = None
+        self._vpreview_show = False
+        # Live mode waits for scrubbing / slider drags to settle before running.
+        self._vpreview_timer = QTimer(self)
+        self._vpreview_timer.setSingleShot(True)
+        self._vpreview_timer.setInterval(450)
+        self._vpreview_timer.timeout.connect(lambda: self._video_preview(show=True))
         # Set when a freshly loaded video should start playing on its own, so a
         # loaded video shows motion instead of a black frame that reads as "not
         # loading" until someone finds the play button.
@@ -5052,6 +5221,104 @@ class MainWindow(QMainWindow):
         self.settings.stereo = stereo
         self.settings.save(paths.settings_path())
 
+    def _video_neural_changed(self) -> None:
+        # The Video tab edits settings.video.neural in place; persist it, and
+        # in live mode show the new look on the current frame.
+        self.settings.save(paths.settings_path())
+        self._video_live_nudge()
+
+    # -- Video tab DLSS preview ------------------------------------------------
+
+    def _video_live_nudge(self) -> None:
+        page = self.video_page
+        if page.live_dlss.isChecked() and page.source is not None:
+            self._vpreview_timer.start()
+
+    def _video_live_toggled(self, on: bool) -> None:
+        if on:
+            self._video_preview(show=True)
+
+    def _video_preview(self, show: bool = False, seconds: float | None = None) -> None:
+        """Run DLSS on the frame on screen (or at `seconds`) in the background."""
+        page = self.video_page
+        if page.source is None or self._video_thread is not None:
+            return
+        if seconds is None:
+            seconds = page.player.position() / 1000.0
+        self._vpreview_show = self._vpreview_show or show
+        if self._vpreview_thread is not None:
+            self._vpreview_pending = seconds
+            return
+        try:
+            ready = runtime.detect(self.settings.runtime_dir or None).ready
+        except Exception:  # noqa: BLE001 - treat a failed check as not ready
+            ready = False
+        if not ready:
+            page.preview_status.setText(
+                "The DLSS preview needs your DLSS files. Set them up in Settings, then try again.")
+            return
+        page.preview_status.setText(f"Running DLSS on the frame at {seconds:.1f} s…")
+        page.preview_frame.setEnabled(False)
+        self._vpreview_thread = QThread(self)
+        self._vpreview_worker = VideoPreviewWorker(
+            page.source, seconds, getattr(page.info, "hdr", ""), self.video_run_settings(), self.engine)
+        self._vpreview_worker.moveToThread(self._vpreview_thread)
+        self._vpreview_thread.started.connect(self._vpreview_worker.run)
+        self._vpreview_worker.finished.connect(self._video_preview_done)
+        self._vpreview_worker.failed.connect(self._video_preview_failed)
+        self._vpreview_thread.start()
+
+    def _video_preview_teardown(self) -> None:
+        if self._vpreview_thread is not None:
+            self._vpreview_thread.quit()
+            self._vpreview_thread.wait(15000)
+            self._vpreview_thread = None
+        self._vpreview_worker = None
+        self.video_page.preview_frame.setEnabled(self.video_page.source is not None)
+        pending, self._vpreview_pending = self._vpreview_pending, None
+        if pending is not None:
+            self._video_preview(seconds=pending)
+
+    def _video_preview_done(self, payload) -> None:
+        from PySide6.QtMultimedia import QMediaPlayer
+
+        before, after, seconds = payload
+        page = self.video_page
+        playing = page.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        page.dlss_view.set_images(before, after)
+        page.view_switch.setEnabled(True)
+        # Never yank the view away from a playing video; the switch is lit up
+        # so the preview is one click away.
+        if self._vpreview_show and not playing and self._vpreview_pending is None:
+            page.show_dlss()
+            self._vpreview_show = False
+        page.preview_status.setText(
+            f"DLSS preview of the frame at {seconds:.1f} s (up to 1080p). Drag the divider to "
+            "compare; press Play or pick Video to go back.")
+        self._video_preview_teardown()
+
+    def _video_preview_failed(self, message: str) -> None:
+        self.video_page.preview_status.setText(f"DLSS preview failed: {message}")
+        self._vpreview_show = False
+        self._video_preview_teardown()
+
+    def video_run_settings(self) -> AppSettings:
+        """The settings a video conversion runs with: the Video tab's own
+        neural and HDR controls, the fixed video choices (settings.VIDEO_*),
+        and nothing from the Single image sidebar. A copy, so neither tab's
+        settings are touched."""
+        run = copy.deepcopy(self.settings)
+        run.neural = copy.deepcopy(self.settings.video.neural)
+        run.evaluation.frames = VIDEO_PASSES
+        run.evaluation.max_edge = VIDEO_MAX_EDGE
+        run.evaluation.jitter = False
+        run.depth = DepthSettings()
+        run.detail = DetailSettings()
+        # The colour grade is a Single image tool; it no longer leaks into video.
+        run.grade = GradeSettings()
+        run.stereo = self.video_page.stereo_settings()
+        return run
+
     def _effects_changed(self) -> None:
         """An effect toggled or a slider moved: persist, redraw, keep it live.
 
@@ -5061,6 +5328,8 @@ class MainWindow(QMainWindow):
         """
         self.settings.save(paths.settings_path())
         self._validate_lut()
+        self.video_page.set_effects_note(not self.settings.effects.is_neutral)
+        self._video_live_nudge()
         # The main comparison view, when it is showing the result.
         if self._view in ("result", "styles"):
             self._grade_timer.start()
@@ -5131,6 +5400,8 @@ class MainWindow(QMainWindow):
 
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.video_page.play_button.setText("Pause" if playing else "Play")
+        if state == QMediaPlayer.PlaybackState.PausedState:
+            self._video_live_nudge()
 
     def _video_media_status(self, status) -> None:
         from PySide6.QtMultimedia import QMediaPlayer
@@ -5157,6 +5428,7 @@ class MainWindow(QMainWindow):
     def _video_scrub(self, frame: int) -> None:
         self.video_page.show_video()
         self.video_page.player.setPosition(self._frame_to_ms(frame))
+        self._video_live_nudge()
 
     def _video_range_changed(self) -> None:
         page = self.video_page
@@ -5166,7 +5438,7 @@ class MainWindow(QMainWindow):
         page = self.video_page
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
         stem = page.source.stem if page.source else "video"
-        style = style_slug(self.settings.neural.style)
+        style = style_slug(self.settings.video.neural.style)
         start_dir = str(page.output_path or (paths.output_dir() / f"{stem}_dlss5_{style}{codec.suffix}"))
         chosen, _ = QFileDialog.getSaveFileName(
             self, "Output video", start_dir, f"{codec.label} (*{codec.suffix})"
@@ -5205,6 +5477,14 @@ class MainWindow(QMainWindow):
         page.info_label.setText(info.describe())
         page.start.setEnabled(True)
         page.play_button.setEnabled(True)
+        page.preview_frame.setEnabled(True)
+        page.view_switch.setEnabled(False)
+        page.preview_status.setText("")
+        # A preview of the opening frame straight away, so the look is visible
+        # before anything else is touched. It lights up the DLSS preview switch
+        # when ready rather than interrupting the video that auto-plays.
+        self._vpreview_show = False
+        self._video_preview(seconds=0.0)
 
         # Load it into the player and lay out the timeline. A frame count of 0
         # (some containers do not report one) still gives a usable scrubber via
@@ -5221,20 +5501,19 @@ class MainWindow(QMainWindow):
         # A default output beside the app, so Convert works without a detour
         # through the Output picker - but the picker can override it.
         codec = video.CODECS_BY_KEY[page.codec_box.currentData()]
-        style = style_slug(self.settings.neural.style)
+        style = style_slug(self.settings.video.neural.style)
         page.output_path = paths.output_dir() / f"{path.stem}_dlss5_{style}{codec.suffix}"
         page.output_label.setText(f"Output: {page.output_path}")
-
-    def _video_mode_changed(self) -> None:
-        # Deliberately does not touch settings. The video Effort is read at
-        # convert time onto a copy - writing it to the shared settings here is
-        # what let a video export silently drop the single-image sidebar to
-        # 1 pass, since both read the same settings.evaluation.frames.
-        pass
 
     def _start_video(self) -> None:
         page = self.video_page
         if page.source is None or self._video_thread is not None:
+            return
+        if self._vpreview_thread is not None:
+            # One DLSS harness at a time: let the preview land, then start.
+            self._vpreview_pending = None
+            page.preview_status.setText("Finishing the preview, then converting…")
+            QTimer.singleShot(300, self._start_video)
             return
         if not video.is_available():
             self._download_video_support(then=self._start_video)
@@ -5250,12 +5529,7 @@ class MainWindow(QMainWindow):
         page.player.stop()
         page.show_preview()
 
-        # A copy, with the video's own pass count, so the shared sidebar setting
-        # the single-image path reads is left exactly as the user set it. The
-        # neural strengths, style and colour still come from the live settings.
-        settings = copy.deepcopy(self.settings)
-        settings.evaluation.frames = int(page.mode_box.currentData() or 1)
-        settings.stereo = page.stereo_settings()
+        settings = self.video_run_settings()
 
         # The range comes from the timeline's In/Out when ranging, else the
         # whole clip. Frames, inclusive of Out, which is why limit is +1.
@@ -5269,6 +5543,7 @@ class MainWindow(QMainWindow):
         page.start.setEnabled(False)
         page.pick_video.setEnabled(False)
         page.play_button.setEnabled(False)
+        page.preview_frame.setEnabled(False)
         page.stop.setVisible(True)
         page.bar.setVisible(True)
         page.bar.setValue(0)
@@ -5283,7 +5558,7 @@ class MainWindow(QMainWindow):
         self._video_worker = VideoWorker(
             page.source, output, settings, self.engine,
             page.codec_box.currentData(), start, limit,
-            page.estimate_depth.isChecked(),
+            False,
         )
         self._video_worker.moveToThread(self._video_thread)
         self._video_thread.started.connect(self._video_worker.run)
@@ -5364,6 +5639,7 @@ class MainWindow(QMainWindow):
         page.start.setEnabled(page.source is not None)
         page.pick_video.setEnabled(True)
         page.play_button.setEnabled(page.source is not None)
+        page.preview_frame.setEnabled(page.source is not None)
         page.stop.setVisible(False)
 
     def _download_video_support(self, then) -> None:
@@ -6840,6 +7116,16 @@ def main() -> None:
     app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
     window = MainWindow()
     window.show()
+    # If the window ever stops responding, logs\freeze_*.txt records where.
+    # Started after the window is built, so a slow first launch is not
+    # mistaken for a freeze.
+    try:
+        from .freeze_watch import FreezeWatch
+
+        app._freeze_watch = FreezeWatch(paths.data_dir() / "logs", version=__version__)
+        app._freeze_watch.start(app)
+    except Exception:  # noqa: BLE001 - a diagnostic must never block launch
+        pass
     sys.exit(app.exec())
 
 

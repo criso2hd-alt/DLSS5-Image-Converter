@@ -7,7 +7,9 @@ The whole conversion in one place so it can be exercised without the GUI:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +17,7 @@ import cv2
 import numpy as np
 
 from . import (
+    hdrvideo,
     bigtiff,
     contract,
     detail,
@@ -943,6 +946,54 @@ class VideoProgress:
     stage: str = "converting"  # converting | encoding | muxing | done
 
 
+def _prefetch(frames: Iterator[np.ndarray], depth: int) -> Iterator[np.ndarray]:
+    """Run a frame iterator ahead on its own thread, `depth` frames deep.
+
+    Decoding a 4K frame (and, for HDR, undoing its curve) takes as long as the
+    DLSS pass, so doing it while the previous frame is evaluated takes it off
+    the clock. Closing this generator stops the thread and closes the source.
+    """
+    import queue
+    import threading
+
+    items: queue.Queue = queue.Queue(maxsize=depth)
+    stop = threading.Event()
+
+    def put(item) -> bool:
+        while not stop.is_set():
+            try:
+                items.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def run() -> None:
+        try:
+            for frame in frames:
+                if not put(("frame", frame)):
+                    return
+            put(("end", None))
+        except BaseException as error:  # noqa: BLE001 - handed to the consumer
+            put(("error", error))
+        finally:
+            frames.close()
+
+    thread = threading.Thread(target=run, name="video-decode", daemon=True)
+    thread.start()
+    try:
+        while True:
+            kind, item = items.get()
+            if kind == "end":
+                return
+            if kind == "error":
+                raise item
+            yield item
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+
 def convert_video(
     source: Path,
     destination: Path,
@@ -1003,14 +1054,39 @@ def convert_video(
         assert status.harness is not None
         runtime.write_config(staged, settings.neural)
 
+    # HDR in: decoded to linear light with highlights above 1.0 (hdrvideo).
+    # HDR out when the chosen codec can carry it, else a tone-mapped SDR file.
+    hdr = getattr(info, "hdr", "")
+    out_codec, hdr_out = codec, False
+    if hdr:
+        carrier = video.hdr_codec(codec)
+        name = "HDR10" if hdr == "pq" else "HLG"
+        if carrier is not None:
+            out_codec, hdr_out = carrier, True
+            say(f"{name} source: writing HDR10 with {codec.label}.")
+        else:
+            say(f"{name} source: {codec.label} is SDR only, so it is tone-mapped. "
+                "Choose H.265 or ProRes to keep HDR.")
+    styled = ((grade_settings is not None and not grade_settings.is_neutral)
+              or not settings.effects.is_neutral)
+    if hdr_out and styled:
+        say("The grade and effects are SDR tools and are not applied to HDR output.")
+    # Bytes end to end when nothing downstream needs more than 8 bits: every
+    # step is then a table lookup or a byte warp instead of float maths on
+    # 25 million values, which was most of the time a 4K frame took.
+    fast8 = not hdr and not out_codec.ten_bit and not styled
+
     if estimate_depth or stereo_on:
         engine.load(settings.depth.model_id, progress=progress)
     if stereo_on:
         from . import stereo
         smoother = stereo.DepthSmoother(settings.stereo.smoothing)
     offsets = contract.jitter_sequence(settings.evaluation.frames)
-    if not settings.evaluation.jitter:
+    if not settings.evaluation.jitter or len(offsets) == 1:
+        # A single evaluation accumulates nothing, so a jitter offset would
+        # only buy a Lanczos resample of the whole frame, and a softer one.
         offsets = [(0.0, 0.0)] * len(offsets)
+    unshifted = all(offset == (0.0, 0.0) for offset in offsets)
 
     scratch = paths.scratch_dir()
     luts_dir = paths.luts_dir()
@@ -1025,19 +1101,98 @@ def convert_video(
     size: tuple[int, int] | None = None
     done = 0
 
+    def look8(image: np.ndarray) -> np.ndarray:
+        """8-bit display version of a working frame, for depth and previews."""
+        if image.dtype == np.uint16:
+            return hdrvideo.pq16_to_sdr8(image)
+        if image.dtype == np.uint8:
+            return image
+        return (np.clip(image, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    def prepare(payload: np.ndarray):
+        """After DLSS, stage one (own thread): back to display form, and the
+        frame's steadied depth for 3D. Overlaps the next frame's DLSS pass."""
+        if run_dlss:
+            bits = payload[..., :3]
+            if hdr_out:
+                frame = hdrvideo.half_bits_to_pq16(payload)
+            elif hdr:
+                frame = contract.table_lookup(hdrvideo.half_to_sdr8_lut(), bits)
+            elif fast8:
+                frame = contract.table_lookup(contract.half_to_srgb8_lut(), bits)
+            else:
+                frame = contract.table_lookup(contract.half_to_srgb_lut(), bits)
+        elif hdr_out:
+            frame = hdrvideo.to_pq16(payload)
+        elif hdr:
+            frame = contract.table_lookup(hdrvideo.half_to_sdr8_lut(),
+                                          payload.astype(np.float16).view(np.uint16))
+        else:
+            frame = payload
+        if styled and not hdr_out:
+            frame = frame.astype(np.float32) / 255.0 if frame.dtype == np.uint8 else frame
+            if grade_settings is not None:
+                frame = grade.apply(frame, grade_settings)
+            # Detail (Boost/Ultra) is a single-image, supersampled operation
+            # and is not applied per video frame. Video frames are display-
+            # referred, so the plain sRGB effect path, as the photo save uses.
+            frame = effects.apply(frame, settings.effects, luts_dir)
+        depth = shift = None
+        if stereo_on:
+            # 3D from the finished frame, so both eyes carry the DLSS look.
+            # Shrunk first, then made 8-bit: the HDR table then runs on a
+            # fraction of the pixels.
+            small = look8(stereo.depth_input(frame))
+            inverse = engine.infer(small, input_size=settings.depth.input_size,
+                                   tiled=settings.depth.tiled)
+            depth = smoother(inverse, small)
+            if stereo.needs_views(settings.stereo.format):
+                # The shift map here, so the next stage only warps and encodes.
+                shift = stereo.shift_map(depth, (frame.shape[1], frame.shape[0]),
+                                         settings.stereo.strength, settings.stereo.pop_out)
+        return frame, depth, shift
+
+    def finish(prepared) -> np.ndarray:
+        """Stage two (own thread): the eye views, packing and encoding. Each
+        stage has one worker, so frames pass through strictly in order, which
+        the depth smoothing and the encoder both rely on."""
+        frame, depth, shift = prepared.result()
+        if depth is not None:
+            frame = stereo.compose(frame, depth, settings.stereo, shift)
+        assert writer is not None
+        writer.write(frame)
+        # A reduced preview: the UI shows it at a few hundred pixels anyway.
+        return look8(frame[::4, ::4] if frame.dtype == np.uint16 else frame[::2, ::2])
+
+    stage_one = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-prepare")
+    post = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-post")
+    pending: deque = deque()
+
+    def drain(keep: int):
+        nonlocal done
+        while pending and (len(pending) > keep or pending[0].done()):
+            preview = pending.popleft().result()
+            done += 1
+            say(f"pass {done} of {total}" if total else f"frame {done}")
+            yield VideoProgress(done, total, preview, "converting")
+
+    decoded = video.frames(source, start=start, limit=limit, should_stop=should_stop,
+                           as_uint8=not hdr, hdr=hdr)
+    # Decoding (and HDR's curve) runs ahead on a thread of its own.
+    source_frames = _prefetch(decoded, 3)
+
     try:
-        for source_rgb in video.frames(source, start=start, limit=limit,
-                                        should_stop=should_stop):
+        for source_frame in source_frames:
             if should_stop is not None and should_stop():
                 say("Stopped.")
                 return
-            fitted = contract.fit_to_budget(source_rgb, settings.evaluation.max_edge)
+            fitted = contract.fit_to_budget(source_frame, settings.evaluation.max_edge)
             height, width = fitted.shape[:2]
 
             if size is None and not run_dlss:
                 size = (width, height)
                 out_size = stereo.output_size(settings.stereo.format, size)
-                writer = video.VideoWriter(video_only, codec, info.fps, out_size)
+                writer = video.VideoWriter(video_only, out_codec, info.fps, out_size, hdr=hdr_out)
             elif harness is None and run_dlss:
                 # The first frame fixes the size for the whole clip: one harness,
                 # one set of NGX buffers, and one output stream.
@@ -1057,71 +1212,61 @@ def convert_video(
                 # 3D formats can be wider or taller than the frame (full side by
                 # side is twice the width), so the stream takes the packed size.
                 out_size = stereo.output_size(settings.stereo.format, size) if stereo_on else size
-                writer = video.VideoWriter(video_only, codec, info.fps, out_size)
+                writer = video.VideoWriter(video_only, out_codec, info.fps, out_size, hdr=hdr_out)
                 # The colour plane is 66 MB at 4K and identical in shape every
                 # pass of every frame, so it is allocated once and rewritten in
                 # place. With shared memory this buffer *is* the mapping the
-                # harness reads, so writing into it is the whole transport; the
-                # alpha row, always 1.0, is filled here and never touched again.
+                # harness reads, so writing into it is the whole transport.
                 colour_plane = harness.colour_buffer((height, width, 4))
                 colour_plane[..., 3] = np.float16(1.0)
+                plane_bits = colour_plane.view(np.uint16)
             elif (width, height) != size:
                 # A source whose frames change size mid-stream is degenerate;
                 # refuse rather than silently rescaling to the first frame.
                 raise RuntimeError(
-                    f"Frame {done + 1} is {width}x{height}, but the video "
+                    f"Frame {done + len(pending) + 1} is {width}x{height}, but the video "
                     f"started at {size[0]}x{size[1]}."
                 )
 
             if not run_dlss:
-                enhanced = np.clip(fitted, 0.0, 1.0)
+                payload = fitted
             else:
                 if estimate_depth:
                     inverse = engine.infer(
-                        (np.clip(fitted, 0, 1) * 255).astype(np.uint8),
+                        look8(hdrvideo.to_pq16(fitted)) if hdr else fitted,
                         input_size=settings.depth.input_size, tiled=settings.depth.tiled,
                     )
                     shaped = contract.to_hardware_depth(inverse, settings.depth.contrast)
                     np.ascontiguousarray(shaped).tofile(depth_path)
                     harness.set_depth(depth_path)
 
-                linear = contract.srgb_to_linear(np.clip(fitted, 0, 1))
                 harness.reset_history()
-                for offset in offsets:
-                    shifted = contract.shift_subpixel(linear, offset[0], offset[1])
-                    # Reused buffer: only the colour channels change per pass; alpha
-                    # was set to 1.0 when it was allocated. commit_colour sends it
-                    # through shared memory or the file, whichever is live.
-                    colour_plane[..., :3] = shifted.astype(np.float16)
-                    harness.commit_colour(colour_plane, colour_path, offset)
+                if not hdr and unshifted:
+                    # 8-bit sRGB straight to linear half floats by table, alpha
+                    # included (255 -> 1.0), written into the shared plane.
+                    rgba = cv2.cvtColor(fitted, cv2.COLOR_RGB2RGBA)
+                    filled = cv2.LUT(rgba, contract.srgb8_to_half_lut(), dst=plane_bits)
+                    if not np.may_share_memory(filled, plane_bits):
+                        plane_bits[...] = filled
+                    for offset in offsets:
+                        harness.commit_colour(colour_plane, colour_path, offset)
+                else:
+                    linear = fitted if hdr else contract.srgb_to_linear(fitted.astype(np.float32) / 255.0)
+                    for offset in offsets:
+                        shifted = contract.shift_subpixel(linear, offset[0], offset[1])
+                        # RGBA float (alpha 1.0) to half floats in one OpenCV
+                        # pass straight into the shared plane.
+                        halves = cv2.convertFp16(cv2.cvtColor(shifted, cv2.COLOR_RGB2RGBA))
+                        plane_bits[...] = halves.view(np.uint16)
+                        harness.commit_colour(colour_plane, colour_path, offset)
                 harness.write(out_path)
+                payload = contract.read_output_bits(out_path, width, height)
 
-                enhanced = np.clip(
-                    contract.linear_to_srgb(contract.read_output(out_path, width, height)),
-                    0.0, 1.0,
-                )
-            if grade_settings is not None:
-                enhanced = grade.apply(enhanced, grade_settings)
-            # Detail (Boost/Ultra) is a single-image, supersampled operation and
-            # is not applied per video frame — it would multiply an already
-            # frame-by-frame conversion by the tile count. Video keeps the neural
-            # pass at native size; the grade and effects still apply.
-            # Video frames are display-referred (the codecs are 8-bit SDR), so
-            # the plain sRGB effect path — the same one the photo save uses.
-            enhanced = effects.apply(enhanced, settings.effects, luts_dir)
-            if stereo_on:
-                # 3D from the finished frame, so both eyes carry the DLSS look.
-                inverse = engine.infer(
-                    (np.clip(enhanced, 0, 1) * 255).astype(np.uint8),
-                    input_size=settings.depth.input_size, tiled=settings.depth.tiled,
-                )
-                enhanced = stereo.frame(enhanced.astype(np.float32), inverse, settings.stereo, smoother)
-            assert writer is not None
-            writer.write(enhanced)
-            done += 1
-            say(f"pass {done} of {total}" if total else f"frame {done}")
-            yield VideoProgress(done, total, enhanced, "converting")
+            pending.append(post.submit(finish, stage_one.submit(prepare, payload)))
+            yield from drain(keep=3)
+        yield from drain(keep=0)
 
+        post.shutdown(wait=True)
         if writer is not None:
             writer.close()
             writer = None
@@ -1147,6 +1292,9 @@ def convert_video(
         yield VideoProgress(done, total, np.zeros((1, 1, 3), np.float32),
                             "done" if had_audio else "done-no-audio")
     finally:
+        source_frames.close()
+        stage_one.shutdown(wait=True, cancel_futures=True)
+        post.shutdown(wait=True, cancel_futures=True)
         if writer is not None:
             try:
                 writer.close()

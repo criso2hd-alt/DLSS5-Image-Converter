@@ -24,6 +24,7 @@ A DLAA evaluation wants colour, depth, motion vectors, and a jitter offset:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -61,6 +62,81 @@ def linear_to_srgb(image: np.ndarray) -> np.ndarray:
     low = image * 12.92
     high = 1.055 * np.power(np.maximum(image, 0.0), 1.0 / 2.4) - 0.055
     return np.where(image <= 0.0031308, low, high).astype(np.float32)
+
+
+@lru_cache(maxsize=1)
+def srgb8_to_half_lut() -> np.ndarray:
+    """8-bit sRGB -> linear half float, as raw uint16 bits, for cv2.LUT.
+
+    Video frames arrive as 8 bits per channel, so there are only 256 inputs:
+    a table gives the exact same half floats as srgb_to_linear, without the
+    float power over 25 million values that made it ~0.45 s per 4K frame.
+    255 maps to exactly 1.0, so an alpha channel of 255 comes out as 1.0 too.
+    """
+    values = srgb_to_linear(np.arange(256, dtype=np.float32) / 255.0)
+    return values.astype(np.float16).view(np.uint16)
+
+
+@lru_cache(maxsize=1)
+def half_to_srgb8_lut() -> np.ndarray:
+    """Every half float bit pattern -> the 8-bit sRGB the video writer would make.
+
+    The harness returns half floats, so there are only 65536 possible values.
+    Each entry is exactly read_output's clean-up (NaN to 0, infinities
+    clamped), linear_to_srgb, the clip and the writer's rounding, done once.
+    """
+    values = _half_values()
+    srgb = np.clip(linear_to_srgb(values), 0.0, 1.0)
+    return (srgb * 255.0 + 0.5).astype(np.uint8)
+
+
+@lru_cache(maxsize=1)
+def half_to_srgb_lut() -> np.ndarray:
+    """Every half float bit pattern -> display sRGB float, for frames that go
+    on to a grade, effects or a 10-bit encode and need more than 8 bits."""
+    return np.clip(linear_to_srgb(_half_values()), 0.0, 1.0).astype(np.float32)
+
+
+_LOOKUP_POOL = None
+
+
+def table_lookup(table: np.ndarray, index: np.ndarray) -> np.ndarray:
+    """table[index] for a whole frame, split across threads by rows.
+
+    A 65536-entry gather over a 4K frame is memory-bound and numpy runs it on
+    one core; eight row bands in parallel take it from ~90 ms to under 40.
+    """
+    global _LOOKUP_POOL
+    out = np.empty(index.shape, table.dtype)
+    rows = index.shape[0]
+    if rows < 64:
+        np.take(table, index, out=out)
+        return out
+    if _LOOKUP_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _LOOKUP_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lookup")
+    bands = np.linspace(0, rows, 9, dtype=int)
+    list(_LOOKUP_POOL.map(lambda i: np.take(table, index[bands[i]:bands[i + 1]],
+                                            out=out[bands[i]:bands[i + 1]]), range(8)))
+    return out
+
+
+def _half_values() -> np.ndarray:
+    values = np.arange(65536, dtype=np.uint32).astype(np.uint16).view(np.float16).astype(np.float32)
+    return np.nan_to_num(values, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def read_output_bits(path: Path, width: int, height: int) -> np.ndarray:
+    """The harness's RGBA16F result as raw uint16 bits (H x W x 4), for the
+    tables above. No float conversion: that alone was ~0.25 s per 4K frame."""
+    data = np.fromfile(path, dtype=np.uint16)
+    if data.size != width * height * 4:
+        raise ValueError(
+            f"DLSS returned {data.size} values, expected {width * height * 4}. "
+            "The harness and the contract disagree about the frame size."
+        )
+    return data.reshape(height, width, 4)
 
 
 def halton(index: int, base: int) -> float:

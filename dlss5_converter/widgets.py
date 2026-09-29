@@ -228,7 +228,10 @@ def to_qimage_u8(image_rgb: np.ndarray) -> QImage:
 
 
 def to_qimage(image_rgb: np.ndarray) -> QImage:
-    """0..1 float RGB to an 8-bit QImage that owns its buffer."""
+    """0..1 float RGB to an 8-bit QImage that owns its buffer. An 8-bit
+    array (video conversion previews) is taken as it is."""
+    if image_rgb.dtype == np.uint8:
+        return to_qimage_u8(image_rgb)
     return to_qimage_u8(np.clip(image_rgb, 0.0, 1.0) * 255.0)
 
 

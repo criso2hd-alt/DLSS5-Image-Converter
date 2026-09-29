@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 from .depth_engine import DEFAULT_MODEL
@@ -318,6 +318,30 @@ class StereoSettings:
     run_dlss: bool = True
 
 
+#: What a video conversion always uses, so the Video tab has no controls for
+#: them: one pass (a user comparing 1 against 8 on video saw no difference,
+#: and it is up to 8x the time), DLSS at up to 4K, the bundled Small depth
+#: model (only the 3D export reads depth, and Small was what made the best
+#: 3D conversion so far), and no Detail (a supersampled still-image mode).
+VIDEO_PASSES = 1
+VIDEO_MAX_EDGE = 3840
+
+
+@dataclass
+class VideoSettings:
+    """The Video tab's own DLSS controls.
+
+    Independent of the Single image sidebar on purpose. Video used to read
+    the sidebar silently: someone who came straight to the Video tab had no
+    way to see which style or strengths their clip would get (or that a
+    colour grade from an earlier photo would be baked in), and "I see no
+    difference" reports followed. Now what the Video tab shows is exactly
+    what a video gets.
+    """
+
+    neural: NeuralSettings = field(default_factory=NeuralSettings)
+
+
 @dataclass
 class AppSettings:
     neural: NeuralSettings = field(default_factory=NeuralSettings)
@@ -333,6 +357,8 @@ class AppSettings:
     detail: DetailSettings = field(default_factory=DetailSettings)
     #: 3D video export: format and depth feel. Off by default.
     stereo: StereoSettings = field(default_factory=StereoSettings)
+    #: The Video tab's own neural and HDR controls (see VideoSettings).
+    video: VideoSettings = field(default_factory=VideoSettings)
     #: Folder holding the user's own nvngx_dlssnr.dll and the RenoDX add-on.
     #: Empty means "search the usual places" (see paths.runtime_search_roots).
     runtime_dir: str = ""
@@ -388,8 +414,18 @@ class AppSettings:
         except (TypeError, ValueError):
             onboarding_version = ONBOARDING_VERSION
 
+        neural = build(NeuralSettings, raw.get("neural"))
+        # First run of a version with separate video settings: start them as
+        # a copy of the photo ones, so an existing user's videos look the same
+        # as before on day one and only diverge when they change something.
+        video_raw = raw.get("video")
+        if isinstance(video_raw, dict) and isinstance(video_raw.get("neural"), dict):
+            video = VideoSettings(neural=build(NeuralSettings, video_raw["neural"]))
+        else:
+            video = VideoSettings(neural=replace(neural))
+
         return cls(
-            neural=build(NeuralSettings, raw.get("neural")),
+            neural=neural,
             depth=build(DepthSettings, raw.get("depth")),
             evaluation=build(EvaluationSettings, raw.get("evaluation")),
             # grade and effects are both written by to_json but were not read
@@ -399,6 +435,7 @@ class AppSettings:
             effects=build(EffectsSettings, raw.get("effects")),
             detail=build(DetailSettings, raw.get("detail")),
             stereo=build(StereoSettings, raw.get("stereo")),
+            video=video,
             runtime_dir=str(raw.get("runtime_dir") or ""),
             last_output_dir=str(raw.get("last_output_dir") or ""),
             theme=str(raw.get("theme") or "Neural Cyan"),

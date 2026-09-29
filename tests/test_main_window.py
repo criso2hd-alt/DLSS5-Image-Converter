@@ -586,7 +586,6 @@ def test_video_effort_does_not_touch_the_sidebar_passes(window, monkeypatch):
     page.source = gui.Path("clip.mp4")
     page.info = _Info()
     page.output_path = gui.Path("out.mp4")
-    page.mode_box.setCurrentIndex(0)  # Quick (1 pass)
 
     monkeypatch.setattr(gui.video, "is_available", lambda: True)
     started = {}
@@ -603,10 +602,3 @@ def test_video_effort_does_not_touch_the_sidebar_passes(window, monkeypatch):
     assert window.settings.evaluation.frames == 8, "sidebar passes must be untouched"
     assert started["settings"].evaluation.frames == 1, "the video run used its own 1 pass"
     window._video_teardown()
-
-
-def test_changing_video_effort_does_not_touch_the_sidebar(window):
-    window.settings.evaluation.frames = 8
-    window.video_page.mode_box.setCurrentIndex(1)  # Quality
-    window._video_mode_changed()
-    assert window.settings.evaluation.frames == 8
