@@ -38,12 +38,15 @@ class VideoInfo:
     frames: int          # 0 when the container does not report a count
     has_audio: bool
     duration: float      # seconds, 0.0 when unknown
+    #: 'pq' (HDR10), 'hlg', or '' for SDR. See hdrvideo.
+    hdr: str = ""
 
     def describe(self) -> str:
         count = f"{self.frames}" if self.frames else "?"
         audio = "with audio" if self.has_audio else "no audio"
+        hdr = {"pq": ", HDR10", "hlg": ", HDR (HLG)"}.get(self.hdr, "")
         return (
-            f"{self.width}x{self.height}, {self.fps:.3g} fps, "
+            f"{self.width}x{self.height}, {self.fps:.3g} fps{hdr}, "
             f"{count} frames, {audio}"
         )
 
@@ -63,6 +66,29 @@ class Codec:
     @property
     def ten_bit(self) -> bool:
         return "10" in self.pix_fmt
+
+
+def hdr_codec(codec: Codec) -> Codec | None:
+    """The version of `codec` that carries HDR10, or None if it cannot.
+
+    ProRes is 10-bit already. H.265 has a 10-bit profile (Main10) on NVENC and
+    x265, so an HDR source switches it to that. H.264 and VP9 as offered here
+    are 8-bit: an HDR source is tone-mapped to SDR for them instead.
+    """
+    from dataclasses import replace
+
+    if codec.ten_bit:
+        return codec
+    if codec.key == "h265":
+        return replace(codec, pix_fmt="yuv420p10le")
+    return None
+
+
+def _pix_fmt_for(name: str, codec: Codec) -> str:
+    # NVENC takes 10-bit 4:2:0 as P010, not the planar yuv420p10le x265 wants.
+    if "nvenc" in name and codec.pix_fmt == "yuv420p10le":
+        return "p010le"
+    return codec.pix_fmt
 
 
 #: Quality settings per encoder. Without these every encoder runs at its own
@@ -133,6 +159,8 @@ def probe(path: str | Path) -> VideoInfo:
             duration = float(stream.duration * stream.time_base)
         elif container.duration:
             duration = container.duration / 1_000_000
+        from .hdrvideo import kind_of
+
         return VideoInfo(
             width=stream.codec_context.width,
             height=stream.codec_context.height,
@@ -140,6 +168,7 @@ def probe(path: str | Path) -> VideoInfo:
             frames=stream.frames or (round(duration * float(rate)) if duration else 0),
             has_audio=bool(container.streams.audio),
             duration=duration,
+            hdr=kind_of(stream.codec_context.color_trc),
         )
 
 
@@ -166,11 +195,11 @@ def _encoder_opens(name: str, codec: Codec, fps: float, size: tuple[int, int]) -
     try:
         ctx = av.CodecContext.create(_encoder_name(name), "w")
         ctx.width, ctx.height = width, height
-        ctx.pix_fmt = codec.pix_fmt
+        ctx.pix_fmt = _pix_fmt_for(name, codec)
         ctx.framerate = Fraction(fps).limit_denominator(90000)
         ctx.options = dict(ENCODER_OPTIONS.get(name, {}))
         ctx.open()
-        probe = av.VideoFrame(width, height, codec.pix_fmt)
+        probe = av.VideoFrame(width, height, _pix_fmt_for(name, codec))
         ctx.encode(probe)  # forces avcodec_open2 and one real encode
         # No explicit close: PyAV's codec context has none and frees on GC.
         # Flushing here is unnecessary - the point was only to prove it opens.
@@ -197,7 +226,7 @@ def _pick_encoder(container, codec: Codec, fps: float, size: tuple[int, int]):
                                           rate=Fraction(fps).limit_denominator(90000))
             stream.width = width
             stream.height = height
-            stream.pix_fmt = codec.pix_fmt
+            stream.pix_fmt = _pix_fmt_for(name, codec)
             stream.options = dict(ENCODER_OPTIONS.get(name, {}))
             return stream, _encoder_name(name)
         except Exception:  # noqa: BLE001 - fall through to the software floor
@@ -208,16 +237,63 @@ def _pick_encoder(container, codec: Codec, fps: float, size: tuple[int, int]):
     )
 
 
+def frame_at(path: str | Path, seconds: float, max_edge: int = 1920, hdr: str = "") -> np.ndarray:
+    """One frame near `seconds`, for a preview: 8-bit RGB, or for an HDR
+    source ('pq'/'hlg') linear float as frames(hdr=...) gives. Shrunk so the
+    longest edge fits `max_edge` (even sizes, as DLSS wants).
+
+    Seeks to the keyframe before and decodes forward to the time, so it lands
+    on the frame the player shows rather than the nearest keyframe.
+    """
+    import av
+
+    from .contract import fit_to_budget
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        base = stream.start_time or 0
+        target = base + int(max(0.0, float(seconds)) / float(stream.time_base))
+        try:
+            container.seek(target, stream=stream, backward=True, any_frame=False)
+        except Exception:  # noqa: BLE001 - an unseekable file decodes from the start
+            pass
+        chosen = None
+        for frame in container.decode(stream):
+            chosen = frame
+            if frame.pts is not None and frame.pts >= target:
+                break
+        if chosen is None:
+            raise ValueError("No frame could be decoded at that time.")
+        if hdr:
+            from .hdrvideo import decode_frame
+
+            image = decode_frame(chosen, hdr)
+        else:
+            image = chosen.to_ndarray(format="rgb24")
+    return fit_to_budget(image, max_edge)
+
+
 def frames(
     path: str | Path,
     start: int = 0,
     limit: int | None = None,
     should_stop: Callable[[], bool] | None = None,
+    as_uint8: bool = False,
+    hdr: str = "",
 ) -> Iterator[np.ndarray]:
     """Yield decoded frames as 0..1 float32 RGB, the form the pipeline wants.
 
     ``start`` and ``limit`` cut a range out of the middle, so someone can test
     five seconds before committing to the whole clip.
+
+    ``as_uint8`` yields the decoder's 8-bit RGB untouched. Video conversion
+    works on that directly; turning a 4K frame into floats costs more than
+    decoding it.
+
+    ``hdr`` ('pq' or 'hlg') decodes at 16 bits instead and yields linear
+    BT.709 float32 with SDR white at 1.0 and highlights above it, the form
+    DLSS takes HDR in. See hdrvideo.decode_frame.
     """
     import av
 
@@ -234,7 +310,16 @@ def frames(
                 continue
             if limit is not None and emitted >= limit:
                 return
-            rgb = frame.to_ndarray(format="rgb24").astype(np.float32) / 255.0
+            if hdr:
+                from .hdrvideo import decode_frame
+
+                yield decode_frame(frame, hdr)
+                index += 1
+                emitted += 1
+                continue
+            rgb = frame.to_ndarray(format="rgb24")
+            if not as_uint8:
+                rgb = rgb.astype(np.float32) / 255.0
             yield np.ascontiguousarray(rgb)
             index += 1
             emitted += 1
@@ -371,15 +456,47 @@ def _reencode_audio_window(src, out, audio_in, audio_out, start: float, end: flo
 class VideoWriter:
     """An open output video, fed converted frames one at a time."""
 
-    def __init__(self, path: Path, codec: Codec, fps: float, size: tuple[int, int]):
+    def __init__(self, path: Path, codec: Codec, fps: float, size: tuple[int, int],
+                 hdr: bool = False):
         import av
 
         self._container = av.open(str(path), mode="w")
         self._stream, self.encoder_used = _pick_encoder(self._container, codec, fps, size)
         self._av = av
         self._deep = codec.ten_bit
+        #: HDR10 output: frames arrive as 16-bit PQ BT.2020 RGB (hdrvideo.to_pq16).
+        self._hdr = hdr
+        self._reformatter = None
+        if hdr:
+            # The tags players read to switch into HDR. Without them a PQ
+            # stream plays as washed-out SDR.
+            ctx = self._stream.codec_context
+            ctx.color_primaries = 9      # BT.2020
+            ctx.color_trc = 16           # SMPTE ST 2084 (PQ)
+            ctx.colorspace = 9           # BT.2020 non-constant luminance
+            ctx.color_range = 1          # limited (TV) range
 
     def write(self, image_rgb: np.ndarray) -> None:
+        if self._hdr:
+            # RGB to YUV with the BT.2020 matrix ourselves: left to the
+            # encoder, the conversion would use BT.601 and shift every hue.
+            frame = self._av.VideoFrame.from_ndarray(np.ascontiguousarray(image_rgb, np.uint16),
+                                                     format="rgb48le")
+            # Tag the RGB frame itself as PQ BT.2020. Asking for those tags
+            # only on the output makes swscale treat the input as SDR and
+            # convert the colours (and costs ~0.4 s per 4K frame).
+            frame.color_trc, frame.color_primaries = 16, 9
+            if self._reformatter is None:
+                from av.video.reformatter import VideoReformatter
+
+                # One converter for the whole clip: it keeps its scaler set up.
+                self._reformatter = VideoReformatter()
+            frame = self._reformatter.reformat(frame, format=self._stream.pix_fmt,
+                                               src_colorspace="bt2020", dst_colorspace="bt2020",
+                                               src_color_range="JPEG", dst_color_range="MPEG")
+            for packet in self._stream.encode(frame):
+                self._container.mux(packet)
+            return
         if self._deep and image_rgb.dtype != np.uint8:
             # 10-bit masters get 16-bit input, so smooth gradients (skies, fog)
             # are not banded to 8 bits before the encoder ever sees them.
